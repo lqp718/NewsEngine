@@ -1,0 +1,1 @@
+/mnt/d/MyWallet/SynapseEngine/docs/NEWSENGINE-IMPLEMENT-PLAN.md

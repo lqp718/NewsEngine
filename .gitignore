@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 敏感配置
+.env
+
+# 数据卷
+data/neo4j/
+data/logs/
+
+# 日志
+logs/*.log
+logs/*.json
+
+# 测试
+.pytest_cache/
+.coverage
