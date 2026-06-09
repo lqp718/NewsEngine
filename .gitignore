@@ -7,6 +7,7 @@ __pycache__/
 dist/
 build/
 .venv/
+venv/
 
 # IDE
 .vscode/
@@ -22,8 +23,14 @@ Thumbs.db
 .env
 
 # 数据卷
+# data/neo4j/ 和 data/logs/ 是 Docker 挂载的数据卷，包含运行时状态，不可提交
 data/neo4j/
 data/logs/
+
+# 运行时缓存文件（TickerSync、数据摄取等生成）
+data/*.json
+data/*.sqlite
+data/*.db
 
 # 日志
 logs/*.log
@@ -32,3 +39,10 @@ logs/*.json
 # 测试
 .pytest_cache/
 .coverage
+
+# 临时验证脚本（P2-3 阶段一次性脚本，不应随生产代码提交）
+test_graphiti_episode.py
+test_graphiti_*.py
+
+#openclaw
+.openclaw
