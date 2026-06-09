@@ -10,7 +10,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import time
 from typing import Any
 
@@ -21,8 +20,9 @@ from graphiti_core.nodes import EpisodeType
 from src.adapters.models import NormalizedEpisode, build_entity_suffix
 from src.graphiti.entity_types import ENTITY_TYPES
 from src.graphiti.relation_types import EDGE_TYPES, DEFAULT_EDGE_TYPE_MAP
+from src.utils.logging_config import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 __all__ = [
     "WriteResult",

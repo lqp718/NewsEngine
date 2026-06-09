@@ -8,14 +8,15 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from src.adapters.base import BaseAdapter
 from src.adapters.models import EntityItem, NormalizedEpisode
+from src.utils.logging_config import get_logger
+from src.utils.time_utils import now_hkt
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Mapping of stock exchange prefixes
 EXCHANGE_PREFIX: dict[str, str] = {
@@ -33,7 +34,7 @@ def _parse_akshare_time(time_val: Any) -> datetime:
     Falls back to current UTC time on parse failure.
     """
     if time_val is None:
-        return datetime.now(timezone.utc)
+        return now_hkt()
 
     # If it's already a datetime-like object from pandas
     if hasattr(time_val, "to_pydatetime"):
@@ -60,8 +61,8 @@ def _parse_akshare_time(time_val: Any) -> datetime:
         except ValueError:
             continue
 
-    logger.warning("Could not parse AkShare time '%s', using current UTC time", ts)
-    return datetime.now(timezone.utc)
+    logger.warning("Could not parse AkShare time '%s', using current HKT time", ts)
+    return now_hkt()
 
 
 def _build_episode_body(title: str, content: str | None) -> str:

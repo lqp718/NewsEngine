@@ -13,7 +13,6 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
-import logging
 import os
 import tempfile
 import zipfile
@@ -34,8 +33,10 @@ from src.adapters.models import (
     NormalizedEpisode,
     Severity,
 )
+from src.utils.logging_config import get_logger
+from src.utils.time_utils import now_hkt
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 GKG_V2_COLUMN_NAMES: list[str] = [
     "v2_1_global_event_id",  # 0  — not used directly
@@ -538,8 +539,8 @@ def _parse_gkg_datetime(raw: str) -> datetime:
             )
         except ValueError:
             pass
-    logger.warning("Could not parse GKG datetime '%s', using current UTC time", raw)
-    return datetime.now(timezone.utc)
+    logger.warning("Could not parse GKG datetime '%s', using current HKT time", raw)
+    return now_hkt()
 
 
 

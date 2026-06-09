@@ -6,13 +6,13 @@ Every concrete adapter (GDELT, RSS, AkShare, Treasury) inherits from this.
 
 from __future__ import annotations
 
-import logging
 from abc import ABC, abstractmethod
 from typing import Any
 
 from src.adapters.models import NormalizedEpisode
+from src.utils.logging_config import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class BaseAdapter(ABC):

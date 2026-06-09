@@ -1,0 +1,178 @@
+"""NewsEngine configuration management using Pydantic Settings.
+
+Loads configuration from .env file with validation and type safety.
+Provides a global singleton for accessing configuration throughout the application.
+"""
+
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+from typing import Any
+
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+# Define project root directory - used for loading .env file
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+
+
+class Settings(BaseSettings):
+    """Application settings loaded from .env file and environment variables."""
+    
+    # === 阿里百炼 API (LLM + Embedding) ===
+    bailian_api_key: str = Field(
+        ...,
+        description="阿里百炼 API Key - 必填字段，无默认值",
+    )
+    openai_base_url: str = Field(
+        "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        description="百炼 OpenAI 兼容 Base URL",
+    )
+    embedding_model: str = Field(
+        "text-embedding-v4",
+        description="百炼 Embedding 模型名",
+    )
+    llm_model: str = Field(
+        "qwen3.7-plus",
+        description="百炼 LLM 模型名",
+    )
+    
+    # === Neo4j 连接 ===
+    neo4j_uri: str = Field(
+        "bolt://localhost:7687",
+        description="Neo4j Bolt URI",
+    )
+    neo4j_user: str = Field(
+        "neo4j",
+        description="Neo4j 用户名",
+    )
+    neo4j_password: str = Field(
+        "newsengine2026",
+        description="Neo4j 密码",
+    )
+    
+    # === FastAPI 服务 ===
+    api_host: str = Field(
+        "0.0.0.0",
+        description="FastAPI 监听地址",
+    )
+    api_port: int = Field(
+        8100,
+        description="FastAPI 监听端口",
+    )
+    
+    # === SynapseEngine 连接 ===
+    synapse_base_url: str = Field(
+        "http://localhost:8000",
+        description="SynapseEngine REST API 地址",
+    )
+    ticker_whitelist_file: str = Field(
+        "data/ticker_whitelist.json",
+        description="Ticker 白名单本地缓存文件路径",
+    )
+    
+    # === 日志 ===
+    log_level: str = Field(
+        "INFO",
+        description="日志级别",
+    )
+    log_file: str = Field(
+        "logs/news_engine.log",
+        description="日志文件路径",
+    )
+    
+    # === 数据摄取 ===
+    ingestion_interval_sec: int = Field(
+        900,
+        description="数据源轮询间隔（秒）",
+    )
+    
+    # === GDELT ===
+    gdelt_lastupdate_url: str = Field(
+        "http://data.gdeltproject.org/gdeltv2/lastupdate.txt",
+        description="GDELT V2 lastupdate.txt URL",
+    )
+    gdelt_max_retries: int = Field(
+        3,
+        description="GDELT 下载重试次数",
+    )
+    gdelt_timeout_sec: int = Field(
+        60,
+        description="GDELT HTTP 超时（秒）",
+    )
+    
+    # === RSS ===
+    rss_timeout_sec: int = Field(
+        30,
+        description="RSS HTTP 超时（秒）",
+    )
+    
+    # === AkShare ===
+    akshare_request_interval_sec: float = Field(
+        0.5,
+        description="AkShare 查询间隔（秒）",
+    )
+    
+    # === Risk Summary 缓存 ===
+    risk_summary_cache_ttl_sec: int = Field(
+        300,
+        description="Risk Summary 缓存 TTL（秒）",
+    )
+    
+    model_config = SettingsConfigDict(
+        env_file=str(PROJECT_ROOT / ".env"),
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",  # Ignore undefined fields in .env for forward compatibility
+    )
+    
+    @field_validator("bailian_api_key")
+    @classmethod
+    def validate_bailian_api_key(cls, v: str) -> str:
+        """Validate that bailian_api_key is not a placeholder value."""
+        if not v:
+            raise ValueError("BAILIAN_API_KEY 必须设置为真实的百炼 API Key，不可为空")
+        
+        # Check for common placeholder values
+        placeholder_values = ["***", "sk-***", "your-api-key", "YOUR_API_KEY", "your_api_key", "sk-your-api-key"]
+        if v.strip() in placeholder_values:
+            raise ValueError("BAILIAN_API_KEY 必须设置为真实的百炼 API Key，不可使用占位符")
+        
+        return v
+    
+    @field_validator("log_level")
+    @classmethod
+    def validate_log_level(cls, v: str) -> str:
+        """Validate that log_level is a valid Python logging level (case-insensitive)."""
+        valid_levels = {"debug", "info", "warning", "error", "critical"}
+        if v.lower() not in valid_levels:
+            raise ValueError(f"log_level must be one of {valid_levels}, got '{v}'")
+        
+        # Return uppercase version for consistency
+        return v.upper()
+
+
+# Global settings instance - initialized lazily
+_settings: Settings | None = None
+
+
+def get_settings() -> Settings:
+    """Get the global settings instance (lazy initialization)."""
+    global _settings
+    if _settings is None:
+        _settings = Settings()
+        logging.getLogger(__name__).info("Settings loaded successfully")
+    return _settings
+
+
+def reload_settings() -> Settings:
+    """Reload the global settings instance (useful for testing or runtime updates)."""
+    global _settings
+    _settings = Settings()
+    logging.getLogger(__name__).info("Settings reloaded successfully")
+    return _settings
+
+
+__all__ = ["Settings", "get_settings", "reload_settings", "PROJECT_ROOT"]

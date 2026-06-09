@@ -46,3 +46,7 @@ test_graphiti_*.py
 
 #openclaw
 .openclaw
+.gitnexus
+.claude/
+AGENTS.md
+CLAUDE.md

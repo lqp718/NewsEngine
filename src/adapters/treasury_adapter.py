@@ -9,14 +9,14 @@ Data source (Phase 2+): https://home.treasury.gov/resource-center/data-chart-cen
 from __future__ import annotations
 
 import hashlib
-import logging
-from datetime import datetime, timezone
 from typing import Any
 
 from src.adapters.base import BaseAdapter
 from src.adapters.models import EntityItem, NormalizedEpisode, Severity
+from src.utils.logging_config import get_logger
+from src.utils.time_utils import now_hkt
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 def _detect_inversion(term_rates: dict[str, float]) -> Severity:
@@ -117,7 +117,7 @@ class TreasuryAdapter(BaseAdapter):
         Returns:
             NormalizedEpisode with yield curve data.
         """
-        fetch_time = record.get("fetch_time", datetime.now(timezone.utc))
+        fetch_time = record.get("fetch_time", now_hkt())
         date_str = fetch_time.strftime("%Y-%m-%d")
         term_rates: dict[str, float] = record.get("term_rates", {})
 

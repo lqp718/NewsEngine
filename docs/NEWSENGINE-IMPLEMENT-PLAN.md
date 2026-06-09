@@ -15,7 +15,7 @@
 | N1 | 项目骨架 + 基础设施 | 4 | 4 | 0 | 0 | ✅ 已完成 |
 | N2 | 数据源适配器 | 4 | 4 | 0 | 0 | ✅ 已完成 |
 | N3 | Graphiti 集成 | 4 | 4 | 0 | 0 | ✅ 已完成 |
-| N4 | REST API 层 | 10 | 0 | 0 | 10 | 🔴 未开始 |
+| N4 | REST API 层 | 10 | 5 | 0 | 5 | 🟡 进行中 |
 | N5 | SynapseEngine 同步 | 1 | 0 | 0 | 1 | 🔴 未开始 |
 | N6 | 端到端集成测试 | 1 | 0 | 0 | 1 | 🔴 未开始 |
 
@@ -406,6 +406,17 @@ P2-3 已验证 Graphiti 能自动提取实体。现在需要定义金融专用�
 > **目标**: 5 个 REST API 端点全部实现
 > **前置**: N3 完成（Graphiti 知识图配置就绪）
 
+⚠️ **铁律：不重复造轮子。** 以下 N4-0 已完成的基础件，后续任务如果涉及对应功能，必须复用，禁止自建等价逻辑：
+
+| 基础件 | 功能 | 调用方式 |
+|--------|------|----------|
+| `get_settings()` | 配置加载（.env → Pydantic Settings） | `from src.core.config import get_settings` |
+| `get_neo4j_driver()` | Neo4j 连接（单例） | `from src.core.neo4j_client import get_neo4j_driver` |
+| `create_graphiti()` | Graphiti SDK 实例化 | `from src.core.graphiti_client import create_graphiti` |
+| `get_logger(__name__)` | JSON 结构化日志 | `from src.utils.logging_config import get_logger` |
+| `now_hkt()` | HKT 时区（UTC+8） | `from src.utils.time_utils import now_hkt` |
+| `to_iso8601()` | 时间 → ISO 8601 字符串 | `from src.utils.time_utils import to_iso8601` |
+
 | # | 任务 | 状态 | 负责人 | 预估 | 产出物 | 完成日期 |
 |---|------|------|--------|------|--------|----------|
 | **N4-1** | FastAPI 应用骨架 | [ ] | Tech Lead | 0.5 天 | `src/api/server.py` | |
@@ -425,18 +436,30 @@ P2-3 已验证 Graphiti 能自动提取实体。现在需要定义金融专用�
 
 N1 阶段遗留的空壳文件，N4 实施前必须补完：
 
-- [ ] 创建 `src/core/config.py` — Pydantic Settings + 校验（Design Doc §4.1）
-- [ ] 创建 `src/core/neo4j_client.py` — Neo4j Driver 单例 + 生命周期（Design Doc §8.1.2）
-- [ ] 创建 `src/core/graphiti_client.py` — Graphiti SDK 实例化（Design Doc §3.5）
-- [ ] 创建 `src/utils/logging_config.py` — 结构化日志配置
-- [ ] 创建 `src/utils/time_utils.py` — HKT 转换 + ISO 8601
-- [ ] 创建 `.env.example` — 配置模板（20 个字段，见 Design Doc §4.1.3）
-- [ ] 填充所有 `__init__.py` — `__version__ = "1.0.0"` + `__all__` 导出
+- [x] 创建 `src/core/config.py` — Pydantic Settings + 校验（Design Doc §4.1）| 177行 | 2026-06-09
+- [x] 创建 `src/core/neo4j_client.py` — Neo4j Driver 单例 + 生命周期（Design Doc §8.1.2）| 64行 | 2026-06-09
+- [x] 创建 `src/core/graphiti_client.py` — Graphiti SDK 实例化（Design Doc §3.5）| 64行 | 2026-06-09
+- [x] 创建 `src/utils/logging_config.py` — 结构化日志配置 | 108行 | 2026-06-09
+- [x] 创建 `src/utils/time_utils.py` — HKT 转换 + ISO 8601 | 115行 | 2026-06-09
+- [x] 创建 `.env.example` — 配置模板（20 个字段，见 Design Doc §4.1.3）| 141行 | 2026-06-09
+- [x] 填充所有 `__init__.py` — `__version__ = "1.0.0"` + `__all__` 导出
+- [x] `requirements.txt` 补充 `pydantic-settings`
+- [x] 验收：5 个文件 import 成功 + Settings 加载 + logging 初始化 + time_utils 正常
+- [x] QA Auditor: 24/24 requirements 验证通过 | Token: `[VT-SUCCESS-N4-003]` | 归档: `.openclaw/opsx-changes/archive/2026-06-09-n4-infrastructure/`
 
 ### N4-7 FastAPI 依赖注入（deps.py）
+⚠️ **铁律：不重复造轮子。** 以下 N4-0 已完成的基础件，后续任务如果涉及对应功能，必须复用，禁止自建等价逻辑：
+
+| 基础件 | 功能 | 调用方式 |
+|--------|------|----------|
+| `get_settings()` | 配置加载（.env → Pydantic Settings） | `from src.core.config import get_settings` |
+| `get_neo4j_driver()` | Neo4j 连接（单例） | `from src.core.neo4j_client import get_neo4j_driver` |
+| `create_graphiti()` | Graphiti SDK 实例化 | `from src.core.graphiti_client import create_graphiti` |
+| `get_logger(__name__)` | JSON 结构化日志 | `from src.utils.logging_config import get_logger` |
+| `now_hkt()` | HKT 时区（UTC+8） | `from src.utils.time_utils import now_hkt` |
+| `to_iso8601()` | 时间 → ISO 8601 字符串 | `from src.utils.time_utils import to_iso8601` |
 
 > **依据**: Design Doc Part 3
-
 - [ ] 创建 `src/api/deps.py`：
   - `get_settings()` — 依赖注入配置
   - `get_neo4j_driver()` — 依赖注入 Neo4j Driver
@@ -445,9 +468,18 @@ N1 阶段遗留的空壳文件，N4 实施前必须补完：
   - `get_aggregator()` — 依赖注入 SectorBriefingAggregator
 
 ### N4-8 API 响应 Pydantic 模型（models.py）
+⚠️ **铁律：不重复造轮子。** 以下 N4-0 已完成的基础件，后续任务如果涉及对应功能，必须复用，禁止自建等价逻辑：
+
+| 基础件 | 功能 | 调用方式 |
+|--------|------|----------|
+| `get_settings()` | 配置加载（.env → Pydantic Settings） | `from src.core.config import get_settings` |
+| `get_neo4j_driver()` | Neo4j 连接（单例） | `from src.core.neo4j_client import get_neo4j_driver` |
+| `create_graphiti()` | Graphiti SDK 实例化 | `from src.core.graphiti_client import create_graphiti` |
+| `get_logger(__name__)` | JSON 结构化日志 | `from src.utils.logging_config import get_logger` |
+| `now_hkt()` | HKT 时区（UTC+8） | `from src.utils.time_utils import now_hkt` |
+| `to_iso8601()` | 时间 → ISO 8601 字符串 | `from src.utils.time_utils import to_iso8601` |
 
 > **依据**: Design Doc §5.7 + Part 2 接口契约
-
 - [ ] 创建 `src/api/models.py`：
   - `EventItem` — 单个事件响应模型
   - `ActiveEventsResponse` — `/api/events/active` 响应
@@ -458,9 +490,18 @@ N1 阶段遗留的空壳文件，N4 实施前必须补完：
   - 所有模型字段与 Design Doc Part 2 接口契约一致
 
 ### N4-9 调度器 + 管线（ingestion/）
+⚠️ **铁律：不重复造轮子。** 以下 N4-0 已完成的基础件，后续任务如果涉及对应功能，必须复用，禁止自建等价逻辑：
+
+| 基础件 | 功能 | 调用方式 |
+|--------|------|----------|
+| `get_settings()` | 配置加载（.env → Pydantic Settings） | `from src.core.config import get_settings` |
+| `get_neo4j_driver()` | Neo4j 连接（单例） | `from src.core.neo4j_client import get_neo4j_driver` |
+| `create_graphiti()` | Graphiti SDK 实例化 | `from src.core.graphiti_client import create_graphiti` |
+| `get_logger(__name__)` | JSON 结构化日志 | `from src.utils.logging_config import get_logger` |
+| `now_hkt()` | HKT 时区（UTC+8） | `from src.utils.time_utils import now_hkt` |
+| `to_iso8601()` | 时间 → ISO 8601 字符串 | `from src.utils.time_utils import to_iso8601` |
 
 > **依据**: Design Doc Part 5（sector_briefing 链路）+ Part 3（模块依赖）
-
 **这是 N4 阶段最大的新增工作量**，整合适配器 + Graphiti + TickerSync 为可运行的服务。
 
 - [ ] 创建 `src/ingestion/scheduler.py` — 多源调度编排：
@@ -484,9 +525,18 @@ N1 阶段遗留的空壳文件，N4 实施前必须补完：
   - 降级：LLM 不可用 → sector_briefing = null
 
 ### N4-10 进程入口（main.py）
+⚠️ **铁律：不重复造轮子。** 以下 N4-0 已完成的基础件，后续任务如果涉及对应功能，必须复用，禁止自建等价逻辑：
+
+| 基础件 | 功能 | 调用方式 |
+|--------|------|----------|
+| `get_settings()` | 配置加载（.env → Pydantic Settings） | `from src.core.config import get_settings` |
+| `get_neo4j_driver()` | Neo4j 连接（单例） | `from src.core.neo4j_client import get_neo4j_driver` |
+| `create_graphiti()` | Graphiti SDK 实例化 | `from src.core.graphiti_client import create_graphiti` |
+| `get_logger(__name__)` | JSON 结构化日志 | `from src.utils.logging_config import get_logger` |
+| `now_hkt()` | HKT 时区（UTC+8） | `from src.utils.time_utils import now_hkt` |
+| `to_iso8601()` | 时间 → ISO 8601 字符串 | `from src.utils.time_utils import to_iso8601` |
 
 > **依据**: Design Doc Part 3 §3.4（生命周期管理）
-
 - [ ] 创建 `main.py` — NewsEngine 进程入口：
   - 启动顺序（FIFO）：
     1. load_settings() → 校验 .env
@@ -500,6 +550,19 @@ N1 阶段遗留的空壳文件，N4 实施前必须补完：
   - 关闭顺序（LIFO）：scheduler → uvicorn → writer → driver
   - asyncio event loop 共享（API + scheduler 并发安全）
 
+### N4-1 FastAPI 应用骨架
+⚠️ **铁律：不重复造轮子。** 以下 N4-0 已完成的基础件，后续任务如果涉及对应功能，必须复用，禁止自建等价逻辑：
+
+| 基础件 | 功能 | 调用方式 |
+|--------|------|----------|
+| `get_settings()` | 配置加载（.env → Pydantic Settings） | `from src.core.config import get_settings` |
+| `get_neo4j_driver()` | Neo4j 连接（单例） | `from src.core.neo4j_client import get_neo4j_driver` |
+| `create_graphiti()` | Graphiti SDK 实例化 | `from src.core.graphiti_client import create_graphiti` |
+| `get_logger(__name__)` | JSON 结构化日志 | `from src.utils.logging_config import get_logger` |
+| `now_hkt()` | HKT 时区（UTC+8） | `from src.utils.time_utils import now_hkt` |
+| `to_iso8601()` | 时间 → ISO 8601 字符串 | `from src.utils.time_utils import to_iso8601` |
+
+> **依据**: Design Doc Part 2
 - [ ] 创建 `src/api/server.py`：
   ```python
   from fastapi import FastAPI
@@ -516,18 +579,36 @@ N1 阶段遗留的空壳文件，N4 实施前必须补完：
 - [ ] uvicorn 启动脚本：`uvicorn src.api.server:app --host 0.0.0.0 --port 8100`
 
 ### N4-2 GET /api/events/active
+⚠️ **铁律：不重复造轮子。** 以下 N4-0 已完成的基础件，后续任务如果涉及对应功能，必须复用，禁止自建等价逻辑：
+
+| 基础件 | 功能 | 调用方式 |
+|--------|------|----------|
+| `get_settings()` | 配置加载（.env → Pydantic Settings） | `from src.core.config import get_settings` |
+| `get_neo4j_driver()` | Neo4j 连接（单例） | `from src.core.neo4j_client import get_neo4j_driver` |
+| `create_graphiti()` | Graphiti SDK 实例化 | `from src.core.graphiti_client import create_graphiti` |
+| `get_logger(__name__)` | JSON 结构化日志 | `from src.utils.logging_config import get_logger` |
+| `now_hkt()` | HKT 时区（UTC+8） | `from src.utils.time_utils import now_hkt` |
+| `to_iso8601()` | 时间 → ISO 8601 字符串 | `from src.utils.time_utils import to_iso8601` |
 
 > **依据**: Design Doc §2.3（完整接口契约）
-
 - [ ] 参数: `limit` (int, 默认 50), `min_severity` (string, 默认 "medium"), `sector` (string, 可选)
 - [ ] 响应格式: `{events: [...], total: int, freshness: {...}}`
 - [ ] 排序: severity 降序 + last_updated 降序
 - [ ] 错误码: 503 (Neo4j 不可用), 500 (内部错误)
 
 ### N4-3 GET /api/events/entity/:ticker
+⚠️ **铁律：不重复造轮子。** 以下 N4-0 已完成的基础件，后续任务如果涉及对应功能，必须复用，禁止自建等价逻辑：
+
+| 基础件 | 功能 | 调用方式 |
+|--------|------|----------|
+| `get_settings()` | 配置加载（.env → Pydantic Settings） | `from src.core.config import get_settings` |
+| `get_neo4j_driver()` | Neo4j 连接（单例） | `from src.core.neo4j_client import get_neo4j_driver` |
+| `create_graphiti()` | Graphiti SDK 实例化 | `from src.core.graphiti_client import create_graphiti` |
+| `get_logger(__name__)` | JSON 结构化日志 | `from src.utils.logging_config import get_logger` |
+| `now_hkt()` | HKT 时区（UTC+8） | `from src.utils.time_utils import now_hkt` |
+| `to_iso8601()` | 时间 → ISO 8601 字符串 | `from src.utils.time_utils import to_iso8601` |
 
 > **依据**: Design Doc §2.4
-
 - [ ] 路径参数: `ticker` (格式: `0700.HK`)
 - [ ] ticker 格式转换: SynapseEngine 的 `HK.00700` → NewsEngine 的 `0700.HK`
 - [ ] 响应格式: `{ticker: str, events: [...], summary: {...}}`
@@ -535,27 +616,54 @@ N1 阶段遗留的空壳文件，N4 实施前必须补完：
 - [ ] 错误码: 404 (无该 ticker 事件), 503, 500
 
 ### N4-4 GET /api/events/sector/:name
+⚠️ **铁律：不重复造轮子。** 以下 N4-0 已完成的基础件，后续任务如果涉及对应功能，必须复用，禁止自建等价逻辑：
+
+| 基础件 | 功能 | 调用方式 |
+|--------|------|----------|
+| `get_settings()` | 配置加载（.env → Pydantic Settings） | `from src.core.config import get_settings` |
+| `get_neo4j_driver()` | Neo4j 连接（单例） | `from src.core.neo4j_client import get_neo4j_driver` |
+| `create_graphiti()` | Graphiti SDK 实例化 | `from src.core.graphiti_client import create_graphiti` |
+| `get_logger(__name__)` | JSON 结构化日志 | `from src.utils.logging_config import get_logger` |
+| `now_hkt()` | HKT 时区（UTC+8） | `from src.utils.time_utils import now_hkt` |
+| `to_iso8601()` | 时间 → ISO 8601 字符串 | `from src.utils.time_utils import to_iso8601` |
 
 > **依据**: Design Doc §2.5
-
 - [ ] 路径参数: `sector_name` (中文，如 "互联网平台")
 - [ ] 响应格式: `{sector: str, events: [...], statistics: {...}, sector_briefing: str}`
 - [ ] **`sector_briefing` 字段**: LLM 聚合的 300-500 字行业情报简报，由 `SectorBriefingAggregator` 异步预计算（见 Design Doc §5）
 - [ ] 错误码: 404 (无该行业事件)
 
 ### N4-5 GET /api/events/risk-summary
+⚠️ **铁律：不重复造轮子。** 以下 N4-0 已完成的基础件，后续任务如果涉及对应功能，必须复用，禁止自建等价逻辑：
+
+| 基础件 | 功能 | 调用方式 |
+|--------|------|----------|
+| `get_settings()` | 配置加载（.env → Pydantic Settings） | `from src.core.config import get_settings` |
+| `get_neo4j_driver()` | Neo4j 连接（单例） | `from src.core.neo4j_client import get_neo4j_driver` |
+| `create_graphiti()` | Graphiti SDK 实例化 | `from src.core.graphiti_client import create_graphiti` |
+| `get_logger(__name__)` | JSON 结构化日志 | `from src.utils.logging_config import get_logger` |
+| `now_hkt()` | HKT 时区（UTC+8） | `from src.utils.time_utils import now_hkt` |
+| `to_iso8601()` | 时间 → ISO 8601 字符串 | `from src.utils.time_utils import to_iso8601` |
 
 > **依据**: Design Doc §2.6
-
 - [ ] 响应格式: `{overall_risk, risk_score, top_risks, sector_risk_levels, summary, generated_at}`
 - [ ] `top_risks`: Top-5 高风险事件，包含 `potential_impact`（LLM 生成的影响分析）
 - [ ] `sector_risk_levels`: 各行业风险等级映射
 - [ ] 缓存策略: 结果缓存 5 分钟（降低 Neo4j 查询压力）
 
 ### N4-6 GET /api/events/health
+⚠️ **铁律：不重复造轮子。** 以下 N4-0 已完成的基础件，后续任务如果涉及对应功能，必须复用，禁止自建等价逻辑：
+
+| 基础件 | 功能 | 调用方式 |
+|--------|------|----------|
+| `get_settings()` | 配置加载（.env → Pydantic Settings） | `from src.core.config import get_settings` |
+| `get_neo4j_driver()` | Neo4j 连接（单例） | `from src.core.neo4j_client import get_neo4j_driver` |
+| `create_graphiti()` | Graphiti SDK 实例化 | `from src.core.graphiti_client import create_graphiti` |
+| `get_logger(__name__)` | JSON 结构化日志 | `from src.utils.logging_config import get_logger` |
+| `now_hkt()` | HKT 时区（UTC+8） | `from src.utils.time_utils import now_hkt` |
+| `to_iso8601()` | 时间 → ISO 8601 字符串 | `from src.utils.time_utils import to_iso8601` |
 
 > **依据**: Design Doc §2.7
-
 - [ ] 响应格式: `{status, uptime_seconds, data_sources: {...}, neo4j: {...}, graphiti: {...}}`
 - [ ] 数据源状态: `gdelt_csv`, `rss`, `akshare`, `treasury`
 - [ ] 新鲜度判定: 最近数据源更新在 30 分钟内 = healthy，否则 = stale
@@ -576,7 +684,6 @@ N1 阶段遗留的空壳文件，N4 实施前必须补完：
 ### N5-1 Ticker Push 端到端联调验证
 
 > **前置依赖**: SynapseEngine 需先完成 P3-C2.6（启动时 + ticker 变化时调用 `push_ticker_whitelist()`）
-
 - [ ] SynapseEngine 启动 → 调用 `POST /api/tickers/whitelist` → NewsEngine 返回 200 OK
 - [ ] NewsEngine `data/ticker_whitelist.json` 缓存文件写入成功
 - [ ] SynapseEngine 持仓变动/watchlist 增删 → 再次 push → NewsEngine 白名单更新

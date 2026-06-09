@@ -7,7 +7,6 @@ filtering, and dedup by link/guid.
 from __future__ import annotations
 
 import hashlib
-import logging
 from datetime import datetime, timezone
 from typing import Any
 
@@ -15,8 +14,10 @@ import feedparser
 
 from src.adapters.base import BaseAdapter
 from src.adapters.models import NormalizedEpisode
+from src.utils.logging_config import get_logger
+from src.utils.time_utils import now_hkt
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 def _extract_published(entry: dict[str, Any]) -> datetime:
@@ -35,7 +36,7 @@ def _extract_published(entry: dict[str, Any]) -> datetime:
         "Entry '%s' has no valid published date, using current UTC time",
         entry.get("title", "")[:50],
     )
-    return datetime.now(timezone.utc)
+    return now_hkt()
 
 
 def _build_episode_body(title: str, summary: str | None) -> str:

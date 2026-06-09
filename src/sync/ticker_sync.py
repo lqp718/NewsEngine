@@ -9,14 +9,15 @@
 from __future__ import annotations
 
 import json
-import logging
 import os
 import time
 from typing import Any
 
 import requests
 
-logger = logging.getLogger(__name__)
+from src.utils.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 __all__ = [
     "TickerSync",
