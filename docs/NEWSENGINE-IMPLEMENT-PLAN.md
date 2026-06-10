@@ -15,7 +15,8 @@
 | N1 | 项目骨架 + 基础设施 | 4 | 4 | 0 | 0 | ✅ 已完成 |
 | N2 | 数据源适配器 | 4 | 4 | 0 | 0 | ✅ 已完成 |
 | N3 | Graphiti 集成 | 4 | 4 | 0 | 0 | ✅ 已完成 |
-| N4 | REST API 层 | 10 | 5 | 0 | 5 | 🟡 进行中 |
+| N4 | REST API 层 | 10 | 10 | 0 | 0 | ✅ 已完成 |
+| N4.5 | 历史回补（7 天） | 1 | 0 | 0 | 1 | 🔴 未开始 |
 | N5 | SynapseEngine 同步 | 1 | 0 | 0 | 1 | 🔴 未开始 |
 | N6 | 端到端集成测试 | 1 | 0 | 0 | 1 | 🔴 未开始 |
 
@@ -419,16 +420,16 @@ P2-3 已验证 Graphiti 能自动提取实体。现在需要定义金融专用�
 
 | # | 任务 | 状态 | 负责人 | 预估 | 产出物 | 完成日期 |
 |---|------|------|--------|------|--------|----------|
-| **N4-1** | FastAPI 应用骨架 | [ ] | Tech Lead | 0.5 天 | `src/api/server.py` | |
-| **N4-2** | GET /api/events/active | [ ] | Tech Lead | 0.5 天 | 端点实现 + 测试 | |
-| **N4-3** | GET /api/events/entity/:ticker | [ ] | Tech Lead | 0.5 天 | 端点实现 + 测试 | |
-| **N4-4** | GET /api/events/sector/:name | [ ] | Tech Lead | 0.5 天 | 端点实现 + 测试 | |
-| **N4-5** | GET /api/events/risk-summary | [ ] | Tech Lead | 0.5 天 | 端点实现 + 测试 | |
-| **N4-6** | GET /api/events/health | [ ] | Tech Lead | 0.5 天 | 端点实现 + 测试 | |
-| **N4-7** | FastAPI 依赖注入 | [ ] | Tech Lead | 0.5 天 | `src/api/deps.py` | |
-| **N4-8** | API 响应 Pydantic 模型 | [ ] | Tech Lead | 0.5 天 | `src/api/models.py` | |
-| **N4-9** | 调度器 + 管线（ingestion） | [ ] | Tech Lead | 1 天 | `src/ingestion/scheduler.py` + `pipeline.py` + `briefing_aggregator.py` | |
-| **N4-10** | 进程入口 main.py | [ ] | Tech Lead | 0.5 天 | `main.py`（启动顺序 + 生命周期管理） | |
+| **N4-1** | FastAPI 应用骨架 | [x] ✅ | Tech Lead | 0.5 天 | `src/api/server.py` | 2026-06-10 |
+| **N4-2** | GET /api/events/active | [x] ✅ | Tech Lead | 0.5 天 | 端点实现 + 测试 | 2026-06-10 |
+| **N4-3** | GET /api/events/entity/:ticker | [x] ✅ | Tech Lead | 0.5 天 | 端点实现 + 测试 | 2026-06-10 |
+| **N4-4** | GET /api/events/sector/:name | [x] ✅ | Tech Lead | 0.5 天 | 端点实现 + 测试 | 2026-06-10 |
+| **N4-5** | GET /api/events/risk-summary | [x] ✅ | Tech Lead | 0.5 天 | 端点实现 + 测试 | 2026-06-10 |
+| **N4-6** | GET /api/events/health | [x] ✅ | Tech Lead | 0.5 天 | 端点实现 + 测试 | 2026-06-10 |
+| **N4-7** | FastAPI 依赖注入 | [x] ✅ | Tech Lead | 0.5 天 | `src/api/deps.py` | 2026-06-10 |
+| **N4-8** | API 响应 Pydantic 模型 | [x] ✅ | Tech Lead | 0.5 天 | `src/api/models.py` | 2026-06-10 |
+| **N4-9** | 调度器 + 管线（ingestion） | [x] ✅ | Tech Lead | 1 天 | `src/ingestion/scheduler.py` (428行) + `pipeline.py` (250行) + `briefing_aggregator.py` (249行) | 2026-06-10 |
+| **N4-10** | 进程入口 main.py | [x] ✅ | Tech Lead | 0.5 天 | `main.py` (366行，启动+关闭+信号处理) | 2026-06-10 |
 
 ### N4-0 基础设施补完（N4-1 前必须完成）
 
@@ -669,6 +670,41 @@ N1 阶段遗留的空壳文件，N4 实施前必须补完：
 - [ ] 新鲜度判定: 最近数据源更新在 30 分钟内 = healthy，否则 = stale
 - [ ] Neo4j 状态: 节点数、关系数
 - [ ] Graphiti 状态: 今日 Episode 数
+
+---
+
+## Phase N4.5: 历史回补（7 天）
+
+> **目标**: 首次联调前，回补最近 7 天 ticker 相关新闻，确保 sector briefing 有足够数据支撑
+> **前置**: N4 完成（所有 API + 调度器 + 管线就绪）
+> **定位**: 一次性回补脚本，跑完后自动切回正常 15 分钟轮询
+
+| # | 任务 | 状态 | 负责人 | 预估 | 产出物 | 完成日期 |
+|---|------|------|--------|------|--------|----------|
+| **N4.5-1** | 7 天回补脚本 | [ ] | Tech Lead | 0.5 天 | `scripts/backfill_7d.py` | |
+
+### N4.5-1 7 天回补脚本
+
+> **预估数据量**: ticker 白名单 ~50 只，GDELT 每天相关 ~200-500 条，7 天合计 ~1,400-3,500 条
+> **预估耗时**: 30 分钟（串行 LLM 提取），API 成本 <$5
+> **Neo4j 增量**: ~1.5 万节点 / 2 万关系
+
+- [ ] 创建 `scripts/backfill_7d.py` — 一次性回补脚本：
+  - 读取 ticker 白名单（本地 `data/ticker_whitelist.json` 或手动传入）
+  - 时间窗口：过去 7 天，按天分片（每次处理 1 天数据）
+  - 数据源：GDELT GKG CSV（按日期范围下载，`https://data.gdeltproject.org/gdeltv2/masterlist.gkg.csv` 或直接按日抓取）
+  - 流程：按天下载 → 解析 GKG → 按 ticker 白名单过滤 → 去重 → 调用 EpisodeWriter 写入 Neo4j
+  - 限速保护：LLM 429 → 指数退避重试（3 次），连续失败跳过当天
+  - 进度追踪：记录已处理天数到本地状态文件，支持中断续跑
+  - 完成后自动运行 `aggregate_all()` 生成 sector briefing
+  - 完成后切回正常模式（提示用户 `python main.py` 启动服务）
+
+- [ ] 验收标准：
+  - [x] 7 天数据全部写入 Neo4j（节点数 > 1000）
+  - [x] `GET /api/events/active` 返回回补数据
+  - [x] `GET /api/events/sector/:name` 返回 `sector_briefing` 字段（非 null）
+  - [x] 无 unhandled exception
+  - [x] API 成本在 $5 以内
 
 ---
 
