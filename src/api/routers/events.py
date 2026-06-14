@@ -4,7 +4,7 @@ Implements N4-2 through N4-5:
 - N4-2: GET /api/events/active — 当前活跃事件
 - N4-3: GET /api/events/entity/:ticker — 某股票相关事件
 - N4-4: GET /api/events/sector/:name — 行业事件聚合
-- N4-5: GET /api/events/risk-summary — 风险摘要（mock, 待 N4-9 LLM 聚合）
+- N4-5: GET /api/events/risk-summary — 风险摘要（mock — LLM 聚合待 L-5 实现）
 
 All endpoints query the Neo4j knowledge graph (graphiti Episodic/Entity nodes)
 and return responses conforming to the Pydantic models defined in models.py.
@@ -33,6 +33,12 @@ from src.api.models import (
 )
 from src.api.deps import get_neo4j_driver, get_settings
 from src.core.config import Settings
+from src.graphiti.translation import (
+    SEVERITY_WEIGHT,
+    severity_sort_weight,
+    translate_episode_to_event,
+    translate_entities_to_items,
+)
 from src.utils.time_utils import now_hkt, to_iso8601
 from src.utils.logging_config import get_logger
 
@@ -43,167 +49,58 @@ router = APIRouter(
     tags=["Events"],
 )
 
-# ---------------------------------------------------------------------------
-# Helper — severity sort weight
-# ---------------------------------------------------------------------------
-
-_SEVERITY_WEIGHT: dict[str, int] = {
-    "critical": 4,
-    "high": 3,
-    "medium": 2,
-    "low": 1,
-}
+# Helper — severity sort weight (delegated to translation.py)
 
 
 def _severity_sort_weight(severity: str) -> int:
     """Map severity string to numeric weight for sorting."""
-    return _SEVERITY_WEIGHT.get(severity.lower(), 0)
+    return severity_sort_weight(severity)
 
 
 # ---------------------------------------------------------------------------
-# Helper — map EpisodicNode + related EntityNode data to EventItem
+# L-5: Risk-summary LLM prompts & helpers
 # ---------------------------------------------------------------------------
 
+SYSTEM_RISK_PROMPT = """你是一个金融风险分析师。严格按用户要求的 JSON 格式输出。
+只输出 JSON，不要额外说明。"""
 
-def _episode_to_event_item(
-    episode_record: dict[str, Any],
-    entity_records: list[dict[str, Any]] | None = None,
-) -> EventItem:
-    """Convert a Neo4j Episodic node + related entities to an EventItem.
+RISK_SUMMARY_PROMPT = """基于以下活跃事件数据，生成：
+1. 整体风险摘要（2-3 句，中文）
+2. 每条 top risk 的潜在影响分析（1-2 句，中文）
 
-    The graphiti EpisodicNode stores:
-      - uuid, name, body, source, reference_time, created_at, group_id
-    EntityNode stores:
-      - uuid, name, entity_type, attributes (JSON)
-    EntityEdge (RELATES_TO) stores:
-      - name (AFFECTS / BELONGS_TO / …), fact, attributes (JSON)
-    """
+事件数据：
+{events_json}
 
-    e = episode_record.get("e", episode_record)
+行业风险分布：
+{sector_risk_json}
 
-    # ---- event_id ----
-    event_id = e.get("event_id") or e.get("uuid") or e.get("name", "unknown")
-    if str(event_id).startswith("evt-"):
-        pass  # already in correct format
-    else:
-        # Derive from name or uuid — use first chars as identifier
-        short_id = str(event_id).replace("-", "")[:6]
-        now = now_hkt()
-        event_id = f"evt-{now.strftime('%Y%m%d')}-{short_id[:3].upper()}"
+输出格式（JSON）：
+{{
+  "summary": "整体风险摘要...",
+  "potential_impacts": ["影响分析1", "影响分析2", ...]
+}}
+"""
 
-    # ---- title & summary ----
-    body: str = e.get("content") or e.get("body") or e.get("title", "")
-    # Find first non-empty line for title
-    lines = body.split("\n") if body else []
-    title = ""
-    rest_lines: list[str] = []
-    found_title = False
-    for line in lines:
-        stripped = line.strip()
-        if not found_title and stripped:
-            title = stripped
-            found_title = True
-        elif found_title:
-            rest_lines.append(line)
-    if not title:
-        title = e.get("name", str(e.get("entity_name", "Untitled Event")))
-    if len(title) > 200:
-        title = title[:200]
-    # summary from remaining content
-    summary: str | None = None
-    body_summary = "\n".join(rest_lines).strip() if rest_lines else ""
-    if len(body_summary) > 10:
-        summary = body_summary[:500]
 
-    # ---- severity ----
-    # Graphiti EpisodicNode does not have a native severity property.
-    # Default to "medium". Proper severity will be available after N4-9
-    # LLM enrichment which writes severity to episode metadata.
-    severity_raw: str = "medium"
-    if severity_raw.lower() not in _SEVERITY_WEIGHT:
-        severity_raw = "medium"
+def _build_risk_events_json(top_risks_raw: list[dict]) -> str:
+    """Build JSON string of risk events for LLM prompt."""
+    import json
 
-    # ---- timestamps ----
-    ref_time = e.get("valid_at") or e.get("reference_time") or e.get("first_seen") or now_hkt()
-    created = e.get("created_at") or ref_time
-    if isinstance(ref_time, datetime):
-        first_seen = to_iso8601(ref_time)
-        if isinstance(created, datetime):
-            last_updated = to_iso8601(created)
-        else:
-            last_updated = first_seen
-    else:
-        first_seen = to_iso8601(now_hkt())
-        last_updated = first_seen
+    simplified = []
+    for r in top_risks_raw:
+        simplified.append({
+            "title": r["title"],
+            "severity": r["severity"],
+            "affected_sectors": r["affected_sectors"],
+        })
+    return json.dumps(simplified, ensure_ascii=False, indent=2)
 
-    # ---- source_count, source_urls ----
-    source_count: int = int(e.get("source_count", 0))
-    source_urls: list[str] | None = e.get("source_urls") or None
 
-    # ---- keywords ----
-    keywords: list[str] = list(e.get("keywords", []))
+def _format_sector_risk_json(sector_risk_levels: dict[str, str]) -> str:
+    """Format sector risk levels as JSON string for LLM prompt."""
+    import json
 
-    # ---- entities ----
-    entities: list[EventEntityItem] = []
-    if entity_records:
-        for rec in entity_records:
-            en = rec.get("ent", rec)
-
-            # Entity labels: graphiti EntityNode has 'labels' property (list)
-            # e.g. ['Entity', 'Stock'] or ['Entity', 'Sector']
-            # Also check for entity_name, name, ticker, sector, type properties
-            en_labels: list = en.get("labels") or []
-            en_name: str = en.get("entity_name") or en.get("name", "")
-            ticker: str | None = en.get("ticker") or None
-            ent_type: str = "stock"  # default
-
-            # Determine entity type from labels array
-            label_set = {l.upper() for l in en_labels}
-            if "SECTOR" in label_set:
-                ent_type = "sector"
-            elif "COUNTRY" in label_set:
-                ent_type = "country"
-            elif "POLICY" in label_set:
-                ent_type = "policy"
-            # Stock is the default — also check if ticker is present
-            elif ticker:
-                ent_type = "stock"
-            # Additional fallback: check type property
-            elif en.get("type"):
-                type_val = str(en.get("type", "")).lower()
-                if type_val in ("stock", "sector", "country", "policy"):
-                    ent_type = type_val
-
-            # Policy status
-            status: str | None = None
-            if ent_type == "policy":
-                status = en.get("status", "rumor")
-
-            entities.append(
-                EventEntityItem(
-                    type=ent_type,
-                    ticker=ticker,
-                    name=en_name,
-                    status=status,
-                )
-            )
-
-    # ---- relations ----
-    relations: list[EventRelationItem] | None = None
-
-    return EventItem(
-        event_id=event_id,
-        title=title,
-        summary=summary,
-        severity=severity_raw.lower(),
-        first_seen=first_seen,
-        last_updated=last_updated,
-        source_count=source_count,
-        source_urls=source_urls,
-        keywords=keywords,
-        entities=entities,
-        relations=relations,
-    )
+    return json.dumps(sector_risk_levels, ensure_ascii=False, indent=2)
 
 
 # ---------------------------------------------------------------------------
@@ -296,7 +193,7 @@ async def get_active_events(
     events: list[EventItem] = []
     for rec in records:
         entity_records = rec.get("entities", [])
-        event = _episode_to_event_item(rec, entity_records)
+        event = EventItem(**translate_episode_to_event(rec, entity_records))
         events.append(event)
 
     # Sort by severity desc + last_updated desc (in-memory safety net)
@@ -399,7 +296,7 @@ async def get_entity_events(
         if ep is None:
             continue
         entity_records = rec.get("entities", [])
-        event = _episode_to_event_item({"e": ep}, entity_records)
+        event = EventItem(**translate_episode_to_event({"e": ep}, entity_records))
         events.append(event)
 
     if not events:
@@ -494,7 +391,7 @@ async def get_sector_events(
 ) -> SectorEventsResponse:
     """Return events aggregated by sector (Chinese name).
 
-    sector_briefing returns None (SectorBriefingAggregator TBD in N4-9).
+    sector_briefing returns None (SectorBriefingAggregator 提供缓存，见 src/ingestion/briefing_aggregator.py).
     无该 sector 事件返回 404, Neo4j 不可用返回 503。
     """
     logger.info("GET /api/events/sector/%s", sector_name)
@@ -517,7 +414,7 @@ async def get_sector_events(
         if ep is None:
             continue
         entity_records = rec.get("entities", [])
-        event = _episode_to_event_item({"e": ep}, entity_records)
+        event = EventItem(**translate_episode_to_event({"e": ep}, entity_records))
         events.append(event)
 
         # Collect tickers and severity counts for statistics
@@ -560,7 +457,7 @@ async def get_sector_events(
             affected_tickers=len(unique_tickers),
             dominant_severity=dominant_severity,
         ),
-        sector_briefing=None,  # SectorBriefingAggregator TBD in N4-9
+        sector_briefing=None,  # briefing 由 SectorBriefingAggregator 在调度器 cycle 内异步更新
     )
 
 
@@ -576,8 +473,9 @@ async def get_risk_summary(
 ) -> RiskSummaryResponse:
     """Return a risk summary across all sectors.
 
-    TODO: LLM 聚合逻辑待 N4-9 实现.
-    Current implementation returns structured mock data derived from Neo4j query.
+    TODO(L-5): LLM 聚合 → risk-summary 真实文本.
+    Uses LLM (qwen-plus) to generate summary and potential_impact text.
+    Falls back to mock template on LLM failure.
     """
     logger.info("GET /api/events/risk-summary")
 
@@ -591,7 +489,7 @@ async def get_risk_summary(
         raise
 
     sector_risk_levels: dict[str, str] = {}
-    top_risks: list[TopRiskItem] = []
+    top_risks_raw: list[dict[str, Any]] = []  # raw data before LLM enrichment
     severity_counts: dict[str, int] = {}
     total_events = 0
 
@@ -604,8 +502,7 @@ async def get_risk_summary(
         sev = (ep.get("severity") or "medium").lower()
         severity_counts[sev] = severity_counts.get(sev, 0) + 1
 
-        # Build TopRiskItem
-        event_item = _episode_to_event_item(rec, rec.get("entities", []))
+        event_item = EventItem(**translate_episode_to_event(rec, rec.get("entities", [])))
         affected_sectors = [
             ent.name
             for ent in event_item.entities
@@ -614,29 +511,20 @@ async def get_risk_summary(
         if not affected_sectors:
             affected_sectors = ["综合"]
 
-        top_risks.append(
-            TopRiskItem(
-                event_id=event_item.event_id,
-                title=event_item.title,
-                severity=event_item.severity,
-                affected_sectors=affected_sectors,
-                potential_impact=f"{event_item.title} 可能对 {', '.join(affected_sectors)} 板块产生影响。"
-                # TODO: LLM 聚合逻辑待 N4-9 实现 — use LLM to generate real potential_impact
-            )
-        )
+        top_risks_raw.append({
+            "event_id": event_item.event_id,
+            "title": event_item.title,
+            "severity": event_item.severity,
+            "affected_sectors": affected_sectors,
+        })
 
         for sec in affected_sectors:
             if sec not in sector_risk_levels:
                 sector_risk_levels[sec] = sev.upper()
 
-    # If no high-severity events in Neo4j, provide reasonable defaults
-    if not top_risks:
-        sector_risk_levels = {
-            "互联网平台": "LOW",
-            "新能源汽车": "LOW",
-            "消费": "LOW",
-        }
-        # TODO: LLM 聚合逻辑待 N4-9 实现 — query actual event data
+    # When no events, use empty dict + annotation (avoids hardcoded defaults)
+    if not top_risks_raw:
+        sector_risk_levels = {}
 
     # Calculate overall risk and score
     crit_count = severity_counts.get("critical", 0)
@@ -661,7 +549,88 @@ async def get_risk_summary(
     else:
         overall_risk = "LOW"
 
-    top_risks = top_risks[:5]  # Top-5
+    top_risks = top_risks_raw[:5]
+
+    # ---- LLM enrichment (L-5) ----
+    llm_summary: str | None = None
+    llm_impacts: list[str] | None = None
+
+    if top_risks_raw:
+        try:
+            from openai import AsyncOpenAI
+
+            llm_client = AsyncOpenAI(
+                api_key=settings.bailian_api_key,
+                base_url=settings.openai_base_url,
+            )
+
+            events_json = _build_risk_events_json(top_risks_raw)
+            sector_risk_json = _format_sector_risk_json(sector_risk_levels)
+
+            prompt = RISK_SUMMARY_PROMPT.format(
+                events_json=events_json,
+                sector_risk_json=sector_risk_json,
+            )
+
+            response = await llm_client.chat.completions.create(
+                model="qwen-plus",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": SYSTEM_RISK_PROMPT,
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=800,
+                temperature=0.3,
+                response_format={"type": "json_object"},
+            )
+
+            content = response.choices[0].message.content
+            if content:
+                import json
+
+                parsed = json.loads(content)
+                llm_summary = parsed.get("summary", "")
+                llm_impacts = parsed.get("potential_impacts", [])
+
+                if not isinstance(llm_impacts, list):
+                    llm_impacts = None
+        except Exception as exc:
+            logger.warning(
+                "Risk-summary LLM enrichment failed, using fallback: %s",
+                exc,
+            )
+
+    # ---- Build final TopRiskItem list ----
+    final_top_risks: list[TopRiskItem] = []
+    for i, raw in enumerate(top_risks_raw[:5]):
+        if llm_impacts and i < len(llm_impacts):
+            impact = llm_impacts[i]
+        else:
+            impact = (
+                f"{raw['title']} 可能对 "
+                f"{', '.join(raw['affected_sectors'])} 板块产生影响。"
+            )
+        final_top_risks.append(
+            TopRiskItem(
+                event_id=raw["event_id"],
+                title=raw["title"],
+                severity=raw["severity"],
+                affected_sectors=raw["affected_sectors"],
+                potential_impact=impact,
+            )
+        )
+
+    # ---- Build summary ----
+    if llm_summary:
+        summary_text = llm_summary
+    else:
+        summary_text = (
+            f"当前整体风险等级 {overall_risk} (risk_score={risk_score:.2f})。"
+            f"监测到 {crit_count} 条 critical 级别事件、{high_count} 条 high 级别事件。"
+            f"建议关注高风险板块并调整防御仓位比例。"
+        )
 
     now_str = to_iso8601(now_hkt())
 
@@ -669,18 +638,13 @@ async def get_risk_summary(
         "GET /api/events/risk-summary — overall_risk=%s, risk_score=%.2f, top_risks=%d",
         overall_risk,
         risk_score,
-        len(top_risks),
+        len(final_top_risks),
     )
     return RiskSummaryResponse(
         overall_risk=overall_risk,
         risk_score=round(risk_score, 2),
-        top_risks=top_risks,
+        top_risks=final_top_risks,
         sector_risk_levels=sector_risk_levels,
-        summary=(
-            f"当前整体风险等级 {overall_risk} (risk_score={risk_score:.2f})。"
-            f"监测到 {crit_count} 条 critical 级别事件、{high_count} 条 high 级别事件。"
-            f"建议关注高风险板块并调整防御仓位比例。"
-        ),
-        # TODO: LLM 聚合逻辑待 N4-9 实现 — use LLM to generate real summary text
+        summary=summary_text,
         generated_at=now_str,
     )

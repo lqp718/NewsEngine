@@ -319,7 +319,24 @@ class IngestionScheduler:
             else:
                 pipeline_results.append(result)
 
-        # ── Step 3: Briefing aggregation ───────────────────────────
+        # ── Step 3: Severity enrichment (L-4 rule engine) ──────────
+        try:
+            from .severity_enricher import enrich_severity_batch
+
+            enriched = await enrich_severity_batch(self._neo4j_driver)
+            if enriched:
+                logger.info(
+                    "Severity enrichment: classified %d Episodic nodes",
+                    enriched,
+                )
+        except Exception as exc:
+            logger.warning(
+                "Severity enrichment failed (non-critical): %s",
+                exc,
+                exc_info=True,
+            )
+
+        # ── Step 4: Briefing aggregation ───────────────────────────
         if sector_names and self._aggregator:
             try:
                 briefing_results = await self._aggregator.aggregate_all(sector_names)

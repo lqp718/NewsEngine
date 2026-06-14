@@ -4,13 +4,14 @@ Implements N4-6:
 - N4-6: GET /api/events/health — 系统健康检查
 
 Reports Neo4j connectivity, node/relation counts, Graphiti episode count,
-data source status (placeholder, to be filled by N4-9 scheduler),
+data source status (placeholder, to be filled by L-6: ingestion scheduler health telemetry),
 and overall service uptime.
 """
 
 from __future__ import annotations
 
 import time
+from datetime import datetime, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Depends
@@ -25,6 +26,7 @@ from src.api.models import (
     DataSourceStatus,
 )
 from src.core.config import Settings
+from src.ingestion.pipeline import get_health_registry
 from src.utils.time_utils import now_hkt, to_iso8601
 from src.utils.logging_config import get_logger
 
@@ -95,8 +97,6 @@ def _query_graphiti_episode_count(driver: Driver) -> tuple[int, str]:
         return 0, "down"
 
     try:
-        from datetime import datetime, timezone, timedelta
-
         # Compute start of today in UTC
         utc_now = datetime.now(timezone.utc)
         today_start = utc_now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -133,7 +133,7 @@ async def get_health(
     """Return system health status.
 
     Real-time Neo4j connectivity check via verify_connectivity().
-    Data source status is a placeholder — will be filled by the N4-9 scheduler.
+    Data source status is a placeholder — will be filled by L-6: ingestion scheduler health telemetry.
 
     Status determination:
       - Neo4j reachable + all checks ok  → status="healthy"
@@ -162,29 +162,52 @@ async def get_health(
 
     now_str = to_iso8601(now_hkt())
 
-    # ---- Data sources (placeholder — 待 N4-9 调度器实现后填充) ----
+    # ---- Data sources (来自 ingestion pipeline 的健康注册表) ----
+    registry = get_health_registry()
+
+    def _build_source_status(source_key: str) -> DataSourceStatus:
+        health = registry.get(source_key)
+        if health is None:
+            return DataSourceStatus(
+                status="down",
+                last_update=now_str,
+                latency_minutes=0,
+                error="No pipeline runs recorded yet",
+            )
+        # Determine status
+        if health.consecutive_errors >= 6:
+            status = "down"
+        elif health.consecutive_errors >= 3:
+            status = "degraded"
+        elif health.consecutive_errors > 0:
+            status = "degraded"
+        else:
+            status = "ok"
+
+        # Last update
+        last_ts = health.last_success_time or health.last_run_time
+        if last_ts is not None:
+            last_update = to_iso8601(last_ts)
+            latency = int(
+                (datetime.now(timezone.utc) - last_ts).total_seconds() / 60
+            )
+        else:
+            last_update = now_str
+            latency = 0
+
+        return DataSourceStatus(
+            status=status,
+            last_update=last_update,
+            latency_minutes=latency,
+            error=health.last_error if health.consecutive_errors > 0 else None,
+        )
+
     data_sources = DataSourceHealth(
-        gdelt_csv=DataSourceStatus(
-            status="ok",
-            last_update=now_str,
-            latency_minutes=0,
-            error=None,
-        ),
-        rss=DataSourceStatus(
-            status="ok",
-            last_update=now_str,
-            latency_minutes=0,
-            error=None,
-        ),
-        akshare=DataSourceStatus(
-            status="ok",
-            last_update=now_str,
-            latency_minutes=0,
-            error=None,
-        ),
+        gdelt_csv=_build_source_status("gdelt_csv"),
+        rss=_build_source_status("rss"),
+        akshare=_build_source_status("akshare"),
         treasury=None,
     )
-    # TODO: data_sources 待 N4-9 调度器实现后填充真实状态
 
     logger.info(
         "GET /api/events/health — status=%s, uptime=%ds, neo4j=%s, episodes_today=%d",

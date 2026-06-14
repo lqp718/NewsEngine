@@ -30,6 +30,8 @@ class SourceHealth:
     last_success_time: datetime | None = None
     consecutive_errors: int = 0
     total_episodes: int = 0
+    last_error: str | None = None
+    """Last error message (None when healthy)."""
 
 
 @dataclass
@@ -130,6 +132,7 @@ async def run_pipeline(
         # ── Update health: error path ──────────────────────────────
         health.last_run_time = datetime.now(timezone.utc)
         health.consecutive_errors += 1
+        health.last_error = str(exc)
 
         if health.consecutive_errors >= 6:
             logger.critical(
@@ -208,6 +211,7 @@ async def run_pipeline_single(
         )
         health.last_run_time = datetime.now(timezone.utc)
         health.consecutive_errors += 1
+        health.last_error = str(exc)
         result.success = False
         result.error = exc
 

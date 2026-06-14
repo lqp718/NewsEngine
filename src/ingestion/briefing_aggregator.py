@@ -149,35 +149,46 @@ class SectorBriefingAggregator:
     async def _query_sector_events(
         self, driver: Driver, sector_name: str
     ) -> list[dict]:
-        """执行 Neo4j Cypher 查询."""
+        """执行 Neo4j Cypher 查询 (Graphiti 原生 schema).
+
+        查询 Entity/Sector → Stock(Entity) → RELATES_TO → Episodic 路径。
+        返回字段名与旧查询保持一致，下游代码不受影响。
+        """
         query = """
-        MATCH (s:Sector {name: $sector_name})
-              <-[:BELONGS_TO]-(stock:Stock)
-              <-[:AFFECTS]-(event:Event)
-        WHERE event.valid_at IS NOT NULL AND event.invalid_at IS NULL
-        RETURN
-          event.event_id AS event_id,
-          event.title AS title,
-          event.severity AS severity,
-          event.first_seen AS first_seen,
-          event.last_updated AS last_updated,
-          event.source_count AS source_count,
-          event.summary AS summary,
-          event.keywords AS keywords,
-          collect(DISTINCT stock.ticker) AS affected_tickers,
-          collect(DISTINCT stock.name) AS affected_stocks
-        ORDER BY
-          CASE event.severity
-            WHEN 'critical' THEN 4 WHEN 'high' THEN 3
-            WHEN 'medium' THEN 2 WHEN 'low' THEN 1
-          END DESC,
-          event.last_updated DESC
+        MATCH (sector_ent:Entity)
+        WHERE (sector_ent.name = $sector_name
+               OR sector_ent.entity_name = $sector_name)
+          AND 'Sector' IN sector_ent.labels
+        OPTIONAL MATCH (stock:Entity)
+        WHERE stock.ticker IS NOT NULL
+          AND (stock.sector = sector_ent.name
+               OR stock.sector = sector_ent.entity_name)
+        OPTIONAL MATCH (stock)-[rel:RELATES_TO]-(other:Entity)
+        OPTIONAL MATCH (ep:Episodic)
+        WHERE rel.uuid IN ep.entity_edges
+          AND ep.valid_at IS NOT NULL
+        WITH ep, collect(DISTINCT stock) + collect(DISTINCT other) AS entities
+        WHERE ep IS NOT NULL
+        RETURN ep AS e, entities
+        ORDER BY ep.created_at DESC
         LIMIT 20
         """
         records, _, _ = await asyncio.to_thread(
             driver.execute_query, query, sector_name=sector_name
         )
-        return [dict(r) for r in records]
+        # 通过共享翻译层将 Neo4j record 转为 briefing input dict
+        from src.graphiti.translation import translate_episode_to_briefing_input
+
+        results: list[dict] = []
+        for r in records:
+            d = dict(r)
+            ep = d.get("e")
+            if ep is None:
+                continue
+            entities = d.get("entities", [])
+            result = translate_episode_to_briefing_input({"e": ep}, entities)
+            results.append(result)
+        return results
 
     def _compute_fingerprint(self, events: list[dict]) -> str:
         """计算事件指纹 (用于增量检测).
