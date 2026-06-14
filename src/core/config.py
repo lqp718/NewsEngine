@@ -144,6 +144,12 @@ class Settings(BaseSettings):
         "src/adapters/macro_themes.py",
         description="GDELT 宏观主题白名单常量文件路径，V2.2",
     )
+    
+    # === Scheduler Cycle Guard (V2.3) ===
+    min_cycle_gap_sec: int = Field(
+        60,
+        description="相邻 ingestion cycle 之间的最小冷却间隔（秒）。默认 60 秒，设为 0 可禁用。",
+    )
 
     model_config = SettingsConfigDict(
         env_file=str(PROJECT_ROOT / ".env"),
@@ -152,6 +158,14 @@ class Settings(BaseSettings):
         extra="ignore",  # Ignore undefined fields in .env for forward compatibility
     )
     
+    @field_validator("min_cycle_gap_sec")
+    @classmethod
+    def validate_min_cycle_gap(cls, v: int) -> int:
+        """Validate that min_cycle_gap_sec is not negative."""
+        if v < 0:
+            raise ValueError("min_cycle_gap_sec 必须 >= 0")
+        return v
+
     @field_validator("bailian_api_key")
     @classmethod
     def validate_bailian_api_key(cls, v: str) -> str:

@@ -124,6 +124,7 @@ class IngestionScheduler:
         feed_urls: list[str] | None = None,
         whitelist_path: str | None = None,
         interval_sec: int | None = None,
+        min_cycle_gap_sec: int | None = None,
     ) -> None:
         """Initialize scheduler and create all sub-components.
 
@@ -148,6 +149,7 @@ class IngestionScheduler:
             )
         )
         self._interval_sec = interval_sec or settings.ingestion_interval_sec
+        self._min_cycle_gap_sec = min_cycle_gap_sec or settings.min_cycle_gap_sec
 
         # ── Shared dedup cache (across all adapters) ──────────────
         self._dedup_cache: set[str] = set()
@@ -291,10 +293,11 @@ class IngestionScheduler:
 
             # Sleep until next cycle (check running flag every second)
             elapsed = time.monotonic() - cycle_start
-            remaining = max(0.0, self._interval_sec - elapsed)
+            remaining = max(float(self._min_cycle_gap_sec), self._interval_sec - elapsed)
             logger.info(
-                "=== Ingestion cycle complete (%.1fs, next in %.0fs) ===",
+                "=== Ingestion cycle complete (%.1fs, guard=%.1fs, next in %.1fs) ===",
                 elapsed,
+                self._min_cycle_gap_sec,
                 remaining,
             )
 
