@@ -500,7 +500,7 @@ class IngestionScheduler:
             orphan_query = """
             MATCH (e:Entity)
             WHERE NOT (e)-[:RELATES_TO]-()
-            DELETE e
+            DETACH DELETE e
             RETURN count(e) AS deleted
             """
             with self._neo4j_driver.session() as session:

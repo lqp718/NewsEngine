@@ -81,32 +81,12 @@ class GdeltDownloadError(Exception):
 
 
 def _map_tone_to_severity(tone_str: str | None) -> Severity:
-    """Map GKG V2.14 Tone value to severity.
+    """GDELT GKG tone format ("entity,score;...") is not a single severity value.
 
-    Mapping rules:
-        >  5.0  → "low"
-        -5.0 ~ 5.0 → "medium"
-        -15.0 ~ -5.0 → "high"
-        < -15.0 → "critical"
-        invalid / None → "medium"
+    Severity is determined later by L-4 rule-based enricher (severity_enricher.py).
+    This function just returns a neutral placeholder.
     """
-    if tone_str is None or tone_str.strip() == "":
-        logger.warning("Empty tone value, defaulting to medium")
-        return "medium"
-    try:
-        tone = float(tone_str.strip())
-    except (ValueError, TypeError):
-        logger.warning("Invalid tone value '%s', defaulting to medium", tone_str)
-        return "medium"
-
-    if tone > 5.0:
-        return "low"
-    if tone >= -5.0:  # -5.0 ~ 5.0 (inclusive)
-        return "medium"
-    if tone >= -15.0:  # -15.0 ~ -5.0 (exclusive upper bound -5.0)
-        return "high"
-    # < -15.0
-    return "critical"
+    return "medium"
 
 
 def _parse_location(location_str: str) -> str:

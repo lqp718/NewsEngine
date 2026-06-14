@@ -107,10 +107,10 @@ def _build_prose_format(response_model: type[BaseModel]) -> str:
     return "\n".join(lines)
 
 
-class DashscopeSafeClient(OpenAIGenericClient):
-    """LLM client optimized for Dashscope/qwen compatibility.
+class SchemaEchoSafeClient(OpenAIGenericClient):
+    """LLM client optimized for OpenAI-compatible providers.
     
-    Addresses two issues:
+    Addresses two issues common with less-reliable providers:
     1. Replaces raw JSON Schema injection with prose format to reduce schema echo
     2. Adds schema echo detection and retry capability
     """
@@ -127,7 +127,7 @@ class DashscopeSafeClient(OpenAIGenericClient):
         attribute_extraction: bool = False,
     ) -> dict[str, Any]:
         """Override generate_response to use prose format instead of raw schema."""
-        from graphiti_core.prompts.utils import get_extraction_language_instruction
+        from graphiti_core.llm_client.client import get_extraction_language_instruction
         
         self._apply_attribute_extraction_preamble(messages, attribute_extraction)
         if max_tokens is None:
@@ -215,13 +215,13 @@ def create_graphiti(graph_driver: GraphDriver | None = None) -> Graphiti:
     """
     settings = get_settings()
 
-    # Configure LLM client with 百炼 API
+    # Configure LLM client with DeepSeek API
     llm_config = LLMConfig(
-        api_key=settings.bailian_api_key,
-        base_url=settings.openai_base_url,
-        model=settings.llm_model,
+        api_key=settings.deepseek_api_key,
+        base_url=settings.deepseek_base_url,
+        model=settings.deepseek_model,
     )
-    llm_client = DashscopeSafeClient(
+    llm_client = SchemaEchoSafeClient(
         config=llm_config,
         structured_output_mode='json_object',  # Dashscope 不支持 json_schema constrained decoding
     )

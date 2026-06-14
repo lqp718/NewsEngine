@@ -38,6 +38,20 @@ class Settings(BaseSettings):
         "qwen3.7-plus",
         description="百炼 LLM 模型名",
     )
+
+    # === DeepSeek API (LLM) ===
+    deepseek_api_key: str = Field(
+        ...,
+        description="DeepSeek API Key，用于 LLM 客户端",
+    )
+    deepseek_base_url: str = Field(
+        "https://api.deepseek.com",
+        description="DeepSeek API Base URL",
+    )
+    deepseek_model: str = Field(
+        "deepseek-chat",
+        description="DeepSeek 模型名",
+    )
     
     # === Neo4j 连接 ===
     neo4j_uri: str = Field(
