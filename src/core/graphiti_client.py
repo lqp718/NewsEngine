@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 
 from graphiti_core import Graphiti
 from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
-from graphiti_core.llm_client.openai_client import OpenAIClient
+from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
 from graphiti_core.llm_client.client import LLMConfig
 
 if TYPE_CHECKING:
@@ -40,7 +40,10 @@ def create_graphiti(graph_driver: GraphDriver | None = None) -> Graphiti:
         base_url=settings.openai_base_url,
         model=settings.llm_model,
     )
-    llm_client = OpenAIClient(config=llm_config)
+    llm_client = OpenAIGenericClient(
+        config=llm_config,
+        structured_output_mode='json_object',  # Dashscope 不支持 json_schema constrained decoding
+    )
 
     # Configure Embedder client with 百炼 API
     embedder_config = OpenAIEmbedderConfig(

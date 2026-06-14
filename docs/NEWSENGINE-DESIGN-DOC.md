@@ -1,11 +1,12 @@
 # NewsEngine 设计文档
 
-**版本:** V2.0（合并 Redesign Doc V1.2 + Internal Spec V1.1）  
-**日期:** 2026-06-09  
+**版本:** V2.1（Graphiti Schema 对齐 — 物理存储模型 vs 逻辑业务模型）  
+**日期:** 2026-06-14  
 **作者:** Chief Architect  
 **依据文档:**
 - `NewsEngine Proposal V1.0` (2026-06-08)
-- `SynapseEngine LOW_LEVEL_DESIGN.md` V1.6
+- `SynapseEngine LOW_LEVEL_DESIGN.md` V1.8
+- `Graphiti SDK v0.29.2` 实际 Neo4j Schema（Episodic/Entity/RELATES_TO）
 
 **状态:** Draft → 待审批  
 **审批人:** 老公  
@@ -15,6 +16,16 @@
 ---
 
 ## 版本说明
+
+### V2.1 变更摘要 (2026-06-14)
+
+1. **Neo4j Schema 对齐**: Graphiti SDK 硬编码产生 `Episodic`/`Entity`/`RELATES_TO` label，与 V2.0 假设的 `Event`/`Stock`/`Sector`/`AFFECTS`/`BELONGS_TO` 不一致。本文档新增 §2.8「物理存储模型 vs 逻辑业务模型」对两套 schema 做完整映射。
+2. **sector_briefing Cypher 更新** (§5.2): 从假设的 `MATCH (s:Sector)<-[:BELONGS_TO]-(stock:Stock)<-[:AFFECTS]-(event:Event)` 更新为实际 Graphiti schema `MATCH (sector:Entity)...(stock:Entity)...(ep:Episodic)`。
+3. **新增共享翻译层** (§3.1, §3.2, §3.3): `src/graphiti/translation.py` 将 Episodic/Entity → EventItem 的内存翻译逻辑提取为公共函数，API 路由层和简报聚合层复用同一翻译入口，避免 DRY 漂移。
+4. **端点→Neo4j 映射表修正** (§8.2.3): 反映实际查询的 `Episodic`/`Entity`/`RELATES_TO` label，不再引用不存在的 `Event`/`Stock`/`Sector`/`AFFECTS`/`BELONGS_TO`。
+5. **MongoDB 同步链路澄清**: SynapseEngine `news_events` Collection 通过 NewsEngine REST API 填充（`_episode_to_event_item()` 在 API 响应层完成 Episodic→EventItem 翻译），不直接依赖 Neo4j label，无需额外同步层。
+
+### V2.0 合并说明
 
 V2.0 合并了 NewsEngine 的两份设计文档：
 
@@ -34,7 +45,7 @@ V2.0 合并了 NewsEngine 的两份设计文档：
 | Part 5 | sector_briefing 生成链路 | Internal Spec §7 | NewsEngine 实现 |
 | Part 6 | 部署要求 | Redesign Doc §F | NewsEngine + SynapseEngine |
 | Part 7 | MongoDB Schema 变更 | Redesign Doc §D | SynapseEngine 实施 |
-| Part 8 | N4 实施与验收（补完清单 + API 指南 + main.py） | Internal Spec §8~§10 | NewsEngine 实现 |
+| Part 8 | N4 实施与验收（补完清单 + API 指南 + main.py + N4-L 收尾） | Internal Spec §8~§10 + V2.1 新增 | NewsEngine 实现 |
 | Part 9 | 闭环检查 | 两份 spec 的闭环检查合并去重 | — |
 | 附录 A | SynapseEngine LLD 替换清单 | Redesign Doc §B | **不在 NewsEngine 实施** |
 | 附录 B | SynapseEngine IMPLEMENT_PLAN 变更影响 | Redesign Doc §E | **不在 NewsEngine 实施** |
@@ -646,6 +657,55 @@ Host: localhost:8100
 
 ---
 
+## 2.8 物理存储模型 vs 逻辑业务模型
+
+> **V2.1 新增（2026-06-14）。** Graphiti SDK v0.29.2 硬编码 Neo4j label，不可更改。V2.0 设计文档假设的 `Event`/`Stock`/`Sector`/`AFFECTS`/`BELONGS_TO` 是**逻辑业务模型**，不是物理存储 schema。
+
+### 2.8.1 Schema 映射表
+
+| 概念 | 物理存储 (Graphiti Neo4j) | 逻辑业务模型 (代码中使用) | 映射方式 |
+|------|--------------------------|------------------------|---------|
+| 新闻事件 | `Episodic` 节点 (label: `Episodic`) | `EventItem` (Pydantic model) | `translation.py: translate_episode_to_event()` |
+| 股票 | `Entity` 节点 (label: `Entity:Stock`, 属性 `ticker`) | `EventEntityItem(type="stock")` | 同上 |
+| 行业 | `Entity` 节点 (label: `Entity:Sector`, 属性 `name`) | `EventEntityItem(type="sector")` | 同上 |
+| 国家 | `Entity` 节点 (label: `Entity:Country`) | `EventEntityItem(type="country")` | 同上 |
+| 政策 | `Entity` 节点 (label: `Entity:Policy`, 属性 `status`) | `EventEntityItem(type="policy")` | 同上 |
+| 事件-实体关系 | `RELATES_TO` 边 (属性 `name`: `AFFECTS`/`BELONGS_TO`/`CAUSED_BY`/…) | `EventRelationItem` | 同上 |
+| 社区/摘要 | `Community` / `Saga` 节点 | 无（当前未消费） | — |
+
+### 2.8.2 核心设计决策
+
+**不在 Neo4j 中创建双 label。** Graphiti SDK 的 `Episodic`/`Entity`/`RELATES_TO` 是物理真实。`Event`/`Stock`/`Sector`/`AFFECTS`/`BELONGS_TO` 是逻辑抽象，仅在应用代码中作为 Pydantic 模型存在。
+
+**翻译层位置:** `src/graphiti/translation.py` 封装所有 Neo4j record → 业务模型的转换逻辑。API 路由层 (`events.py`) 和简报聚合层 (`briefing_aggregator.py`) 共用同一套翻译函数。
+
+**数据流:**
+```
+Graphiti SDK 写入 → Neo4j (Episodic/Entity/RELATES_TO)
+                              │
+          ┌───────────────────┼───────────────────┐
+          ▼                   ▼                   ▼
+   events.py             briefing_           SynapseEngine
+   Cypher 查             aggregator.py       REST API 调用
+   Episodic/Entity       Cypher 查           拿到 EventItem
+        │                Episodic/Entity          JSON
+        ▼                     │                    │
+   translation.py         translation.py      MongoDB
+   内存翻译 →              内存翻译 →          news_events
+   EventItem JSON         聚合 dict              Collection
+```
+
+**每个消费者的 schema 依赖总结:**
+
+| 消费者 | 读/写 | 访问路径 | 依赖 Graphiti schema? | 依赖逻辑模型? |
+|--------|------|---------|---------------------|-------------|
+| `api/routers/events.py` | 读 | 直连 Neo4j → 内存翻译 | ✅ | ✅ |
+| `ingestion/briefing_aggregator.py` | 读 | 直连 Neo4j → 内存翻译 | ✅ | ✅ |
+| SynapseEngine `news_events` | 写 | REST API → JSON 响应 → MongoDB | ❌ (透明) | ✅ |
+| SynapseEngine 盘前消费 | 读 | MongoDB `news_events` 本地缓存 | ❌ (透明) | ✅ |
+
+---
+
 # Part 3: 内部架构
 
 （来源: Internal Spec §2~§4，原文完整保留 — 含文件树、职责矩阵、依赖图、生命周期）
@@ -684,7 +744,8 @@ NewsEngine/
 │   │   ├── __init__.py
 │   │   ├── entity_types.py       # 实体类型 Pydantic 定义【已实现】
 │   │   ├── relation_types.py     # 关系类型 + edge_type_map【已实现】
-│   │   └── episode_writer.py     # EpisodeWriter (去重 + 写入)【已实现】
+│   │   ├── episode_writer.py     # EpisodeWriter (去重 + 写入)【已实现】
+│   │   └── translation.py        # 共享翻译层: Episodic/Entity → EventItem (V2.1 新增)【需新建】
 │   │
 │   ├── api/                      # REST API 层【N4 🔴 未开始 — 全部 0 字节】
 │   │   ├── __init__.py
@@ -766,6 +827,7 @@ NewsEngine/
 | `core/graphiti_client.py` | Graphiti SDK 实例创建与配置 | `core/config.py`, `core/neo4j_client.py`, `graphiti/` | `create_graphiti()` |
 | `adapters/` | 原始数据 → `NormalizedEpisode` 转换 | `core/config.py`, `adapters/models.py` | `BaseAdapter` 子类 |
 | `graphiti/` | `NormalizedEpisode` → Neo4j 知识图写入 | `graphiti-core`, `adapters/models.py`, `core/neo4j_client.py` | `EpisodeWriter` |
+| `graphiti/translation.py` | Neo4j Episodic/Entity record → 业务模型 (EventItem/EventEntityItem) 共享翻译 | `graphiti/entity_types.py` | `translate_episode_to_event()`, `translate_entity_to_item()`, `SEVERITY_WEIGHT` |
 | `sync/` | SynapseEngine ticker 白名单管理 | `requests` | `get_ticker_whitelist()` |
 | `ingestion/` | 多源调度编排（适配器 + Graphiti + ticker sync + briefing） | `adapters/`, `graphiti/`, `sync/`, `core/` | `run_ingestion_cycle()` |
 | `api/` | REST API 端点实现 + FastAPI 应用 | `core/`, `graphiti/`, `ingestion/` | FastAPI `app` |
@@ -790,19 +852,26 @@ NewsEngine/
         ▼          ▼          ▼           ▼          ▼          ▼
    ┌────────┐┌────────┐┌────────┐   ┌────────┐┌────────┐┌────────┐
    │api/    ││graphiti││core/   │   │adapters││graphiti││sync/   │
-   │routers ││entity  ││graphiti│   │/       ││/episode││ticker  │
-   │        ││/relation││_client │   │        ││_writer ││_sync   │
-   └───┬────┘└────────┘└───┬────┘   └───┬────┘└───┬────┘└───┬────┘
-       │                    │            │         │          │
-       └────────────────────┼────────────┘         │          │
-                            ▼                      │          │
-                    ┌──────────────┐               │          │
-                    │ core/        │               │          │
-                    │ neo4j_client │◄──────────────┘          │
-                    └──────┬───────┘                          │
-                           │                                  │
-                    ┌──────▼───────┐                          │
-                    │ core/config  │◄─────────────────────────┘
+   │routers ││translat││graphiti│   │/       ││/episode││ticker  │
+   │        ││ion     ││_client │   │        ││_writer ││_sync   │
+   └───┬────┘└───┬────┘└───┬────┘   └───┬────┘└───┬────┘└───┬────┘
+       │         │         │            │         │          │
+       └─────────┼─────────┼────────────┘         │          │
+                 │         ▼                      │          │
+                 │  ┌──────────────┐              │          │
+                 │  │graphiti/     │              │          │
+                 │  │entity_types  │◄─────────────┘          │
+                 │  └──────┬───────┘                         │
+                 │         │                                  │
+                 └─────────┼──────────────────────────────────┘
+                           │
+                    ┌──────▼───────┐
+                    │ core/        │
+                    │ neo4j_client │
+                    └──────┬───────┘
+                           │
+                    ┌──────▼───────┐
+                    │ core/config  │
                     │ (Pydantic    │
                     │  Settings)   │
                     └──────────────┘
@@ -814,17 +883,18 @@ NewsEngine/
                     └──────────────┘
 ```
 
-**依赖铁律（9 条，违反即 BUG）:**
+**依赖铁律（10 条，违反即 BUG）:**
 
 1. **`core/config.py`** — 零业务依赖，仅依赖 `python-dotenv` + `pydantic-settings`。所有模块通过依赖注入获取配置，不直接 import。
 2. **`core/neo4j_client.py`** — 仅依赖 `core/config.py` + `neo4j` 驱动。不依赖任何适配器或 graphiti 模块。
 3. **`core/graphiti_client.py`** — 依赖 `core/config.py` + `core/neo4j_client.py` + `graphiti/` 类型定义。封装 Graphiti SDK 实例化。
 4. **`adapters/`** — 仅依赖 `adapters/models.py` + `core/config.py`（通过依赖注入）。不依赖 `graphiti/` 或 `api/`。
-5. **`graphiti/`** — 依赖 `graphiti-core` + `adapters/models.py`（NormalizedEpisode）。不依赖任何具体适配器。
-6. **`ingestion/`** — 编排层，依赖 `adapters/` + `graphiti/` + `sync/` + `core/`。不依赖 `api/`。
-7. **`api/`** — 依赖 `core/` + `graphiti/`。不直接依赖 `adapters/` 或 `sync/`。
-8. **`utils/`** — 零业务依赖，可被所有模块 import。
-9. **循环依赖零容忍** — `adapters/` ↔ `graphiti/` 之间的桥接通过 `adapters/models.py` 共享类型实现，不互相 import。
+5. **`graphiti/entity_types, relation_types, episode_writer`** — 依赖 `graphiti-core` + `adapters/models.py`（NormalizedEpisode）。不依赖任何具体适配器。
+6. **`graphiti/translation.py`** — 依赖 `graphiti/entity_types.py`（Entity 类型定义）。零 `api/` 依赖（可被任意模块 import）。被 `api/routers/events.py` 和 `ingestion/briefing_aggregator.py` 共同消费。
+7. **`ingestion/`** — 编排层，依赖 `adapters/` + `graphiti/`（含 translation）+ `sync/` + `core/`。不依赖 `api/`。
+8. **`api/`** — 依赖 `core/` + `graphiti/`（含 translation）。不直接依赖 `adapters/` 或 `sync/`。
+9. **`utils/`** — 零业务依赖，可被所有模块 import。
+10. **循环依赖零容忍** — `adapters/` ↔ `graphiti/` 之间的桥接通过 `adapters/models.py` 共享类型实现，不互相 import。`translation.py` 仅依赖 `graphiti/entity_types.py`，不导入 `api/` 或 `ingestion/`。
 
 **共享类型（避免循环依赖的关键）:**
 
@@ -832,7 +902,11 @@ NewsEngine/
 - 适配器层**产出** `NormalizedEpisode`（`fetch → normalize → dedup`）
 - Graphiti 层**消费** `NormalizedEpisode`（`EpisodeWriter.write_one`）
 
-两边都依赖同一个 models 文件，避免了互相 import。
+`src/graphiti/translation.py` 中的翻译函数是 Graphiti schema 和业务模型的**共享转换契约**：
+- API 路由层**调用** `translate_episode_to_event()` 将 Neo4j record → `EventItem` JSON
+- 简报聚合层**调用**同一函数做 Neo4j record → 聚合输入 dict
+
+两边都依赖同一个 translation 文件，避免了翻译逻辑的 DRY 漂移。
 
 ## 3.4 生命周期管理
 
@@ -1395,48 +1469,60 @@ def sample_normalized_episode():
 
 ## 5.2 数据来源（从 Neo4j 取什么）
 
-**查询路径:** Sector → (BELONGS_TO) → Stock → (AFFECTS) → Event
+> **V2.1 更新 (2026-06-14):** Graphiti SDK 实际产生 `Episodic`/`Entity`/`RELATES_TO` label，不是 V2.0 假设的 `Sector`/`Stock`/`Event`/`AFFECTS`/`BELONGS_TO`。查询已改为实际物理 schema。
+
+**查询路径:** 行业 Entity → 关联 Stock Entity（通过 sector 属性）→ RELATES_TO 边 → Episodic 节点
 
 ```cypher
 // 对给定 sector_name，获取该行业所有活跃事件
-MATCH (s:Sector {name: $sector_name})
-      <-[:BELONGS_TO]-(stock:Stock)
-      <-[:AFFECTS]-(event:Event)
-WHERE event.valid_at IS NOT NULL
-  AND event.invalid_at IS NULL  // 仅活跃事件
+// 物理 schema: Entity (行业/股票) + Episodic (事件) + RELATES_TO (关系边)
+// entity_edges 是 Episodic 节点的数组属性，存储关联的 RELATES_TO 边 UUID
+
+MATCH (sector_ent:Entity)
+WHERE (sector_ent.name = $sector_name
+       OR sector_ent.entity_name = $sector_name)
+  AND 'Sector' IN sector_ent.labels
+OPTIONAL MATCH (stock:Entity)
+WHERE stock.ticker IS NOT NULL
+  AND (stock.sector = sector_ent.name
+       OR stock.sector = sector_ent.entity_name)
+OPTIONAL MATCH (stock)-[rel:RELATES_TO]-(ep:Episodic)
+WHERE rel.uuid IN ep.entity_edges
+OPTIONAL MATCH (ep)-[other_rel:RELATES_TO]-(all_ents:Entity)
+WHERE ep IS NOT NULL AND other_rel.uuid IN ep.entity_edges
 RETURN
-  event.event_id,
-  event.title,
-  event.severity,        // low | medium | high | critical
-  event.first_seen,
-  event.last_updated,
-  event.source_count,
-  event.summary,         // Graphiti 已提取的事件摘要
-  event.keywords,
+  ep.uuid AS event_id,
+  ep.name AS title,
+  ep.source AS source_description,
+  ep.source_description AS summary,
+  ep.created_at AS first_seen,
+  ep.created_at AS last_updated,
+  coalesce(ep.source_count, 1) AS source_count,
+  ep.keywords AS keywords,
+  'medium' AS severity,              // Graphiti EpisodicNode 无原生 severity，默认 medium
   collect(DISTINCT stock.ticker) AS affected_tickers,
-  collect(DISTINCT stock.name) AS affected_stocks
+  collect(DISTINCT stock.name) AS affected_stocks,
+  collect(DISTINCT all_ents) AS entities
 ORDER BY
-  CASE event.severity
-    WHEN 'critical' THEN 4
-    WHEN 'high' THEN 3
-    WHEN 'medium' THEN 2
-    WHEN 'low' THEN 1
-  END DESC,
-  event.last_updated DESC
+  ep.created_at DESC
 LIMIT 20  // 受 LLM context window 约束
 ```
 
+> **注意:** Graphiti 的 `EpisodicNode` 没有原生 `severity` 字段。V2.1 默认使用 `'medium'` 填充。severity 的 LLM 富化待后续 Phase 单独设计实施（不在当前 scope 内）。`EpisodicNode.source_count` 仅在 multi-source 去重时设置，单源事件为 NULL 时默认 1。
+
 **提取字段（每条事件）:**
 
-| 字段 | 用途 |
-|------|------|
-| `event.title` | 给 LLM 的标题输入 |
-| `event.severity` | 控制摘要中事件的优先级排序和措辞 |
-| `event.first_seen` / `last_updated` | 时间上下文 |
-| `event.source_count` | 事件可信度指标（信源越多越可靠） |
-| `event.summary` | 给 LLM 的正文输入 |
-| `event.keywords` | 帮助 LLM 理解事件核心主题 |
-| `affected_tickers` / `affected_stocks` | 受影响标的列表 |
+| 字段 | Neo4j 来源 | 用途 |
+|------|----------|------|
+| `event_id` | `Episodic.uuid` | 唯一标识 |
+| `title` | `Episodic.name` | 给 LLM 的标题输入 |
+| `severity` | 默认 `'medium'` (LLM 富化待后续 Phase) | 控制摘要中事件的优先级排序和措辞 |
+| `first_seen` / `last_updated` | `Episodic.created_at` | 时间上下文 |
+| `source_count` | `Episodic.source_count` (默认 1) | 事件可信度指标 |
+| `summary` | `Episodic.source_description` | 给 LLM 的正文输入 |
+| `keywords` | `Episodic.keywords` | 帮助 LLM 理解事件核心主题 |
+| `affected_tickers` / `affected_stocks` | `Entity.ticker` / `Entity.name` | 受影响标的列表 |
+| `entities` | 关联的 Entity 节点 | 实体上下文 |
 
 ## 5.3 LLM 配置与 Prompt 设计
 
@@ -1496,13 +1582,16 @@ LIMIT 20  // 受 LLM context window 约束
 
 ## 5.4 聚合模块归属与完整实现
 
-**文件:** `src/ingestion/briefing_aggregator.py`（新建）  
+**文件:** `src/ingestion/briefing_aggregator.py`（已实现）  
 **类:** `SectorBriefingAggregator`
+
+> **V2.1 更新:** `_query_sector_events()` 查询 Graphiti 原生 schema（§5.2 更新后的 Cypher）。Neo4j record → 聚合 dict 的翻译复用 `src/graphiti/translation.py` 的共享函数，与 API 路由层的翻译逻辑保持一致。
 
 ```
 ingestion/scheduler.py  ──每 15 分钟调用──▶  SectorBriefingAggregator.aggregate_all()
                                                   │
-                                                  ├── _query_sector_events() → Neo4j (Cypher)
+                                                  ├── _query_sector_events() → Neo4j (Cypher, Episodic/Entity/RELATES_TO)
+                                                  ├── translation.py → Episodic/Entity record → 聚合 dict (共享翻译)
                                                   ├── _compute_fingerprint() → SHA256 变化检测
                                                   ├── _build_user_prompt()  → LLM Prompt 模板
                                                   └── _call_llm()           → 百炼 qwen-plus
@@ -2218,12 +2307,14 @@ app = create_app()
 
 ### 8.2.3 端点 → Neo4j 查询映射
 
+> **V2.1 更新 (2026-06-14):** 所有端点查询 Graphiti 原生 `Episodic`/`Entity`/`RELATES_TO` label，不是 V2.0 假设的 `Event`/`Stock`/`Sector`/`AFFECTS`/`BELONGS_TO`。业务模型字段通过 `translation.py` 共享翻译函数生成。
+
 | 端点 | 数据来源 | 核心查询方法 |
 |------|---------|------------|
-| `/api/events/active` | Neo4j Event 节点 | Cypher: `MATCH (e:Event) WHERE ... RETURN e ORDER BY severity DESC, last_updated DESC` |
-| `/api/events/entity/:ticker` | Neo4j Stock + Event 节点 | 按 ticker 属性查找 Stock 节点，沿 AFFECTS 追溯关联 Event |
-| `/api/events/sector/:name` | Neo4j Sector + Stock + Event | Sector → BELONGS_TO 反查 Stock → AFFECTS 找 Event |
-| `/api/events/risk-summary` | Neo4j 聚合 + LLM | 查询高 severity 事件 → 按行业分组 → LLM 生成 summary |
+| `/api/events/active` | Neo4j `Episodic` + `Entity` 节点 + `RELATES_TO` 边 | Cypher: `MATCH (e:Episodic) OPTIONAL MATCH ... RELATES_TO ... RETURN e, entities ORDER BY e.created_at DESC` |
+| `/api/events/entity/:ticker` | Neo4j `Entity` (ticker 属性) + `Episodic` | 按 `Entity.ticker = $ticker` 查找→ `RELATES_TO` 反查 `Episodic` (通过 `entity_edges` 数组) |
+| `/api/events/sector/:name` | Neo4j `Entity` (sector) + `Episodic` | 按 `Entity.sector = $sector_name` 查找 stock Entity → `RELATES_TO` → `Episodic` |
+| `/api/events/risk-summary` | Neo4j 聚合 + LLM | 查询最近 `Episodic` → 按 Entity 分组 → `translation.py` 翻译 → LLM 生成 summary |
 | `/api/events/health` | Neo4j 系统表 + 内部状态变量 | `CALL dbms.listConfig()` + 数据源最后更新时间变量 |
 
 ---
@@ -2282,6 +2373,322 @@ if __name__ == "__main__":
 
 ---
 
+## 8.4 N4-L: 收尾修复与 V2.1 对齐
+
+> **V2.1 新增 (2026-06-14).** N4-1~N4-10 已完成基础设施和骨架。N4-L 是最后一个 Phase，目标是修复运行时 Gap 并对齐 V2.1 新定义。所有任务应在一个窗口内完成（预估 2-3 天），无需分 phase。
+
+### 8.4.1 背景
+
+N4-1~N4-10 标记完成后，Architect 重新审计发现以下问题：
+
+- **3 个功能 Gap**（Design Doc 定义了契约，代码只写了骨架/占位符）
+- **2 个 V2.1 新增需求**（translation.py 共享翻译层，briefing_aggregator Cypher 更新）
+- **8 处过时代码注释**（引用了不存在或已完成的 N4-9）
+
+IMPLEMENT-PLAN 中 N4-1~N4-10 虽标 `[x] ✅`，但上述项目不应单独追踪 — 适合作为一个收尾任务包统一交付。
+
+### 8.4.2 任务清单
+
+#### L-1: 创建 `src/graphiti/translation.py`（共享翻译层）
+
+**动机:** V2.1 设计决策 — 不在 Neo4j 建双 label，翻译逻辑集中在 graphiti 层。API 路由和简报聚合器复用同一套函数。
+
+**文件:** `src/graphiti/translation.py`（新建）
+
+**导出:**
+```python
+from src.graphiti.translation import (
+    SEVERITY_WEIGHT,
+    SEVERITY_DEFAULT,
+    translate_episode_to_event,       # Episodic dict → EventItem (API 用)
+    translate_entities_to_items,      # Entity dict list → list[EventEntityItem]
+    translate_episode_to_briefing_input,  # Episodic dict → sector_briefing 聚合输入 dict
+)
+```
+
+**实现要点:**
+1. 从 `src/api/routers/events.py` 提取 `_episode_to_event_item()` 核心逻辑
+2. 从 `src/api/routers/events.py` 提取 `_SEVERITY_WEIGHT` 常量
+3. Graphiti `RELATES_TO` 边的 `name` 属性（`AFFECTS`/`BELONGS_TO`/`CAUSED_BY`）→ 转换为业务关系类型
+4. `translate_episode_to_event()` 输入为 Neo4j `Record.data()` dict，输出为 `EventItem` 的构造函数参数 dict
+5. 零依赖 `api/` 或 `ingestion/` 模块（仅依赖 `graphiti/entity_types.py` 的类型常量）
+
+**类型判断逻辑:**
+```python
+# Entity label 检测（从 Neo4j labels 数组推断类型）
+LABEL_TYPE_MAP = {
+    "Sector": "sector",
+    "Stock": "stock",
+    "Country": "country",
+    "Policy": "policy",
+}
+
+def _entity_type_from_labels(labels: list[str], ticker: str | None) -> str:
+    """从 Neo4j Entity 节点的 labels 数组推断实体类型。"""
+    label_set = {l.title() for l in labels}
+    for label, entity_type in LABEL_TYPE_MAP.items():
+        if label in label_set:
+            return entity_type
+    # Fallback: 有 ticker 则视为 stock
+    if ticker:
+        return "stock"
+    return "unknown"
+```
+
+**验收标准:**
+- [ ] `events.py` 中的 `_episode_to_event_item()` 改为 `from src.graphiti.translation import translate_episode_to_event`
+- [ ] `events.py` 中的 `_SEVERITY_WEIGHT` 改为 `from src.graphiti.translation import SEVERITY_WEIGHT`
+- [ ] 原 `_episode_to_event_item()` 函数体从 `events.py` 删除
+- [ ] `briefing_aggregator.py` 的 `_query_sector_events()` 返回后调用 `translate_episode_to_briefing_input()`
+- [ ] 运行 `python -c 'from src.graphiti.translation import *'` 无 import error
+
+#### L-2: 更新 `briefing_aggregator.py` Cypher 查询
+
+**动机:** V2.1 §5.2 将 Cypher 从假设的 `Sector`/`Stock`/`Event`/`AFFECTS`/`BELONGS_TO` 更新为实际 Graphiti schema `Entity`/`Episodic`/`RELATES_TO`。当前代码仍使用旧查询。
+
+**文件:** `src/ingestion/briefing_aggregator.py`  
+**方法:** `SectorBriefingAggregator._query_sector_events()`
+
+**当前（错误的）查询:**
+```cypher
+MATCH (s:Sector {name: $sector_name})
+      <-[:BELONGS_TO]-(stock:Stock)
+      <-[:AFFECTS]-(event:Event)
+```
+
+**目标（见 Design Doc §5.2 完整 Cypher）:**
+```cypher
+MATCH (sector_ent:Entity)
+WHERE (sector_ent.name = $sector_name
+       OR sector_ent.entity_name = $sector_name)
+  AND 'Sector' IN sector_ent.labels
+OPTIONAL MATCH (stock:Entity)
+WHERE stock.ticker IS NOT NULL
+  AND (stock.sector = sector_ent.name
+       OR stock.sector = sector_ent.entity_name)
+OPTIONAL MATCH (stock)-[rel:RELATES_TO]-(ep:Episodic)
+WHERE rel.uuid IN ep.entity_edges
+...
+```
+
+**关键差异:**
+
+| 项目 | 旧查询 | 新查询 |
+|------|--------|--------|
+| 行业定位 | `(s:Sector {name})` | `(sector_ent:Entity) WHERE name=$n AND 'Sector' IN labels` |
+| 股票定位 | `(stock:Stock)` | `(stock:Entity) WHERE ticker IS NOT NULL` |
+| 事件定位 | `(event:Event)` | `(ep:Episodic)` |
+| 关系 | `:BELONGS_TO`, `:AFFECTS` | `[rel:RELATES_TO] WHERE rel.uuid IN ep.entity_edges` |
+| severity | `event.severity` | `'medium'` 默认值（L-4 后 LLM 富化） |
+
+**验收标准:**
+- [ ] `_query_sector_events()` 使用新 Cypher 返回正确结果（至少 1 个 sector 有事件）
+- [ ] 返回 dict 的字段名保持不变（`event_id`, `title`, `severity`, `affected_tickers`, `affected_stocks`） — 聚合器的下游代码不感知查询变更
+- [ ] `_compute_fingerprint()` 正常工作（`event_id` 字段名不变）
+- [ ] `_build_user_prompt()` 正常工作（格式化模板不变）
+
+#### L-3: 更新过时代码注释
+
+**文件 + 行号 + 旧注释 → 新注释:**
+
+| 文件 | 旧注释 | 新注释 |
+|------|--------|--------|
+| `events.py:7` | `N4-5...（mock, 待 N4-9 LLM 聚合）` | `N4-5...（mock — LLM 聚合待 L-5 实现）` |
+| `events.py:120` | `Proper severity will be available after N4-9` | `Severity defaults to medium; LLM enrichment deferred to L-4` |
+| `events.py:497` | `SectorBriefingAggregator TBD in N4-9` | `SectorBriefingAggregator 提供缓存，见 src/ingestion/briefing_aggregator.py` |
+| `events.py:563` | `# SectorBriefingAggregator TBD in N4-9` | `# briefing 由 SectorBriefingAggregator 在调度器 cycle 内异步更新` |
+| `events.py:579,624,639,684` | `TODO: LLM 聚合逻辑待 N4-9 实现` | `TODO(L-5): LLM 聚合 → risk-summary 真实文本` |
+| `health.py:7` | `N4-9 scheduler` | `L-6: ingestion scheduler health telemetry` |
+| `health.py:136` | `will be filled by the N4-9 scheduler` | `will be filled by L-6: ingestion scheduler health telemetry` |
+| `health.py:165` | `placeholder — 待 N4-9 调度器实现后填充` | `placeholder — 待 L-6 实现 ingestion scheduler health telemetry` |
+| `health.py:187` | `TODO: data_sources 待 N4-9 调度器实现后填充真实状态` | `TODO(L-6): data_sources 待 ingestion scheduler health telemetry 实现后填充真实状态` |
+
+**验收标准:**
+- [ ] `grep -rn "N4-9" src/` 返回空（零残留）
+- [ ] 所有 TODO 指向 L-4 / L-5 / L-6（可追踪）
+
+#### L-4: LLM Severity 富化
+
+**问题:** Graphiti `EpisodicNode` 没有原生 `severity` 字段。所有 API 响应默认返回 `severity="medium"`，导致 briefing_aggregator 和 risk-summary 无法区分事件严重性。
+
+**设计:**
+- 在 `episode_writer.py` 的 `write_one()` 成功后，异步调用 LLM 为 Episodic body 打分
+- 或作为 ingestion scheduler 中每个 cycle 结束后的批处理任务
+
+**实现位置:** `src/ingestion/scheduler.py` 的 `_run_cycle()` 中，在 pipeline 完成后、briefing aggregation 前
+
+**LLM 调用:**
+```python
+SEVERITY_CLASSIFIER_PROMPT = """你是金融事件严重性分级器。
+根据新闻内容，将事件严重性分为以下 4 级：
+
+- critical: 系统性风险、市场崩盘、战争、重大监管打击
+- high: 板块级负面事件、龙头股大跌、重大政策变化
+- medium: 个股事件、行业动态、一般性政策调整
+- low: 中性公告、常规经营动态、一般市场评论
+
+仅输出一个单词: low / medium / high / critical
+"""
+
+async def enrich_severity_batch(
+    neo4j_driver: Driver,
+    llm_client: AsyncOpenAI,
+    model: str = "qwen-plus",
+) -> int:
+    """批量富化 Episodic 节点的 severity。
+
+    查询所有 severity 为 NULL 的 Episodic 节点，
+    用 LLM 根据 body 内容打分，写入 Neo4j。
+    """
+```
+
+**验收标准:**
+- [ ] 新创建的 Episodic 节点在 15 分钟内获得 severity 评分
+- [ ] API 响应 `severity` 字段不再固定为 `"medium"`
+- [ ] briefing_aggregator 的 severity 排序生效（critical 事件排在前面）
+- [ ] 非关键路径：LLM 失败时 severity 保持 `"medium"`，不阻断管道
+
+**备选方案（更简单，推荐优先）:**
+
+如果在 Phase 1 不想引入 LLM 调用，可以用**规则引擎**替代：
+
+```python
+def rule_based_severity(episode_body: str, source_count: int) -> str:
+    """规则驱动的 severity 判定。
+
+    规则（优先级从高到低）:
+    1. source_count >= 5 → high
+    2. 正文含 '暴跌/崩盘/停牌/退市/破产' → critical
+    3. 正文含 '大跌/跌停/利空/罚款/调查/诉讼' → high
+    4. 正文含 '利好/大涨/涨停/突破' → medium
+    5. 正文含 '回购/增持/重组' → low
+    6. 默认 → medium
+    """
+    CRITICAL_KEYWORDS = ["暴跌", "崩盘", "停牌", "退市", "破产", "熔断"]
+    HIGH_KEYWORDS = ["大跌", "跌停", "利空", "罚款", "调查", "诉讼", "违约"]
+    MEDIUM_KEYWORDS = ["利好", "大涨", "涨停", "突破", "新高"]
+    LOW_KEYWORDS = ["回购", "增持", "重组", "分红"]
+
+    if source_count >= 5:
+        return "high"
+    for kw in CRITICAL_KEYWORDS:
+        if kw in episode_body:
+            return "critical"
+    for kw in HIGH_KEYWORDS:
+        if kw in episode_body:
+            return "high"
+    for kw in MEDIUM_KEYWORDS:
+        if kw in episode_body:
+            return "medium"
+    for kw in LOW_KEYWORDS:
+        if kw in episode_body:
+            return "low"
+    return "medium"
+```
+
+> **Architect 建议:** 规则引擎方案优先。零 LLM 调用、零延迟、可预测。Phase 2 再考虑 LLM replacement。
+
+#### L-5: Risk-summary LLM 聚合
+
+**问题:** `GET /api/events/risk-summary` 返回 hardcoded mock 文本：
+- `top_risks[i].potential_impact` 是模板拼接
+- `summary` 是固定文本
+- `sector_risk_levels` 在无事件时使用硬编码默认值
+
+**目标:** 不改 JSON schema（契约不变），仅用 LLM 替换 mock 文本生成逻辑。
+
+**实现位置:** `src/api/routers/events.py` → `get_risk_summary()`
+
+**变更范围（仅替换字段生成逻辑）:**
+
+| 字段 | 当前（mock） | 改为 |
+|------|-------------|------|
+| `summary` | 固定模板拼接 | LLM 根据 top_risks 和 sector_risk_levels 生成 2-3 句中文 summary |
+| `top_risks[i].potential_impact` | `f"{title} 可能对 {sectors} 板块产生影响。"` | LLM 根据 title + entities 生成 1-2 句影响分析 |
+| `sector_risk_levels` (无事件时) | `{"互联网平台":"LOW","新能源汽车":"LOW","消费":"LOW"}` | 返回空 dict `{}`，annotation 标注 `"no_active_events"` |
+
+**LLM 调用模板:**
+```python
+RISK_SUMMARY_PROMPT = """你是一个金融风险分析师。基于以下活跃事件数据，生成：
+1. 整体风险摘要（2-3 句，中文）
+2. 每条 top risk 的潜在影响分析（1-2 句，中文）
+
+事件数据：
+{events_json}
+
+行业风险分布：
+{sector_risk_json}
+
+输出格式（JSON）：
+{{
+  "summary": "整体风险摘要...",
+  "potential_impacts": ["影响分析1", "影响分析2", ...]
+}}
+"""
+```
+
+**验收标准:**
+- [ ] `summary` 字段内容为 LLM 生成的 2-3 句中文（非固定模板）
+- [ ] `top_risks[i].potential_impact` 为 LLM 生成的 1-2 句中文（非固定模板）
+- [ ] LLM 失败时降级为 mock 文本（已有逻辑，保留）
+- [ ] 无事件时 `sector_risk_levels = {}`
+
+#### L-6: Health endpoint — data_sources 真实数据接入
+
+**问题:** `GET /api/events/health` 的 `data_sources` 返回空占位符。调度器已运行但未将数据源最后更新时间回传给 health 端点。
+
+**实现:**
+
+1. **调度器侧** — 在 `ingestion/pipeline.py` 的 `SourceHealth` dataclass 中已有的 `last_run_time` / `last_success_time` 字段暴露给全局 registry
+2. **Health 端点侧** — `src/api/routers/health.py` 从 `ingestion/pipeline.get_health_registry()` 读取实际状态
+
+**data_sources 字段映射:**
+
+| health 响应字段 | 来源 |
+|----------------|------|
+| `data_sources.gdelt.status` | `health_registry["gdelt_csv"].consecutive_errors == 0 → ok, < 3 → degraded, >= 3 → down` |
+| `data_sources.gdelt.last_update` | `health_registry["gdelt_csv"].last_success_time` |
+| `data_sources.gdelt.latency_minutes` | `(now - last_success_time) / 60` |
+| `data_sources.gdelt.error` | `None` (ok) / 最后一次异常信息 (degraded/down) |
+| `data_sources.rss.*` | 同上，key=`"rss"` |
+| `data_sources.akshare.*` | 同上，key=`"akshare"` |
+
+**验收标准:**
+- [ ] `GET /api/events/health` 返回真实的 `data_sources.gdelt.status`（非占位符）
+- [ ] `data_sources.*.last_update` 为实际最后更新时间
+- [ ] 调度器停止 30 分钟后，health 端点返回 `degraded`
+- [ ] 不影响现有 health 检查的其他字段（`neo4j` / `graphiti` / `uptime_seconds`）
+
+### 8.4.3 依赖关系
+
+```
+L-1 (translation.py) ── 无依赖，可最先做
+    │
+    ├──► L-2 (briefing Cypher) ── 依赖 L-1（复用翻译函数）
+    │
+    ├──► L-3 (过时注释) ── 无依赖，任意时间做
+    │
+    └──► L-4 (severity 富化) ── 依赖 L-1（写 severity 后翻译层读取）
+             │
+             └──► L-5 (risk-summary LLM) ── 依赖 L-4（有真实 severity 才值得 LLM 聚合）
+
+L-6 (health data_sources) ── 无依赖，任意时间做
+```
+
+**推荐执行顺序:** L-1 → L-2 + L-3 + L-6 并行 → L-4 → L-5
+
+### 8.4.4 N4-L 完工定义
+
+- [ ] `src/graphiti/translation.py` 存在，`events.py` 和 `briefing_aggregator.py` 都 import 它
+- [ ] `briefing_aggregator._query_sector_events()` 查询 Graphiti 原生 schema 并返回正确结果
+- [ ] `grep -rn "N4-9" src/` 返回空
+- [ ] API 响应 `severity` 字段不为固定 `"medium"`（规则引擎或 LLM 输出真实值）
+- [ ] `GET /api/events/risk-summary` 返回 LLM 生成的 summary（非 mock 模板）
+- [ ] `GET /api/events/health` 返回真实 `data_sources` 状态（非占位符）
+- [ ] 全量集成测试：启动 NewsEngine → 等待 1 个 intake cycle → 5 个 API 端点均返回非 mock 数据
+
+---
+
 # Part 9: 闭环检查清单
 
 （来源: Redesign Doc §G + Internal Spec §11，合并去重）
@@ -2290,14 +2697,23 @@ if __name__ == "__main__":
 
 - [x] 5 个 NewsEngine REST 端点完整契约（请求格式 + JSON Schema + 字段定义表 + 错误码表 + 代码示例）
 - [x] 1 个 SynapseEngine → NewsEngine 端点完整契约（`POST /api/tickers/whitelist`，含请求体定义、响应格式、错误码、处理代码）
-- [x] NewsEngine 文件架构完整定义（目录树 + 变更标记 + 模块职责矩阵）
-- [x] 模块依赖图（ASCII 有向图 + 9 条铁律 + 共享类型契约）
+- [x] NewsEngine 文件架构完整定义（目录树 + 变更标记 + 模块职责矩阵 + V2.1 新增 `translation.py`）
+- [x] 模块依赖图（ASCII 有向图 + 10 条铁律 + 共享类型契约 + translation.py 依赖链）
 - [x] 生命周期管理（启动 8 步 FIFO + 关闭 4 步 LIFO + 依赖就绪检查 + 运行时并发模型）
 - [x] 配置管理规范完整（20 个 .env 字段 + Pydantic Settings 完整实现 + 当前 .env 差异分析）
-- [x] `sector_briefing` 完整生成链路（Cypher 查询 → LLM Prompt 设计 → 完整 Aggregator 代码 → 缓存策略 7 维表 → 降级方案 6 场景表 → Pydantic 模型）
+- [x] `sector_briefing` 完整生成链路（V2.1: Cypher 更新为 Graphiti 原生 Episodic/Entity/RELATES_TO schema → LLM Prompt 设计 → 完整 Aggregator 代码 → 缓存策略 7 维表 → 降级方案 6 场景表 → Pydantic 模型）
 - [x] N4 基础设施补完清单（9 个文件 + neo4j_client.py 完整代码 + 责任判定表）
-- [x] N4 REST API 实施指南（FastAPI 工厂 + 端点实现准则 + Neo4j 查询映射）
+- [x] N4 REST API 实施指南（FastAPI 工厂 + 端点实现准则 + V2.1: Neo4j 查询映射更新为实际 schema）
 - [x] main.py 入口完整代码定义
+- [x] **V2.1 新增** §2.8 物理存储模型 vs 逻辑业务模型（schema 映射表 + 设计决策 + 数据流图 + 消费者依赖矩阵）
+- [x] **V2.1 新增** `src/graphiti/translation.py` 共享翻译层设计
+- [ ] **N4-L** Translation.py 创建（L-1）
+- [ ] **N4-L** Briefing Cyber 更新为 Graphiti 原生 schema（L-2）
+- [ ] **N4-L** 过时代码注释清理（L-3：8 处 N4-9 残留）
+- [ ] **N4-L** LLM/Rule Severity 富化（L-4）
+- [ ] **N4-L** Risk-summary LLM 聚合（L-5）
+- [ ] **N4-L** Health data_sources 真实数据接入（L-6）
+- [ ] **N4-L** 全量集成测试通过
 
 ## 9.2 SynapseEngine 侧影响检查
 
@@ -2349,10 +2765,11 @@ if __name__ == "__main__":
 | 2026-06-09 | Redesign Doc V1.2: `mirofish_seeds` → `sector_briefing` 字段重命名（12 处同步修改） | Chief Architect |
 | 2026-06-09 | Internal Spec V1.1: 新增 `sector_briefing` 完整生成链路（数据来源/LLM Prompt/模块归属/缓存策略/降级方案） | Chief Architect |
 | 2026-06-09 | **V2.0 合并版**: Redesign Doc V1.2 + Internal Spec V1.1 合并为单一设计文档。NewsEngine 内部架构（文件树、依赖图、生命周期、配置、测试、sector_briefing 链路、N4 指南）纳入正文。SynapseEngine 侧变更移至附录 A/B 作为参考指引。原始文件保留不动。 | Chief Architect |
+| 2026-06-14 | **V2.1 Graphiti Schema 对齐**: (1) 新增 §2.8 物理存储模型 vs 逻辑业务模型 (schema 映射表 + 设计决策 + 数据流图)。(2) §5.2 sector_briefing Cypher 从假设的 Event/Stock/Sector 更新为实际 Episodic/Entity/RELATES_TO。(3) 新增 `src/graphiti/translation.py` 共享翻译层 (§3.1/§3.2/§3.3)。(4) §8.2.3 端点→Neo4j 映射表修正为实际 label。(5) 依赖铁律 9→10 条。(6) MongoDB 同步链路澄清（REST API 响应层完成翻译）。(7) **新增 §8.4 N4-L 收尾任务** — 6 个任务修复 3 个 Gap + 实现 V2.1 新定义。 | Chief Architect |
 
 ---
 
-*NewsEngine 设计文档 V2.0 — 单一真相源（Single Source of Truth）。定义 NewsEngine 项目从架构到实施的全部设计规格。审批通过后作为 Tech Lead 的唯一实施蓝图。2026-06-09*
+*NewsEngine 设计文档 V2.1 — 单一真相源（Single Source of Truth）。定义 NewsEngine 项目从架构到实施的全部设计规格。审批通过后作为 Tech Lead 的唯一实施蓝图。2026-06-14*
 
 ---
 
