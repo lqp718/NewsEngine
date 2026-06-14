@@ -128,10 +128,11 @@ class AkShareAdapter(BaseAdapter):
             items: list[dict[str, Any]] = []
             for _, row in df.iterrows():
                 item = {
-                    "title": row.get("标题", row.get("title", "")),
-                    "content": row.get("内容", row.get("content", "")),
+                    "title": row.get("新闻标题", row.get("title", "")),
+                    "content": row.get("新闻内容", row.get("content", "")),
                     "time": row.get("发布时间", row.get("time", "")),
-                    "source": row.get("来源", row.get("source", "")),
+                    "source": row.get("文章来源", row.get("source", "")),
+                    "link": row.get("新闻链接", row.get("link", "")),
                     "symbol": symbol,
                 }
                 items.append(item)
@@ -212,5 +213,5 @@ class AkShareAdapter(BaseAdapter):
             severity="medium",
             keywords=keywords,
             entities=entities,
-            metadata={"symbol": symbol},
+            metadata={"content_scope": "SYMBOL", "symbol": symbol},
         )

@@ -12,6 +12,7 @@ from graphiti_core import Graphiti
 from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
 from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
 from graphiti_core.llm_client.client import LLMConfig
+from graphiti_core.cross_encoder.bge_reranker_client import BGERerankerClient
 
 if TYPE_CHECKING:
     from graphiti_core.driver.driver import GraphDriver
@@ -53,6 +54,10 @@ def create_graphiti(graph_driver: GraphDriver | None = None) -> Graphiti:
     )
     embedder_client = OpenAIEmbedder(config=embedder_config)
 
+    # Configure reranker: BGE local model (GPU available → sub-100ms)
+    # No API key needed, no per-call cost
+    reranker_client = BGERerankerClient()
+
     # Create and return Graphiti instance
     return Graphiti(
         uri=settings.neo4j_uri,
@@ -60,6 +65,7 @@ def create_graphiti(graph_driver: GraphDriver | None = None) -> Graphiti:
         password=settings.neo4j_password,
         llm_client=llm_client,
         embedder=embedder_client,
+        cross_encoder=reranker_client,
         graph_driver=graph_driver,
     )
 

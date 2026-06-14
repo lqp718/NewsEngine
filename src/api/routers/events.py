@@ -236,6 +236,7 @@ def _build_active_events_query() -> str:
     """
     return """
         MATCH (e:Episodic)
+        WHERE e.created_at > datetime() - duration({days: 7})
         OPTIONAL MATCH (src:Entity)-[rel:RELATES_TO]-(tgt:Entity)
         WHERE rel.uuid IN e.entity_edges
         WITH e, collect(DISTINCT src) + collect(DISTINCT tgt) AS entities
@@ -261,6 +262,7 @@ def _build_entity_events_query() -> str:
         OPTIONAL MATCH (ent)-[rel:RELATES_TO]-(other_entity:Entity)
         OPTIONAL MATCH (ep:Episodic)
         WHERE rel.uuid IN ep.entity_edges
+          AND ep.created_at > datetime() - duration({days: 3})
         OPTIONAL MATCH (ep)-[other_rel:RELATES_TO]-(other_entity2:Entity)
         WHERE ep IS NOT NULL AND other_rel.uuid IN ep.entity_edges
         RETURN ep, collect(DISTINCT other_entity) + collect(DISTINCT other_entity2) AS entities
@@ -362,6 +364,7 @@ def _build_sector_events_query() -> str:
         OPTIONAL MATCH (stock)-[rel:RELATES_TO]-(other:Entity)
         OPTIONAL MATCH (ep:Episodic)
         WHERE rel.uuid IN ep.entity_edges
+          AND ep.created_at > datetime() - duration({days: 7})
         OPTIONAL MATCH (ep)-[other_rel:RELATES_TO]-(all_ents:Entity)
         WHERE ep IS NOT NULL AND other_rel.uuid IN ep.entity_edges
         WITH ep, collect(DISTINCT all_ents) AS entities,
@@ -376,6 +379,8 @@ def _build_high_risk_query() -> str:
     """Build Cypher for recent episodes (risk summary)."""
     return """
         MATCH (e:Episodic)
+        WHERE e.episode_metadata CONTAINS 'MACRO'
+          AND e.created_at > datetime() - duration({days: 14})
         OPTIONAL MATCH (src:Entity)-[rel:RELATES_TO]-(tgt:Entity)
         WHERE rel.uuid IN e.entity_edges
         RETURN e, collect(DISTINCT src) + collect(DISTINCT tgt) AS entities

@@ -120,7 +120,31 @@ class Settings(BaseSettings):
         300,
         description="Risk Summary 缓存 TTL（秒）",
     )
-    
+
+    # === Episode TTL 淘汰 (V2.2 新增) ===
+    episode_ttl_macro_days: int = Field(
+        14,
+        description="MACRO scope Episode 保留天数（宏观事件，V2.2）",
+    )
+    episode_ttl_sector_days: int = Field(
+        7,
+        description="SECTOR scope Episode 保留天数（行业事件，V2.2）",
+    )
+    episode_ttl_symbol_days: int = Field(
+        3,
+        description="SYMBOL scope Episode 保留天数（个股事件，V2.2）",
+    )
+    ttl_cleanup_interval_hours: int = Field(
+        24,
+        description="TTL 清理间隔（小时），V2.2",
+    )
+
+    # === GDELT 宏观主题 (V2.2 新增) ===
+    gdelt_macro_themes_file: str = Field(
+        "src/adapters/macro_themes.py",
+        description="GDELT 宏观主题白名单常量文件路径，V2.2",
+    )
+
     model_config = SettingsConfigDict(
         env_file=str(PROJECT_ROOT / ".env"),
         env_file_encoding="utf-8",

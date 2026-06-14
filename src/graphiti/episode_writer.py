@@ -4,15 +4,18 @@
 1. 去重: 按 content_hash + source_url 跳过已处理的 Episode
 2. 格式转换: NormalizedEpisode → graphiti-core EpisodicNode 参数
 3. 写入: 调用 Graphiti.add_episode()
-4. 错误处理: LLM/Neo4j 失败时的重试与降级
+4. content_scope 透传: 写入后通过 Cypher 设置 episode_metadata
+5. 错误处理: LLM/Neo4j 失败时的重试与降级
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from typing import Any
 
+from neo4j import Driver
 from pydantic import BaseModel, Field
 
 from graphiti_core.nodes import EpisodeType
@@ -79,6 +82,7 @@ class EpisodeWriter:
     def __init__(
         self,
         graphiti: Any,
+        neo4j_driver: Driver | None = None,
         entity_types: dict[str, type[BaseModel]] | None = None,
         edge_types: dict[str, type[BaseModel]] | None = None,
         edge_type_map: dict[tuple[str, str], list[str]] | None = None,
@@ -86,6 +90,7 @@ class EpisodeWriter:
         retry_base_sec: float = 2.0,
     ) -> None:
         self._graphiti = graphiti
+        self._neo4j_driver = neo4j_driver
         self._entity_types = entity_types or ENTITY_TYPES
         self._edge_types = edge_types or EDGE_TYPES
         self._edge_type_map = edge_type_map or DEFAULT_EDGE_TYPE_MAP
@@ -122,7 +127,10 @@ class EpisodeWriter:
         # 1. 构造扩展 episode_body
         extended_body = _build_extended_body(episode)
 
-        # 2. 尝试写入（含重试）
+        # 2. 提取 content_scope 用于写入后透传
+        content_scope = episode.metadata.get("content_scope") if episode.metadata else None
+
+        # 3. 尝试写入（含重试）
         last_error: Exception | None = None
         for attempt in range(1, self._max_retries + 1):
             try:
@@ -141,6 +149,14 @@ class EpisodeWriter:
                 self._seen_hashes.add(episode.content_hash)
                 if episode.source_url:
                     self._seen_urls.add(episode.source_url)
+
+                # 4. content_scope 透传：通过 Cypher 设置 episode_metadata
+                if content_scope and self._neo4j_driver:
+                    self._set_episode_metadata(
+                        episode_uuid=result.episode.uuid,
+                        content_scope=content_scope,
+                        metadata=episode.metadata,
+                    )
 
                 nodes_count = len(result.nodes) if hasattr(result, "nodes") else 0
                 edges_count = len(result.edges) if hasattr(result, "edges") else 0
@@ -229,6 +245,44 @@ class EpisodeWriter:
     def seen_count(self) -> int:
         """当前实例已处理的唯一 Episode 数量。"""
         return len(self._seen_hashes)
+
+    def _set_episode_metadata(
+        self,
+        episode_uuid: str,
+        content_scope: str,
+        metadata: dict[str, Any],
+    ) -> None:
+        """通过 Cypher 将 content_scope 写入 EpisodicNode.episode_metadata。
+
+        Graphiti SDK 的 add_episode() 不直接支持 episode_metadata 参数，
+        因此写入后通过 Cypher 更新节点属性。
+
+        注意：Neo4j 不支持 dict 类型属性，metadata dict 会被序列化为 JSON 字符串。
+        """
+        try:
+            # Neo4j 不支持 dict 类型属性，序列化为 JSON 字符串
+            episode_metadata_json = json.dumps(dict(metadata), ensure_ascii=False)
+
+            with self._neo4j_driver.session() as session:
+                session.run(
+                    """
+                    MATCH (ep:Episodic {uuid: $uuid})
+                    SET ep.episode_metadata = $metadata_json
+                    """,
+                    uuid=episode_uuid,
+                    metadata_json=episode_metadata_json,
+                )
+            logger.debug(
+                "Set episode_metadata for %s: content_scope=%s",
+                episode_uuid[:12],
+                content_scope,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to set episode_metadata for %s: %s",
+                episode_uuid[:12],
+                exc,
+            )
 
 
 def _build_extended_body(episode: NormalizedEpisode) -> str:

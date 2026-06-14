@@ -1,12 +1,13 @@
 # NewsEngine 设计文档
 
-**版本:** V2.1（Graphiti Schema 对齐 — 物理存储模型 vs 逻辑业务模型）  
+**版本:** V2.2（宏观/个股管线拆分 + 数据质量修复）  
 **日期:** 2026-06-14  
 **作者:** Chief Architect  
 **依据文档:**
 - `NewsEngine Proposal V1.0` (2026-06-08)
 - `SynapseEngine LOW_LEVEL_DESIGN.md` V1.8
 - `Graphiti SDK v0.29.2` 实际 Neo4j Schema（Episodic/Entity/RELATES_TO）
+- 灵汐 + Architect 联合审查（宏观管线瘫痪分析，2026-06-14）
 
 **状态:** Draft → 待审批  
 **审批人:** 老公  
@@ -16,6 +17,16 @@
 ---
 
 ## 版本说明
+
+### V2.2 变更摘要 (2026-06-14)
+
+1. **宏观/个股管线拆分** (§1.4 新增, §2.2, §3.2, §3.6 新增): 发现 V2.1 实现中 GDELT 和 RSS 适配器误用 `ticker_whitelist` 过滤，导致 824 条宏观新闻全部丢弃。将数据接入层拆分为宏观管线（GDELT/RSS）和个股管线（AkShare），各管线使用独立的过滤策略。
+2. **GDELT 宏观主题白名单** (§3.6.2 新增): 定义 19 个核心金融主题作为 GDELT 的 OR 匹配过滤器，替代原来的 ticker 关键词匹配。不包含地理标签（避免 CHINA/USA 等标签引入体育/娱乐/社会新闻噪音）。
+3. **RSS 零过滤** (§3.6.3): RSS 每天仅 10-30 条，源头（MarketWatch + FT）已是精选财经内容，无需 pre-ingestion 过滤。
+4. **content_scope 写入时标记** (§2.9 新增, §3.6.5): 在 Episode 写入 Neo4j 时标记 `content_scope`（MACRO/SECTOR/SYMBOL），利用 Graphiti `EpisodicNode.episode_metadata` 字段透传。替代原来 SynapseEngine 消费端推断的模式。
+5. **TTL 分级淘汰** (§6.6 新增): SYMBOL 3 天 / SECTOR 7 天 / MACRO 14 天，应用层 Cypher DETACH DELETE + 查询 WHERE 双重保障，每天执行 1 次。
+6. **19 个核心宏观主题定义** (§3.6.2): 货币政策(3) + 宏观指标(3) + 贸易制裁(3) + 地缘政治(2) + 监管(2) + 市场(2) + 科技(1) + 能源(1) + 债务风险(1) + 汇率(1)。
+7. **ticker whitelist 职责限定** (§2.2): 明确 `POST /api/tickers/whitelist` 仅服务于 AkShare 个股管线，不再传递给 GDELT/RSS 适配器。
 
 ### V2.1 变更摘要 (2026-06-14)
 
@@ -155,6 +166,63 @@ NewsEngine 可独立启动（不依赖 SynapseEngine 在线），ticker 白名�
 
 > **Treasury API 说明:** Proposal §3.4 定义的 Treasury API（美国国债收益率/利率决策）作为结构化数据源。Phase 1 (MVP) 暂不接入，推迟到 Phase 2+ 实施。理由: Phase 1 聚焦 GDELT CSV + RSS + AkShare 三条核心管线跑通，Treasury 为日级低频源，不影响主流程。
 
+## 1.4 宏观/个股双管线架构（V2.2 新增）
+
+### 1.4.1 问题发现
+
+V2.1 实现中 GDELT 和 RSS 适配器复用了 AkShare 的 `ticker_whitelist` 过滤逻辑：
+
+```
+GDELT: Parsed 824 records → Filtered 824 → 0 records by ticker whitelist
+RSS:   Parsed 10 entries  → Filtered 10  → 0 entries by ticker whitelist
+AkShare: Fetched 20 news items → wrote 1 episode
+```
+
+**根因：** 宏观新闻（"美联储加息"、"中美贸易战"、"芯片出口管制"）不包含个股 ticker 代码或公司名称，ticker 关键词匹配（`biz_code` / `name_zh` / `name_en`）对宏观事件命中率为零。三条管线使用了相同的过滤策略，但只有 AkShare 应该按 ticker 过滤。
+
+### 1.4.2 双管线架构
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                      NewsEngine 数据接入层                            │
+│                                                                      │
+│  ┌──────────────────────────────┐  ┌──────────────────────────────┐ │
+│  │     宏观管线 (MACRO)          │  │     个股管线 (SYMBOL)         │ │
+│  │                              │  │                              │ │
+│  │  GDELT CSV ──► theme 过滤 ──┤  │  AkShare ──► ticker 过滤 ──┤ │
+│  │  (824条/周期)  (19 核心主题)  │  │  (按白名单查询) (biz_code)    │ │
+│  │                              │  │                              │ │
+│  │  RSS ────────► 零过滤 ──────┤  │                              │ │
+│  │  (10条/周期)  (源头干净)      │  │                              │ │
+│  └──────────────┬───────────────┘  └──────────────┬───────────────┘ │
+│                 │                                  │                 │
+│                 ▼                                  ▼                 │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │                  Graphiti 引擎（统一写入）                      │   │
+│  │  content_scope: MACRO / SECTOR / SYMBOL (episode_metadata)   │   │
+│  └──────────────────────────────────────────────────────────────┘   │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**过滤策略矩阵：**
+
+| 管线 | 数据源 | 过滤维度 | 过滤来源 | 维护方 |
+|------|--------|---------|---------|--------|
+| **宏观** | GDELT | 19 核心宏观主题 OR 匹配 | 静态配置 `macro_themes.py` | NewsEngine（开发期静态） |
+| **宏观** | RSS | 零过滤（源头精选） | — | — |
+| **个股** | AkShare | ticker 白名单 | `POST /api/tickers/whitelist`（SynapseEngine push） | SynapseEngine（运行时动态） |
+
+### 1.4.3 设计决策
+
+**为什么不加地理标签？** GDELT GKG 的 locations 列包含国家代码（如 `CN`、`US`），若加入地理过滤，"中国女排 3:0 战胜巴西"（体育新闻，theme 不含金融标签）会因 `CN` 命中而漏入。内容主题天然排除非财经噪音：一条体育/娱乐新闻不会同时打上 `MONETARY_POLICY` 或 `REGULATION` 标签。
+
+**为什么 RSS 零过滤？** MarketWatch Top Stories + FT 两个 RSS 源每天产出仅 10-30 条，且源头已是财经精选。量级不足以构成存储压力，加过滤反而可能丢失关键宏观评论。
+
+**为什么不在 Neo4j 创建双 label？** Graphiti SDK 的 `Episodic`/`Entity`/`RELATES_TO` 是物理真实，不可更改。`content_scope` 作为 `episode_metadata` 自定义属性存储，消费时通过 Cypher WHERE 过滤。
+
+
+
 ---
 
 # Part 2: 接口契约
@@ -192,6 +260,8 @@ NewsEngine 可独立启动（不依赖 SynapseEngine 在线），ticker 白名�
 ## 2.2 SynapseEngine → NewsEngine: POST /api/tickers/whitelist
 
 SynapseEngine 启动时 + ticker 变化时（持仓变动/watchlist 增删）调用此端点，push ticker 白名单到 NewsEngine。
+
+> **V2.2 职责限定:** 此白名单**仅用于 AkShare 个股管线**。GDELT 和 RSS 宏观管线使用独立的 theme 过滤策略（见 §1.4 和 §3.6.2），不消费 ticker 白名单。
 
 **请求:**
 ```
@@ -234,7 +304,7 @@ Content-Type: application/json
 |------|------|------|------|
 | `tickers` | array | 是 | ticker 列表，包含持仓(5) + 自选股(20) |
 | `tickers[].symbol` | string | 是 | SynapseEngine 内部格式 `HK.XXXXX` |
-| `tickers[].biz_code` | string | 是 | 纯数字代码（供 GDELT/AkShare 使用） |
+| `tickers[].biz_code` | string | 是 | 纯数字代码（供 AkShare 个股管线使用） |
 | `tickers[].name` | string | 是 | 中文名称 |
 | `tickers[].sector` | string | 是 | 行业分类 |
 | `tickers[].source` | string | 是 | 枚举: `holding` (持仓) / `watchlist` (自选) |
@@ -299,8 +369,10 @@ async def receive_ticker_whitelist(request: Request):
 
 
 def get_ticker_whitelist() -> list[dict]:
-    """获取当前白名单（供 GDELT 过滤器使用）。
+    """获取当前白名单（供 AkShare Adapter 使用）。
     
+    V2.2: ticker whitelist 仅用于个股管线（AkShare）。
+    GDELT/RSS 宏观管线使用 macro_themes 白名单（见 §3.6.2）。
     优先使用内存缓存，降级到本地文件。
     """
     global _whitelist_cache
@@ -706,6 +778,60 @@ Graphiti SDK 写入 → Neo4j (Episodic/Entity/RELATES_TO)
 
 ---
 
+n
+
+## 2.9 content_scope 定义与标记策略（V2.2 新增）
+
+### 2.9.1 定义
+
+`content_scope` 标记每条 Episode 的宏观/行业/个股归属，用于消费端按维度查询和 TTL 分级淘汰。
+
+| 值 | 语义 | 典型来源 | 下游消费 |
+|----|------|---------|---------|
+| `MACRO` | 宏观事件（货币政策、地缘政治、贸易制裁等） | GDELT、RSS | PM Agent `macro_context`、risk-summary |
+| `SECTOR` | 行业级事件（行业趋势、政策变化） | sector_briefing 聚合产出 | MiroFish 行业推演、`/api/events/sector/:name` |
+| `SYMBOL` | 个股事件（财报、股价异动、公司新闻） | AkShare | Sentiment Analyst、`/api/events/entity/:ticker` |
+
+### 2.9.2 标记时机与位置
+
+**标记时机：写入时（NewsEngine 侧），不依赖消费端推断。**
+
+- 适配器层（GDELT/RSS/AkShare）在 `normalize()` 阶段设置 `NormalizedEpisode.metadata["content_scope"]`
+- `EpisodeWriter` 写入 Neo4j 时，Graphiti 自动将 `metadata` 透传到 `EpisodicNode.episode_metadata` 属性
+- sector_briefing 聚合产出的事件标记为 `SECTOR`
+
+**标记依据：**
+
+| 适配器 | content_scope | 依据 |
+|--------|--------------|------|
+| `GdeltAdapter` | `MACRO` | GDELT GKG 是全球宏观事件数据源 |
+| `RssAdapter` | `MACRO` | MarketWatch + FT 是宏观财经评论 |
+| `AkShareAdapter` | `SYMBOL` | 东方财富个股新闻 API，按 ticker 查询 |
+| `SectorBriefingAggregator` | `SECTOR` | 行业级聚合产出 |
+
+**为什么不依赖消费端推断？** 源头即真相。GDELT adapter 知道自己在处理宏观数据，不需要消费者通过实体类型（country/policy/sector/stock）反向猜测 scope。写入时标记比读取时推断更准确、更高效。
+
+### 2.9.3 episode_metadata 存储（Graphiti 透传）
+
+```python
+# 写入示例：GdeltAdapter.normalize()
+episode = NormalizedEpisode(
+    ...
+    metadata={"content_scope": "MACRO"},
+)
+```
+
+Graphiti SDK 的 `EpisodicNode` 模型支持 `episode_metadata` 字段，写入 Neo4j 时自动存储为节点属性。查询时：
+
+```cypher
+-- 查询所有宏观事件（14 天 TTL）
+MATCH (ep:Episodic)
+WHERE ep.episode_metadata CONTAINS 'MACRO'
+  AND ep.created_at > datetime() - duration({days: 14})
+RETURN ep
+ORDER BY ep.created_at DESC
+```
+
 # Part 3: 内部架构
 
 （来源: Internal Spec §2~§4，原文完整保留 — 含文件树、职责矩阵、依赖图、生命周期）
@@ -738,6 +864,7 @@ NewsEngine/
 │   │   ├── gdelt_adapter.py      # GDELT CSV 适配器【已实现】
 │   │   ├── rss_adapter.py        # RSS 抓取适配器【已实现】
 │   │   ├── akshare_adapter.py    # AkShare 个股新闻适配器【已实现】
+│   │   └── macro_themes.py       # GDELT 宏观主题白名单（19 核心主题）【V2.2 新增】
 │   │   └── treasury_adapter.py   # Treasury API 适配器【已实现】
 │   │
 │   ├── graphiti/                 # Graphiti 知识图集成层【N3 ✅ 已完成】
@@ -825,7 +952,8 @@ NewsEngine/
 | `core/config.py` | 配置加载、校验、环境变量解析 | `python-dotenv`, `pydantic-settings` | `Settings` 单例 |
 | `core/neo4j_client.py` | Neo4j Driver 生命周期管理 | `core/config.py`, `neo4j` 驱动 | `get_neo4j_driver()`, `close_neo4j_driver()` |
 | `core/graphiti_client.py` | Graphiti SDK 实例创建与配置 | `core/config.py`, `core/neo4j_client.py`, `graphiti/` | `create_graphiti()` |
-| `adapters/` | 原始数据 → `NormalizedEpisode` 转换 | `core/config.py`, `adapters/models.py` | `BaseAdapter` 子类 |
+| `adapters/` | 原始数据 → `NormalizedEpisode` 转换 + 管线过滤（V2.2） | `core/config.py`, `adapters/models.py`, `adapters/macro_themes.py` | `BaseAdapter` 子类 |
+| `adapters/macro_themes.py` | GDELT 宏观主题白名单（19 核心金融主题）| 零依赖（纯常量） | `MACRO_THEME_KEYWORDS` |
 | `graphiti/` | `NormalizedEpisode` → Neo4j 知识图写入 | `graphiti-core`, `adapters/models.py`, `core/neo4j_client.py` | `EpisodeWriter` |
 | `graphiti/translation.py` | Neo4j Episodic/Entity record → 业务模型 (EventItem/EventEntityItem) 共享翻译 | `graphiti/entity_types.py` | `translate_episode_to_event()`, `translate_entity_to_item()`, `SEVERITY_WEIGHT` |
 | `sync/` | SynapseEngine ticker 白名单管理 | `requests` | `get_ticker_whitelist()` |
@@ -1053,6 +1181,256 @@ def create_graphiti(driver: Driver | None = None) -> Graphiti:
 
 ---
 
+n
+
+## 3.6 数据接入层 — 宏观/个股双管线过滤策略（V2.2 新增）
+
+### 3.6.1 架构概述
+
+数据接入层拆分为**宏观管线**和**个股管线**，使用独立的 pre-ingestion 过滤策略：
+
+```
+IngestionScheduler._run_cycle()
+        │
+        ├── Step 1: 读取 ticker whitelist（仅用于 AkShare）
+        │
+        ├── Step 2: 并发运行 3 条管线
+        │     ├── GDELT Pipeline: fetch → theme_filter → normalize → dedup → write
+        │     ├── RSS Pipeline:   fetch → (no filter) → normalize → dedup → write
+        │     └── AkShare Pipeline: fetch → (ticker_filter implicit) → normalize → dedup → write
+        │
+        ├── Step 3: Severity enrichment (L-4 rule engine)
+        │
+        └── Step 4: SectorBriefingAggregator.aggregate_all()
+```
+
+**适配器初始化差异：**
+
+| 适配器 | 构造参数 | 过滤属性 |
+|--------|---------|---------|
+| `GdeltAdapter` | `macro_theme_keywords: set[str]` | `_macro_theme_keywords`（19 个主题，OR 匹配） |
+| `RssAdapter` | `feed_urls: list[str]` | 无（零过滤） |
+| `AkShareAdapter` | `ticker_whitelist: list[dict]` | `ticker_whitelist`（SynapseEngine push） |
+
+**Scheduler._update_adapter_tickers() 拆分（V2.2）：**
+
+```python
+def _update_adapter_tickers(self, tickers):
+    # ticker whitelist 仅用于 AkShare 个股管线
+    # GDELT/RSS 不使用 ticker whitelist（使用 macro_theme 白名单 / 零过滤）
+    if self._akshare_adapter is not None:
+        self._akshare_adapter.ticker_whitelist = tickers
+        self._akshare_adapter._symbol_map = {}
+        for entry in tickers:
+            biz_code = entry.get("biz_code", "")
+            if biz_code:
+                self._akshare_adapter._symbol_map[biz_code] = entry
+```
+
+### 3.6.2 GDELT 宏观主题白名单（19 个核心主题）
+
+**文件：** `src/adapters/macro_themes.py`
+
+**匹配方式：** 子串匹配（`keyword.lower() in themes_text.lower()`），19 个关键词中**任一命中即保留**（OR 逻辑）。匹配对象为 GKG V2.8 Themes 列。
+
+**19 个核心主题：**
+
+| # | 类别 | 关键词 | 覆盖的投资场景 |
+|---|------|--------|-------------|
+| 1 | 货币政策 | `MONETARY_POLICY` | 货币政策转向、QE/QT |
+| 2 | 货币政策 | `CENTRAL_BANK` | 央行政策声明、利率决议 |
+| 3 | 货币政策 | `INTEREST_RATE` | 利率变动、收益率曲线 |
+| 4 | 宏观指标 | `GDP` | 国内生产总值、经济增长 |
+| 5 | 宏观指标 | `INFLATION` | CPI/PPI 超预期、通胀预期 |
+| 6 | 宏观指标 | `RECESSION` | 经济衰退信号、PMI 下滑 |
+| 7 | 贸易制裁 | `TRADE` | 贸易争端、301 关税、谈判 |
+| 8 | 贸易制裁 | `TARIFF` | 关税政策、贸易壁垒 |
+| 9 | 贸易制裁 | `SANCTION` | 经济制裁、金融制裁 |
+| 10 | 地缘政治 | `GEOPOLITICAL` | 地缘冲突、台海、南海 |
+| 11 | 地缘政治 | `WAR` | 军事冲突 |
+| 12 | 监管 | `REGULATION` | 监管政策、法律变更 |
+| 13 | 监管 | `ANTITRUST` | 反垄断调查、拆分 |
+| 14 | 市场 | `STOCK_MARKET` | 全球股市波动、交易所事件 |
+| 15 | 市场 | `CURRENCY` | 汇率波动、货币贬值、人民币 |
+| 16 | 科技 | `SEMICONDUCTOR` | 芯片出口管制、供应链 |
+| 17 | 能源 | `ENERGY` | 能源危机、OPEC+ 减产 |
+| 18 | 债务风险 | `DEBT` | 主权债务、信用违约、恒大/碧桂园 |
+| 19 | 汇率 | `EXCHANGE_RATE` | 人民币汇率、日元贬值 |
+
+**排除的主题及理由：**
+
+| 排除关键词 | 理由 |
+|-----------|------|
+| `ECONOMY` | 太泛，GDELT GKG 中 ~30% 记录带经济标签，等于不过滤 |
+| `MARKETS` | 太泛，覆盖劳动力市场、商品市场等，金融信号密度低 |
+| `TECHNOLOGY` | 太泛，AI 论文、App 更新都算，与投资无关；`SEMICONDUCTOR` 已覆盖核心科技供应链 |
+| `CHINA` / `USA` / `ASIA` | 地理标签，会引入体育/娱乐/社会新闻噪音 |
+| `DIPLOMACY` | 太泛，外交访问/协议等低频市场影响 |
+| `QE` | 与 `MONETARY_POLICY` 重叠 |
+| `EMPLOYMENT` | GDELT 中极少独立出现就业主题 |
+| `COMMODITIES` | 与 `ENERGY` 重叠 |
+
+**常量定义：**
+
+```python
+# src/adapters/macro_themes.py
+"""GDELT GKG macro theme whitelist for financial event filtering.
+
+19 core themes organized by category. Any theme keyword matching a GKG
+record's V2.8 Themes field will cause the record to be retained (OR logic).
+"""
+
+MACRO_THEME_KEYWORDS: set[str] = {
+    # 货币政策 (3)
+    "MONETARY_POLICY",
+    "CENTRAL_BANK",
+    "INTEREST_RATE",
+    # 宏观指标 (3)
+    "GDP",
+    "INFLATION",
+    "RECESSION",
+    # 贸易制裁 (3)
+    "TRADE",
+    "TARIFF",
+    "SANCTION",
+    # 地缘政治 (2)
+    "GEOPOLITICAL",
+    "WAR",
+    # 监管 (2)
+    "REGULATION",
+    "ANTITRUST",
+    # 市场 (2)
+    "STOCK_MARKET",
+    "CURRENCY",
+    # 科技 (1)
+    "SEMICONDUCTOR",
+    # 能源 (1)
+    "ENERGY",
+    # 债务风险 (1)
+    "DEBT",
+    # 汇率 (1)
+    "EXCHANGE_RATE",
+}
+```
+
+**GDELT filter_relevant() 改写：**
+
+```python
+def filter_relevant(self, records: list[dict]) -> list[dict]:
+    """Macro theme filter — 19 核心金融主题 OR 匹配。
+
+    V2.2: 代替原来的 ticker_whitelist 关键词过滤。
+    匹配 GKG V2.8 Themes 列中是否包含任一核心金融主题。
+    """
+    if not self._macro_theme_keywords:
+        return records
+
+    matched: list[dict] = []
+    for rec in records:
+        themes_text = (rec.get("themes") or "").lower()
+        if any(kw.lower() in themes_text for kw in self._macro_theme_keywords):
+            matched.append(rec)
+
+    logger.info(
+        "GDELT theme filter: %d → %d records (themes=%s)",
+        len(records), len(matched),
+        "OR".join(sorted(self._macro_theme_keywords))[:80]
+    )
+    return matched
+```
+
+**预期过滤效果：**
+
+| 指标 | 当前 (ticker whitelist) | 方案后 (19 themes OR) |
+|------|------------------------|---------------------|
+| 单轮输入 | 824 条 | 824 条 |
+| 单轮输出 | **0 条** | **80-180 条** |
+| 保留比例 | 0% | 10-22% |
+| 日写入 (4 轮) | 0 条 | 320-720 条（Graphiti 去重前） |
+| 日有效 Episode | 0 条 | 80-200 条（Graphiti 去重后） |
+
+### 3.6.3 RSS 零过滤
+
+**文件：** `src/adapters/rss_adapter.py`
+
+**方案：** 移除 `filter_relevant()` 调用，`fetch()` 直接返回全部 RSS entry。
+
+**当前代码移除：**
+```python
+# 移除这一行
+all_entries = self.filter_relevant(all_entries)
+```
+
+**适配器构造参数变更：**
+```python
+# 移除 ticker_whitelist 参数
+class RssAdapter(BaseAdapter):
+    def __init__(self, feed_urls=None, dedup_cache=None):
+        self.feed_urls = feed_urls or []
+        # 不再有 self.ticker_whitelist
+```
+
+**数据量评估：**
+- MarketWatch Top Stories：~6-8 条/次
+- FT：~4-6 条/次
+- 每轮周期 ~10 条
+- 每天 ~40 条（4 轮 15min）
+- Graphiti 语义去重后 ~25-30 条/天有效 Episode
+
+**零过滤的理由：**
+1. 量级极低（~10 条/周期），不存在存储压力
+2. MarketWatch + FT 源头已是财经精选内容
+3. 任何 pre-ingestion 过滤都可能丢失关键宏观评论（如 FT 专栏对地缘政治的分析可能不提具体经济术语）
+
+### 3.6.4 数据量三层防御
+
+```
+Layer 1: Pre-Ingestion 主题过滤（适配器层）
+  GDELT: 824 → ~80-180 条/周期
+  RSS:   10  → 10 条/周期（零过滤）
+  降低 GDELT 75-90%
+
+Layer 2: Graphiti 语义去重（SDK 层）
+  ~80-180 → ~30-80 条/周期
+  Graphiti 的 add_episode() 内置语义相似度判重，
+  同一事件多信源报道合并为同一 Episode
+  降低 40-60%
+
+Layer 3: Neo4j TTL 淘汰（存储层）
+  MACRO 14 天 / SECTOR 7 天 / SYMBOL 3 天
+  每天 1 次 DETACH DELETE 清理
+  查询层加 created_at 时间窗口 WHERE
+  活跃事件集控制在 ~5K 以内
+```
+
+### 3.6.5 content_scope 写入链路
+
+```
+适配器 normalize()
+        │
+        ├── GdeltAdapter:  metadata["content_scope"] = "MACRO"
+        ├── RssAdapter:    metadata["content_scope"] = "MACRO"
+        └── AkShareAdapter: metadata["content_scope"] = "SYMBOL"
+                │
+                ▼
+        NormalizedEpisode.metadata
+                │
+                ▼
+        EpisodeWriter.write_one()
+        → graphiti.add_episode(episode)
+                │
+                ▼
+        EpisodicNode.episode_metadata  ←  Graphiti SDK 自动透传
+                │
+                ▼
+        Neo4j: (ep:Episodic {episode_metadata: '{"content_scope": "MACRO"}'})
+                │
+                ▼
+        查询: MATCH (ep:Episodic)
+              WHERE ep.episode_metadata CONTAINS 'MACRO'
+```
+
+
 # Part 4: 配置与测试
 
 （来源: Internal Spec §5~§6，原文完整保留）
@@ -1154,6 +1532,28 @@ AKSHARE_REQUEST_INTERVAL_SEC=0.5
 RISK_SUMMARY_CACHE_TTL_SEC=300
 # 敏感: 否 | 默认: 300 (5 分钟) | 必填: 否
 # 说明: /api/events/risk-summary 结果缓存时间（秒）。Design Doc §2.6 要求的缓存策略
+
+# === Episode TTL 淘汰 (V2.2 新增) ===
+EPISODE_TTL_MACRO_DAYS=14
+# 敏感: 否 | 默认: 14 (2 周) | 必填: 否
+# 说明: MACRO scope Episode 保留天数。宏观趋势变化慢，2 周内对 PM Agent 仍有价值
+
+EPISODE_TTL_SECTOR_DAYS=7
+# 敏感: 否 | 默认: 7 (1 周) | 必填: 否
+# 说明: SECTOR scope Episode 保留天数
+
+EPISODE_TTL_SYMBOL_DAYS=3
+# 敏感: 否 | 默认: 3 (3 天) | 必填: 否
+# 说明: SYMBOL scope Episode 保留天数。个股消息 3 天后已反映在股价里
+
+TTL_CLEANUP_INTERVAL_HOURS=24
+# 敏感: 否 | 默认: 24 (每天 1 次) | 必填: 否
+# 说明: TTL DETACH DELETE 清理间隔（小时）。每天执行 1 次，在 ingestion cycle 之间执行
+
+# === GDELT 宏观主题 (V2.2 新增) ===
+GDELT_MACRO_THEMES_FILE=src/adapters/macro_themes.py
+# 敏感: 否 | 默认: src/adapters/macro_themes.py | 必填: 否
+# 说明: GDELT 宏观主题白名单常量文件路径（19 个核心金融主题）
 ```
 
 ### 4.1.2 Pydantic Settings 实现 (core/config.py)
@@ -1279,6 +1679,30 @@ class Settings(BaseSettings):
     risk_summary_cache_ttl_sec: int = Field(
         default=300,
         description="Risk Summary 结果缓存 TTL（秒）",
+    )
+
+    # ── Episode TTL 淘汰 (V2.2 新增) ──
+    episode_ttl_macro_days: int = Field(
+        default=14,
+        description="MACRO scope Episode 保留天数",
+    )
+    episode_ttl_sector_days: int = Field(
+        default=7,
+        description="SECTOR scope Episode 保留天数",
+    )
+    episode_ttl_symbol_days: int = Field(
+        default=3,
+        description="SYMBOL scope Episode 保留天数",
+    )
+    ttl_cleanup_interval_hours: int = Field(
+        default=24,
+        description="TTL 清理间隔（小时）",
+    )
+
+    # ── GDELT 宏观主题 (V2.2 新增) ──
+    gdelt_macro_themes_file: str = Field(
+        default="src/adapters/macro_themes.py",
+        description="GDELT 宏观主题白名单常量文件路径",
     )
 
     # ── 校验 ──
@@ -2026,6 +2450,137 @@ curl http://localhost:7474
 
 ---
 
+n
+
+## 6.6 Episode TTL 分级淘汰策略（V2.2 新增）
+
+### 6.6.1 设计决策
+
+**应用层 TTL，非 Neo4j 原生 TTL。** Neo4j 社区版无文档级 TTL 支持，且 Graphiti SDK 内部索引依赖 Episodic UUID，不能依赖数据库层自动过期。
+
+**两层保障：**
+- **Layer 1（查询过滤）：** 所有面向消费者的 Cypher 查询加 `WHERE ep.created_at > datetime() - duration({days: N})`
+- **Layer 2（定时清理）：** 每天 1 次 `DETACH DELETE` 删除过期节点
+
+### 6.6.2 分级 TTL
+
+| content_scope | TTL | 理由 |
+|---------------|-----|------|
+| `SYMBOL`（个股） | **3 天** | 个股消息已反映在股价里，3 天后无边际增量信息价值 |
+| `SECTOR`（行业） | **7 天** | 行业趋势变化慢于个股，一周内的行业事件对 MiroFish 推演仍有参考价值 |
+| `MACRO`（宏观） | **14 天** | 宏观信号（加息周期、贸易战、地缘冲突）是慢变量，两周前的数据对 PM Agent 决策仍有上下文价值 |
+
+### 6.6.3 查询层 WHERE 子句（Layer 1）
+
+所有面向消费者的 Cypher 查询必须加时间窗口限制：
+
+```cypher
+-- /api/events/active - 返回所有活跃事件（限制 7 天通用窗口）
+MATCH (ep:Episodic)
+WHERE ep.valid_at IS NOT NULL
+  AND ep.created_at > datetime() - duration({days: 7})
+RETURN ep ORDER BY ep.created_at DESC LIMIT 50
+
+-- /api/events/entity/:ticker - 个股事件（3 天）
+MATCH (stock:Entity {ticker: $ticker})-[rel:RELATES_TO]-(ep:Episodic)
+WHERE rel.uuid IN ep.entity_edges
+  AND ep.created_at > datetime() - duration({days: 3})
+RETURN ep ORDER BY ep.created_at DESC
+
+-- /api/events/sector/:name - 行业事件（7 天）
+MATCH (sector:Entity)-[*2]-(ep:Episodic)
+WHERE sector.name = $sector_name
+  AND ep.created_at > datetime() - duration({days: 7})
+RETURN ep ORDER BY ep.created_at DESC
+
+-- /api/events/risk-summary - 宏观风险（14 天）
+MATCH (ep:Episodic)
+WHERE ep.episode_metadata CONTAINS 'MACRO'
+  AND ep.created_at > datetime() - duration({days: 14})
+RETURN ep ORDER BY ep.severity DESC LIMIT 20
+```
+
+### 6.6.4 定时清理作业（Layer 2）
+
+**文件：** `src/ingestion/scheduler.py`
+
+**执行频率：** 每天 1 次（默认 04:00 UTC / 12:00 HKT），在 ingestion cycle 之间执行。
+
+```python
+async def _ttl_cleanup(self) -> dict[str, int]:
+    """分级 TTL 清理：DETACH DELETE 过期 Episodic 节点。
+
+    每天执行 1 次，在 cycle 开始前检查 last_ttl_cleanup_date。
+    """
+    settings = get_settings()
+    today = now_hkt().strftime("%Y-%m-%d")
+
+    if self._last_ttl_cleanup_date == today:
+        return {"skipped": 0}
+
+    results: dict[str, int] = {}
+    ttl_configs = [
+        ("SYMBOL", settings.episode_ttl_symbol_days),
+        ("SECTOR", settings.episode_ttl_sector_days),
+        ("MACRO", settings.episode_ttl_macro_days),
+    ]
+
+    for scope, days in ttl_configs:
+        query = """
+        MATCH (ep:Episodic)
+        WHERE ep.episode_metadata CONTAINS $scope
+          AND ep.created_at < datetime() - duration({days: $days})
+        DETACH DELETE ep
+        RETURN count(ep) AS deleted
+        """
+        result = self._neo4j_driver.execute_query(
+            query, {"scope": scope, "days": days}
+        )
+        deleted = result[0]["deleted"] if result else 0
+        results[scope] = deleted
+        if deleted > 0:
+            logger.info(
+                "TTL cleanup [%s]: deleted %d episodes (ttl=%dd)",
+                scope, deleted, days,
+            )
+
+    # Optionally: clean orphan Entity nodes (no Episodic connected)
+    orphan_query = """
+    MATCH (e:Entity)
+    WHERE NOT (e)-[:RELATES_TO]-()
+    DELETE e
+    RETURN count(e) AS deleted
+    """
+    orphan_result = self._neo4j_driver.execute_query(orphan_query)
+    orphan_deleted = orphan_result[0]["deleted"] if orphan_result else 0
+    if orphan_deleted > 0:
+        results["orphan_entities"] = orphan_deleted
+        logger.info("TTL cleanup: deleted %d orphan Entity nodes", orphan_deleted)
+
+    self._last_ttl_cleanup_date = today
+    return results
+```
+
+### 6.6.5 边界条件处理
+
+| 场景 | 处理 |
+|------|------|
+| 7 天内无新 Episode | 不执行清理（所有 `deleted == 0`） |
+| 清理中 ingestion 并发 | Neo4j 事务隔离，写入不受影响 |
+| 旧 Episode 仍有活跃 RELATES_TO | `DETACH DELETE` 自动级联删除关系边 |
+| Entity 变成孤儿 | 清理后执行 `MATCH (e:Entity) WHERE NOT (e)--() DELETE e` |
+| 首次启动时 Neo4j 有大量旧数据 | 首次清理可能删除大量节点，之后稳态 |
+
+### 6.6.6 预期效果
+
+| 时间 | 活跃 Episode 存量 | 说明 |
+|------|------------------|------|
+| 首次运行后 | 0 | 全新 Neo4j |
+| 第 1 天 | ~500-1200 | GDELT(200) + RSS(30) + AkShare(300-800) |
+| 稳态（第 14 天后） | ~3K-6K | 前 14 天滚动窗口 |
+| 每天变化 | ±200 | 日增量 ~500-1000，淘汰 ~500-1000，动态平衡 |
+
+
 # Part 7: MongoDB Schema 变更
 
 （来源: Redesign Doc §D，原文完整保留 — 含 DDL、索引、字段重命名、废弃说明）
@@ -2714,6 +3269,14 @@ L-6 (health data_sources) ── 无依赖，任意时间做
 - [ ] **N4-L** Risk-summary LLM 聚合（L-5）
 - [ ] **N4-L** Health data_sources 真实数据接入（L-6）
 - [ ] **N4-L** 全量集成测试通过
+- [ ] **V2.2** §1.4 宏观/个股双管线架构设计
+- [ ] **V2.2** §2.2 ticker whitelist 职责限定（仅 AkShare）
+- [ ] **V2.2** §2.9 content_scope 定义与标记策略
+- [ ] **V2.2** §3.6.2 19 个核心宏观主题白名单定义
+- [ ] **V2.2** §3.6.3 RSS 零过滤策略
+- [ ] **V2.2** §3.6.5 content_scope 写入链路
+- [ ] **V2.2** §4.1 配置项新增（EPISODE_TTL_*, GDELT_MACRO_THEMES_FILE）
+- [ ] **V2.2** §6.6 TTL 分级淘汰策略（3/7/14 天）
 
 ## 9.2 SynapseEngine 侧影响检查
 
@@ -2766,10 +3329,11 @@ L-6 (health data_sources) ── 无依赖，任意时间做
 | 2026-06-09 | Internal Spec V1.1: 新增 `sector_briefing` 完整生成链路（数据来源/LLM Prompt/模块归属/缓存策略/降级方案） | Chief Architect |
 | 2026-06-09 | **V2.0 合并版**: Redesign Doc V1.2 + Internal Spec V1.1 合并为单一设计文档。NewsEngine 内部架构（文件树、依赖图、生命周期、配置、测试、sector_briefing 链路、N4 指南）纳入正文。SynapseEngine 侧变更移至附录 A/B 作为参考指引。原始文件保留不动。 | Chief Architect |
 | 2026-06-14 | **V2.1 Graphiti Schema 对齐**: (1) 新增 §2.8 物理存储模型 vs 逻辑业务模型 (schema 映射表 + 设计决策 + 数据流图)。(2) §5.2 sector_briefing Cypher 从假设的 Event/Stock/Sector 更新为实际 Episodic/Entity/RELATES_TO。(3) 新增 `src/graphiti/translation.py` 共享翻译层 (§3.1/§3.2/§3.3)。(4) §8.2.3 端点→Neo4j 映射表修正为实际 label。(5) 依赖铁律 9→10 条。(6) MongoDB 同步链路澄清（REST API 响应层完成翻译）。(7) **新增 §8.4 N4-L 收尾任务** — 6 个任务修复 3 个 Gap + 实现 V2.1 新定义。 | Chief Architect |
+| 2026-06-14 | **V2.2 宏观/个股管线拆分 + 数据质量修复**: (1) 新增 §1.4 宏观/个股双管线架构（问题发现 + 双管线图 + 过滤策略矩阵 + 设计决策）。(2) §2.2 ticker whitelist 职责限定为仅 AkShare。(3) 新增 §2.9 content_scope 定义与标记策略（3 种 scope + 写入时标记 + episode_metadata 透传）。(4) 新增 §3.6 数据接入层完整设计（GDELT 19 主题白名单 + RSS 零过滤 + 三层防御 + content_scope 写入链路）。(5) §3.1 新增 `macro_themes.py`。(6) §3.2 适配器模块职责更新。(7) §4.1 新增 TTL 和 GDELT 主题配置项。(8) 新增 §6.6 TTL 分级淘汰策略（3/7/14 天 + 两层保障 + 定时清理作业）。(9) 老公 + 灵汐 + Architect 三方审查确认。 | Chief Architect |
 
 ---
 
-*NewsEngine 设计文档 V2.1 — 单一真相源（Single Source of Truth）。定义 NewsEngine 项目从架构到实施的全部设计规格。审批通过后作为 Tech Lead 的唯一实施蓝图。2026-06-14*
+*NewsEngine 设计文档 V2.2 — 单一真相源（Single Source of Truth）。定义 NewsEngine 项目从架构到实施的全部设计规格。审批通过后作为 Tech Lead 的唯一实施蓝图。2026-06-14*
 
 ---
 

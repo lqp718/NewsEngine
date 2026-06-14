@@ -1,7 +1,13 @@
 """IngestionScheduler — multi-source ingestion scheduler.
 
-Orchestrates three adapter pipelines (GDELT, RSS, AkShare) every 15 minutes,
-followed by SectorBriefingAggregator.aggregate_all().
+Orchestrates two pipelines (macro pipeline: GDELT & RSS, stock pipeline:
+AkShare) every 15 minutes, followed by SectorBriefingAggregator.aggregate_all().
+
+V2.2: Macro/stock pipeline split:
+- Macro pipeline (GDELT): uses 19 core theme OR matching, not ticker whitelist
+- Macro pipeline (RSS): zero pre-ingestion filtering
+- Stock pipeline (AkShare): ticker whitelist filtering only
+- TTL cleanup: runs daily via DETACH DELETE (Layer 2)
 
 Lifecycle:
     scheduler = IngestionScheduler(...)
@@ -22,6 +28,7 @@ from neo4j import Driver
 from src.core.config import get_settings
 from src.core.neo4j_client import get_neo4j_driver
 from src.utils.logging_config import get_logger
+from src.utils.time_utils import now_hkt
 
 from .briefing_aggregator import SectorBriefingAggregator
 from .pipeline import PipelineResult, run_pipeline
@@ -101,8 +108,13 @@ def _extract_sector_names(tickers: list[dict[str, str]]) -> list[str]:
 class IngestionScheduler:
     """Multi-source ingestion scheduler.
 
-    Runs three adapter pipelines (GDELT, RSS, AkShare) concurrently every
-    ``interval_sec`` seconds, then calls SectorBriefingAggregator.
+    Runs two pipelines (macro & stock) concurrently every ``interval_sec``
+    seconds, then calls SectorBriefingAggregator.
+
+    V2.2:
+    - Macro pipeline: GDELT (theme filter) + RSS (zero filter)
+    - Stock pipeline: AkShare (ticker whitelist filter)
+    - TTL cleanup on daily schedule
     """
 
     def __init__(
@@ -150,6 +162,9 @@ class IngestionScheduler:
 
         # ── Briefing Aggregator ───────────────────────────────────
         self._aggregator = SectorBriefingAggregator()
+
+        # ── TTL cleanup state (V2.2) ──────────────────────────────
+        self._last_ttl_cleanup_date: str | None = None
 
         # ── Lifecycle state ───────────────────────────────────────
         self._running = False
@@ -202,6 +217,9 @@ class IngestionScheduler:
 
         Delayed from __init__ to allow caller to set up dependencies
         (Neo4j, Graphiti) before the scheduler wires them.
+
+        V2.2: Macro/Stock pipeline split — each adapter receives its
+        own filtering configuration.
         """
         if self._writer is not None:
             return
@@ -216,21 +234,34 @@ class IngestionScheduler:
         if self._graphiti is None:
             self._graphiti = create_graphiti()
 
-        self._writer = EpisodeWriter(graphiti=self._graphiti)
+        self._writer = EpisodeWriter(
+            graphiti=self._graphiti,
+            neo4j_driver=self._neo4j_driver,
+        )
+
+        # ── Macro pipeline: GDELT uses macro theme keywords (not tickers) ──
+        from src.adapters.macro_themes import MACRO_THEME_KEYWORDS
 
         self._gdelt_adapter = GdeltAdapter(
+            macro_theme_keywords=MACRO_THEME_KEYWORDS,
             dedup_cache=self._dedup_cache,
         )
+
+        # ── Macro pipeline: RSS uses zero filtering (no tickers) ───
         self._rss_adapter = RssAdapter(
             feed_urls=self._feed_urls,
             dedup_cache=self._dedup_cache,
         )
+
+        # ── Stock pipeline: AkShare uses ticker whitelist ──────────
         self._akshare_adapter = AkShareAdapter(
             dedup_cache=self._dedup_cache,
         )
 
         logger.info(
-            "Scheduler components initialized: GDELT+RSS+AkShare adapters, "
+            "Scheduler components initialized: "
+            "GDELT[theme-filter] + RSS[zero-filter](macro pipeline), "
+            "AkShare[ticker-filter](stock pipeline), "
             "EpisodeWriter, SectorBriefingAggregator"
         )
 
@@ -243,6 +274,9 @@ class IngestionScheduler:
             logger.info("=== Ingestion cycle starting ===")
 
             try:
+                # V2.2: TTL cleanup at start of each cycle
+                await self._ttl_cleanup()
+
                 results = await self._run_cycle()
                 await self._log_cycle_summary(results, cycle_start)
             except asyncio.CancelledError:
@@ -273,11 +307,11 @@ class IngestionScheduler:
     async def _run_cycle(self) -> list[PipelineResult]:
         """Execute one full ingestion cycle.
 
-        1. Read ticker whitelist
-        2. Run 3 pipelines concurrently with error isolation
+        1. Read ticker whitelist (only for AkShare stock pipeline)
+        2. Run pipelines concurrently with error isolation
         3. Call SectorBriefingAggregator
         """
-        # ── Step 1: Read ticker whitelist ───────────────────────────
+        # ── Step 1: Read ticker whitelist — only for AkShare ────
         tickers = get_ticker_whitelist(self._whitelist_path)
         sector_names = _extract_sector_names(tickers)
         logger.info(
@@ -286,10 +320,10 @@ class IngestionScheduler:
             len(sector_names),
         )
 
-        # Update adapter ticker whitelists for this cycle
+        # Update adapter ticker whitelists — only AkShare needs tickers
         self._update_adapter_tickers(tickers)
 
-        # ── Step 2: Run 3 pipelines concurrently ───────────────────
+        # ── Step 2: Run pipelines concurrently ───────────────────
         pipeline_results: list[PipelineResult] = []
 
         coros = [
@@ -319,7 +353,7 @@ class IngestionScheduler:
             else:
                 pipeline_results.append(result)
 
-        # ── Step 3: Severity enrichment (L-4 rule engine) ──────────
+        # ── Step 3: Severity enrichment (L-4 rule engine) ────────
         try:
             from .severity_enricher import enrich_severity_batch
 
@@ -336,7 +370,7 @@ class IngestionScheduler:
                 exc_info=True,
             )
 
-        # ── Step 4: Briefing aggregation ───────────────────────────
+        # ── Step 4: Briefing aggregation ─────────────────────────
         if sector_names and self._aggregator:
             try:
                 briefing_results = await self._aggregator.aggregate_all(sector_names)
@@ -383,14 +417,13 @@ class IngestionScheduler:
     def _update_adapter_tickers(
         self, tickers: list[dict[str, str]]
     ) -> None:
-        """Update ticker whitelists on all adapters for this cycle.
+        """Update ticker whitelists — only for AkShare stock pipeline.
 
-        The adapters use the whitelist for filtering and symbol lookup.
+        V2.2: GDELT/RSS macro pipeline no longer uses ticker whitelist.
+        Only AkShare receives ticker updates.
         """
-        if self._gdelt_adapter is not None:
-            self._gdelt_adapter.ticker_whitelist = tickers
-        if self._rss_adapter is not None:
-            self._rss_adapter.ticker_whitelist = tickers
+        # GDELT: no longer receives ticker whitelist (uses macro theme filter)
+        # RSS: no longer receives ticker whitelist (zero filter)
         if self._akshare_adapter is not None:
             self._akshare_adapter.ticker_whitelist = tickers
             # AkShareAdapter rebuilds symbol map from whitelist each cycle
@@ -399,6 +432,99 @@ class IngestionScheduler:
                 biz_code = entry.get("biz_code", "")
                 if biz_code:
                     self._akshare_adapter._symbol_map[biz_code] = entry
+
+    # ── TTL Cleanup (V2.2 Layer 2) ─────────────────────────────────────
+
+    async def _ttl_cleanup(self) -> dict[str, int]:
+        """分级 TTL 清理：DETACH DELETE 过期 Episodic 节点。
+
+        每天执行 1 次，在 cycle 开始前检查 last_ttl_cleanup_date。
+
+        Layer 2（存储层）：DETACH DELETE 直接删除过期节点。
+        Layer 1（查询层）在 API 端 Cypher WHERE 中实现。
+
+        Returns:
+            各 scope 的删除数量字典。
+        """
+        settings = get_settings()
+        today = now_hkt().strftime("%Y-%m-%d")
+
+        if self._last_ttl_cleanup_date == today:
+            return {"skipped": 0}
+
+        results: dict[str, int] = {}
+        ttl_configs = [
+            ("SYMBOL", settings.episode_ttl_symbol_days),
+            ("SECTOR", settings.episode_ttl_sector_days),
+            ("MACRO", settings.episode_ttl_macro_days),
+        ]
+
+        for scope, days in ttl_configs:
+            try:
+                with self._neo4j_driver.session() as session:
+                    query = """
+                    MATCH (ep:Episodic)
+                    WHERE ep.episode_metadata CONTAINS $scope
+                      AND ep.created_at < datetime() - duration({days: $days})
+                    DETACH DELETE ep
+                    RETURN count(ep) AS deleted
+                    """
+                    result = session.run(
+                        query,
+                        {"scope": scope, "days": days},
+                    )
+                    record = result.single()
+                    deleted = record["deleted"] if record else 0
+                    results[scope] = deleted
+                    if deleted > 0:
+                        logger.info(
+                            "TTL cleanup [%s]: deleted %d episodes (ttl=%dd)",
+                            scope,
+                            deleted,
+                            days,
+                        )
+            except Exception as exc:
+                logger.warning(
+                    "TTL cleanup [%s] failed: %s",
+                    scope,
+                    exc,
+                    exc_info=True,
+                )
+                results[f"{scope}_error"] = 1
+
+        # 清理孤儿 Entity 节点（无关联 RELATES_TO 的 Entity）
+        try:
+            orphan_query = """
+            MATCH (e:Entity)
+            WHERE NOT (e)-[:RELATES_TO]-()
+            DELETE e
+            RETURN count(e) AS deleted
+            """
+            with self._neo4j_driver.session() as session:
+                orphan_result = session.run(orphan_query)
+                orphan_record = orphan_result.single()
+                orphan_deleted = orphan_record["deleted"] if orphan_record else 0
+            if orphan_deleted > 0:
+                results["orphan_entities"] = orphan_deleted
+                logger.info(
+                    "TTL cleanup: deleted %d orphan Entity nodes",
+                    orphan_deleted,
+                )
+        except Exception as exc:
+            logger.warning(
+                "TTL cleanup [orphan] failed: %s",
+                exc,
+                exc_info=True,
+            )
+
+        self._last_ttl_cleanup_date = today
+        logger.info(
+            "TTL cleanup complete: %s",
+            ", ".join(f"{k}={v}" for k, v in results.items()),
+        )
+        return results
+
+    # ── Logging ─────────────────────────────────────────────────────────
 
     async def _log_cycle_summary(
         self,

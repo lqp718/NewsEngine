@@ -33,6 +33,7 @@ from src.adapters.models import (
     NormalizedEpisode,
     Severity,
 )
+from src.adapters.macro_themes import MACRO_THEME_KEYWORDS
 from src.utils.logging_config import get_logger
 from src.utils.time_utils import now_hkt
 
@@ -218,19 +219,22 @@ class GdeltAdapter(BaseAdapter):
     """GDELT GKG V2 CSV adapter.
 
     Fetches the latest GKG CSV from data.gdeltproject.org, parses the
-    27-column tab-separated format, filters by ticker whitelist, and
-    normalises to NormalizedEpisode.
+    27-column tab-separated format, filters by 19 core macro themes (OR
+    matching), and normalises to NormalizedEpisode with content_scope=MACRO.
+
+    V2.2: Replaced ticker_whitelist filtering with macro theme filtering.
+    No longer receives or uses ticker whitelist.
     """
 
     def __init__(
         self,
-        ticker_whitelist: list[dict[str, str]] | None = None,
+        macro_theme_keywords: set[str] | None = None,
         max_retries: int = 3,
         backoff_base: float = 1.0,
         dedup_cache: set[str] | None = None,
     ) -> None:
         super().__init__(dedup_cache=dedup_cache)
-        self.ticker_whitelist = ticker_whitelist or []
+        self._macro_theme_keywords = macro_theme_keywords or MACRO_THEME_KEYWORDS
         self.max_retries = max_retries
         self.backoff_base = backoff_base
         self._last_records: list[dict] = []
@@ -400,44 +404,28 @@ class GdeltAdapter(BaseAdapter):
     def filter_relevant(
         self, records: list[dict]
     ) -> list[dict]:
-        """Filter records by ticker whitelist.
+        """Filter records by 19 core macro themes (OR matching).
 
-        Searches organizations (V2.6), locations (V2.7), and themes (V2.8)
-        for whitelist keywords.
+        V2.2: Replaced ticker_whitelist filtering. Matches GKG V2.8 Themes
+        column against the 19 core financial theme keywords. Any single
+        match retains the record.
 
-        If whitelist is empty, returns all records.
+        If ``_macro_theme_keywords`` is empty, returns all records.
         """
-        if not self.ticker_whitelist:
-            return records
-
-        keywords: set[str] = set()
-        for entry in self.ticker_whitelist:
-            if "biz_code" in entry and entry["biz_code"]:
-                keywords.add(entry["biz_code"])
-            if "name_zh" in entry and entry["name_zh"]:
-                keywords.add(entry["name_zh"])
-            if "name_en" in entry and entry["name_en"]:
-                keywords.add(entry["name_en"])
-
-        if not keywords:
+        if not self._macro_theme_keywords:
             return records
 
         matched: list[dict] = []
         for rec in records:
-            search_text = " ".join(
-                [
-                    rec.get("organizations", ""),
-                    rec.get("locations", ""),
-                    rec.get("themes", ""),
-                ]
-            ).lower()
-            if any(kw.lower() in search_text for kw in keywords):
+            themes_text = (rec.get("themes") or "").lower()
+            if any(kw.lower() in themes_text for kw in self._macro_theme_keywords):
                 matched.append(rec)
 
         logger.info(
-            "Filtered %d → %d records by ticker whitelist",
+            "GDELT theme filter: %d → %d records (themes=%s)",
             len(records),
             len(matched),
+            "OR".join(sorted(self._macro_theme_keywords))[:80]
         )
         return matched
 
@@ -448,7 +436,7 @@ class GdeltAdapter(BaseAdapter):
             record: A dict from parse_gkg().
 
         Returns:
-            NormalizedEpisode with all fields populated.
+            NormalizedEpisode with content_scope=MACRO in metadata.
         """
         raw_dt = record.get("valid_at", "")
         valid_at = _parse_gkg_datetime(raw_dt)
@@ -457,6 +445,7 @@ class GdeltAdapter(BaseAdapter):
         severity = _map_tone_to_severity(tone_str)
 
         entities = _parse_entities_from_record(record)
+
         body = _build_episode_body(record)
         content_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
 
@@ -486,7 +475,7 @@ class GdeltAdapter(BaseAdapter):
             entities=entities,
             severity=severity,
             keywords=keywords,
-            metadata={},
+            metadata={"content_scope": "MACRO"},
         )
 
     # ── fetch orchestration ──────────────────────────────────────────

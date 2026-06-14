@@ -1,7 +1,10 @@
 """RSS Adapter — fetch, parse, and normalize RSS/Atom feed entries.
 
-Supports multiple feed URLs, RSS 2.0 and Atom formats, ticker whitelist
-filtering, and dedup by link/guid.
+Supports multiple feed URLs, RSS 2.0 and Atom formats, and dedup by
+link/guid.
+
+V2.2: Removed ticker whitelist filtering. RSS now applies zero
+pre-ingestion filtering — all entries are preserved.
 """
 
 from __future__ import annotations
@@ -58,19 +61,20 @@ def _extract_keywords(title: str) -> list[str]:
 class RssAdapter(BaseAdapter):
     """RSS/Atom feed adapter.
 
-    Fetches one or more RSS feeds, parses entries, filters by ticker
-    whitelist, and normalizes to NormalizedEpisode.
+    Fetches one or more RSS feeds, parses entries, and normalizes to
+    NormalizedEpisode with content_scope=MACRO.
+
+    V2.2: Zero pre-ingestion filtering. All entries are preserved because
+    RSS sources (MarketWatch + FT) are already curated financial content.
     """
 
     def __init__(
         self,
         feed_urls: list[str] | None = None,
-        ticker_whitelist: list[dict[str, str]] | None = None,
         dedup_cache: set[str] | None = None,
     ) -> None:
         super().__init__(dedup_cache=dedup_cache)
         self.feed_urls = feed_urls or []
-        self.ticker_whitelist = ticker_whitelist or []
 
     # ── feed fetching ────────────────────────────────────────────────
 
@@ -129,7 +133,10 @@ class RssAdapter(BaseAdapter):
         return entries
 
     async def fetch(self, **kwargs: Any) -> list[dict]:
-        """Fetch entries from all configured RSS feeds."""
+        """Fetch entries from all configured RSS feeds.
+
+        V2.2: Zero pre-ingestion filtering. Every entry is preserved.
+        """
         all_entries: list[dict] = []
         if not self.feed_urls:
             logger.warning("No RSS feed URLs configured")
@@ -139,57 +146,20 @@ class RssAdapter(BaseAdapter):
             entries = self._fetch_single(feed_url)
             all_entries.extend(entries)
 
-        # Apply ticker whitelist filter
-        all_entries = self.filter_relevant(all_entries)
-        return all_entries
-
-    # ── filtering ────────────────────────────────────────────────────
-
-    def filter_relevant(
-        self, entries: list[dict]
-    ) -> list[dict]:
-        """Filter entries by ticker whitelist keywords.
-
-        Searches title and summary for whitelist keywords.
-        Returns all entries if whitelist is empty.
-        """
-        if not self.ticker_whitelist:
-            return entries
-
-        keywords: set[str] = set()
-        for entry in self.ticker_whitelist:
-            if "biz_code" in entry and entry["biz_code"]:
-                keywords.add(entry["biz_code"])
-            if "name_zh" in entry and entry["name_zh"]:
-                keywords.add(entry["name_zh"])
-            if "name_en" in entry and entry["name_en"]:
-                keywords.add(entry["name_en"])
-
-        if not keywords:
-            return entries
-
-        matched: list[dict] = []
-        for entry in entries:
-            search_text = " ".join(
-                [
-                    entry.get("title", ""),
-                    entry.get("summary", ""),
-                ]
-            ).lower()
-            if any(kw.lower() in search_text for kw in keywords):
-                matched.append(entry)
-
         logger.info(
-            "Filtered %d → %d entries by ticker whitelist",
-            len(entries),
-            len(matched),
+            "RSS fetch: %d entries from %d feeds (no filtering)",
+            len(all_entries),
+            len(self.feed_urls),
         )
-        return matched
+        return all_entries
 
     # ── normalization ────────────────────────────────────────────────
 
     def normalize(self, record: dict) -> NormalizedEpisode:
-        """Convert a single RSS entry to NormalizedEpisode."""
+        """Convert a single RSS entry to NormalizedEpisode.
+
+        Sets content_scope=MACRO in metadata.
+        """
         title = record.get("title", "")
         link = record.get("link", "") or None
         summary = record.get("summary", "") or None
@@ -221,5 +191,5 @@ class RssAdapter(BaseAdapter):
             severity="medium",
             keywords=keywords,
             entities=[],
-            metadata={"feed_url": feed_url},
+            metadata={"content_scope": "MACRO", "feed_url": feed_url},
         )
