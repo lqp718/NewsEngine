@@ -108,12 +108,12 @@ def get_episode_writer(
     ``src/graphiti/relation_types.py``.
     """
     from src.graphiti.episode_writer import EpisodeWriter
-    from src.graphiti.entity_types import ENTITY_TYPES
+    from src.graphiti.entity_types import SYMBOL_ENTITY_TYPES
     from src.graphiti.relation_types import DEFAULT_EDGE_TYPE_MAP, EDGE_TYPES
 
     return EpisodeWriter(
         graphiti=graphiti,
-        entity_types=ENTITY_TYPES,
+        entity_types=SYMBOL_ENTITY_TYPES,
         edge_types=EDGE_TYPES,
         edge_type_map=DEFAULT_EDGE_TYPE_MAP,
     )

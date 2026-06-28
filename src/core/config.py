@@ -26,6 +26,16 @@ class Settings(BaseSettings):
         ...,
         description="阿里百炼 API Key - 必填字段，无默认值",
     )
+
+    # === Google Gemini API ===
+    gemini_api_key: str = Field(
+        "",
+        description="Google Gemini API Key (Google AI Studio)",
+    )
+    gemini_model: str = Field(
+        "gemini-2.5-flash",
+        description="Gemini LLM model name (default: gemini-2.5-flash)",
+    )
     openai_base_url: str = Field(
         "https://dashscope.aliyuncs.com/compatible-mode/v1",
         description="百炼 OpenAI 兼容 Base URL",
@@ -49,7 +59,7 @@ class Settings(BaseSettings):
         description="DeepSeek API Base URL",
     )
     deepseek_model: str = Field(
-        "deepseek-chat",
+        "deepseek-v4-flash",
         description="DeepSeek 模型名",
     )
     

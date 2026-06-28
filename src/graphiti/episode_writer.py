@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 from graphiti_core.nodes import EpisodeType
 
 from src.adapters.models import NormalizedEpisode, build_entity_suffix
-from src.graphiti.entity_types import ENTITY_TYPES
+from src.graphiti.entity_types import SYMBOL_ENTITY_TYPES
 from src.graphiti.relation_types import EDGE_TYPES, DEFAULT_EDGE_TYPE_MAP
 from src.utils.logging_config import get_logger
 
@@ -91,7 +91,7 @@ class EpisodeWriter:
     ) -> None:
         self._graphiti = graphiti
         self._neo4j_driver = neo4j_driver
-        self._entity_types = entity_types or ENTITY_TYPES
+        self._entity_types = entity_types or SYMBOL_ENTITY_TYPES
         self._edge_types = edge_types or EDGE_TYPES
         self._edge_type_map = edge_type_map or DEFAULT_EDGE_TYPE_MAP
         self._max_retries = max_retries

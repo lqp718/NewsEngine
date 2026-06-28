@@ -158,9 +158,12 @@ class AkShareAdapter(BaseAdapter):
         for symbol, meta in self._symbol_map.items():
             items = self._fetch_single(symbol)
             for item in items:
-                # Attach ticker metadata
+                # Attach ticker metadata from whitelist
+                # Whitelist entries have keys: ticker, sector, biz_code, name, exchange
                 item["_ticker_name"] = meta.get("name", "")
-                item["_ticker_full"] = meta.get("symbol", "")
+                item["_ticker_full"] = meta.get("ticker", "")
+                item["_ticker_sector"] = meta.get("sector", "")
+                item["_ticker_exchange"] = meta.get("exchange", "")
             all_items.extend(items)
             # Rate limiting between symbols
             if self.rate_limit_sec > 0:
@@ -178,22 +181,28 @@ class AkShareAdapter(BaseAdapter):
         symbol = record.get("symbol", "")
         ticker_name = record.get("_ticker_name", "")
         ticker_full = record.get("_ticker_full", "")
+        ticker_sector = record.get("_ticker_sector", "")
+        ticker_exchange = record.get("_ticker_exchange", "")
 
         episode_body = _build_episode_body(title, content)
         content_hash = hashlib.sha256(episode_body.encode("utf-8")).hexdigest()
         valid_at = _parse_akshare_time(record.get("time"))
         keywords = _extract_keywords(title)
 
-        # Build entity from whitelist metadata
+        # Build entity from whitelist metadata (includes sector/exchange hints)
         entities: list[EntityItem] = []
         if ticker_full:
-            entities.append(
-                EntityItem(
-                    type="stock",
-                    name=ticker_name or symbol,
-                    ticker=ticker_full,
-                )
-            )
+            kwargs = {
+                "type": "stock",
+                "name": ticker_name or symbol,
+                "ticker": ticker_full,
+            }
+            # Only attach sector/exchange if whitelist has non-empty values
+            if ticker_sector:
+                kwargs["sector"] = ticker_sector
+            if ticker_exchange:
+                kwargs["exchange"] = ticker_exchange
+            entities.append(EntityItem(**kwargs))
 
         name = NormalizedEpisode.make_name(
             source_type="akshare",

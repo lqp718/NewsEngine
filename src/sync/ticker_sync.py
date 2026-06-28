@@ -143,6 +143,8 @@ class TickerSync:
                     "biz_code": str(ticker.get("biz_code", "")),
                     "name_zh": str(ticker.get("name_zh", "")),
                     "name_en": str(ticker.get("name_en", "")),
+                    "sector": str(ticker.get("sector", "")),
+                    "exchange": str(ticker.get("exchange", "")),
                 }
             )
         return result

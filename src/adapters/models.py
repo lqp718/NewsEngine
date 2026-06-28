@@ -33,6 +33,20 @@ class EntityItem(BaseModel):
         default=None,
         description="Stock ticker (e.g. '0700.HK'). Only present for stock entities.",
     )
+    sector: str | None = Field(
+        default=None,
+        description=(
+            "Stock sector (e.g. 'Tech', 'Financials'). "
+            "Only present for stock entities."
+        ),
+    )
+    exchange: str | None = Field(
+        default=None,
+        description=(
+            "Stock exchange (e.g. 'HKEX', 'NYSE'). "
+            "Only present for stock entities."
+        ),
+    )
 
 
 def build_entity_suffix(entities: list[EntityItem]) -> str:
@@ -46,7 +60,15 @@ def build_entity_suffix(entities: list[EntityItem]) -> str:
     lines = ["\n[END OF CONTENT]\n", "PRE-EXTRACTED ENTITIES (for reference):"]
     for ent in entities:
         if ent.type == "stock" and ent.ticker:
-            lines.append(f"- Stock: {ent.name} ({ent.ticker})")
+            extra = ent.ticker
+            if ent.sector or ent.exchange:
+                details = []
+                if ent.sector:
+                    details.append(f"sector={ent.sector}")
+                if ent.exchange:
+                    details.append(f"exchange={ent.exchange}")
+                extra += f" ({'; '.join(details)})"
+            lines.append(f"- Stock: {ent.name} ({extra})")
         elif ent.type == "person":
             lines.append(f"- Person: {ent.name}")
         elif ent.type == "organization":

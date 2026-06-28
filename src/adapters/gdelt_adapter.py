@@ -12,10 +12,13 @@ from __future__ import annotations
 
 import csv
 import hashlib
-import io
 import os
 import tempfile
 import zipfile
+
+# GDELT GKG themes/entities CSV fields can reach multiple MB
+# Python's default csv field size limit (128KB) is too small
+csv.field_size_limit(10485760)  # 10MB
 from datetime import datetime, timezone
 from typing import Any, Literal
 

@@ -2,7 +2,7 @@
 
 This package contains Graphiti knowledge graph integration components:
 - Entity type definitions (entity_types.py)
-- Relation type definitions (relation_types.py) 
+- Relation type definitions (relation_types.py)
 - Episode writer (episode_writer.py)
 """
 
@@ -11,7 +11,10 @@ from .entity_types import (
     SectorEntity,
     CountryEntity,
     PolicyEntity,
-    ENTITY_TYPES,
+    OrganizationEntity,
+    TopicEntity,
+    MACRO_ENTITY_TYPES,
+    SYMBOL_ENTITY_TYPES,
 )
 from .episode_writer import (
     WriteResult,
@@ -22,10 +25,13 @@ from .episode_writer import (
 __all__ = [
     # Entity types exports
     "StockEntity",
-    "SectorEntity", 
+    "SectorEntity",
     "CountryEntity",
     "PolicyEntity",
-    "ENTITY_TYPES",
+    "OrganizationEntity",
+    "TopicEntity",
+    "MACRO_ENTITY_TYPES",
+    "SYMBOL_ENTITY_TYPES",
     # Episode writer exports
     "WriteResult",
     "BatchWriteResult",

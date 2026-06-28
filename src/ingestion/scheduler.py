@@ -154,8 +154,9 @@ class IngestionScheduler:
         # ── Shared dedup cache (across all adapters) ──────────────
         self._dedup_cache: set[str] = set()
 
-        # ── EpisodeWriter (lazy init) ─────────────────────────────
-        self._writer: Any = None
+        # ── EpisodeWriter instances (lazy init) ────────────────────
+        self._macro_writer: Any = None
+        self._symbol_writer: Any = None
 
         # ── Adapter instances (lazy init) ─────────────────────────
         self._gdelt_adapter: Any = None
@@ -223,7 +224,7 @@ class IngestionScheduler:
         V2.2: Macro/Stock pipeline split — each adapter receives its
         own filtering configuration.
         """
-        if self._writer is not None:
+        if self._macro_writer is not None or self._symbol_writer is not None:
             return
 
         # ── Import adapter classes (lazy, to avoid circular deps) ───
@@ -231,14 +232,22 @@ class IngestionScheduler:
         from src.adapters.rss_adapter import RssAdapter
         from src.adapters.akshare_adapter import AkShareAdapter
         from src.graphiti.episode_writer import EpisodeWriter
+        from src.graphiti.entity_types import MACRO_ENTITY_TYPES, SYMBOL_ENTITY_TYPES
         from src.core.graphiti_client import create_graphiti
 
         if self._graphiti is None:
             self._graphiti = create_graphiti()
 
-        self._writer = EpisodeWriter(
+        self._macro_writer = EpisodeWriter(
             graphiti=self._graphiti,
             neo4j_driver=self._neo4j_driver,
+            entity_types=MACRO_ENTITY_TYPES,
+        )
+
+        self._symbol_writer = EpisodeWriter(
+            graphiti=self._graphiti,
+            neo4j_driver=self._neo4j_driver,
+            entity_types=SYMBOL_ENTITY_TYPES,
         )
 
         # ── Macro pipeline: GDELT uses macro theme keywords (not tickers) ──
@@ -262,9 +271,9 @@ class IngestionScheduler:
 
         logger.info(
             "Scheduler components initialized: "
-            "GDELT[theme-filter] + RSS[zero-filter](macro pipeline), "
-            "AkShare[ticker-filter](stock pipeline), "
-            "EpisodeWriter, SectorBriefingAggregator"
+            "GDELT[theme-filter] + RSS[zero-filter](macro pipeline, MACRO_ENTITY_TYPES), "
+            "AkShare[ticker-filter](stock pipeline, SYMBOL_ENTITY_TYPES), "
+            "SectorBriefingAggregator"
         )
 
     # ── Internal: cycle loop ──────────────────────────────────────────
@@ -327,12 +336,14 @@ class IngestionScheduler:
         self._update_adapter_tickers(tickers)
 
         # ── Step 2: Run pipelines concurrently ───────────────────
+        # Macro pipelines (GDELT, RSS) use MACRO_ENTITY_TYPES
+        # Stock pipeline (AkShare) uses SYMBOL_ENTITY_TYPES
         pipeline_results: list[PipelineResult] = []
 
         coros = [
-            self._run_adapter_pipeline(self._gdelt_adapter, tickers),
-            self._run_adapter_pipeline(self._rss_adapter, tickers),
-            self._run_adapter_pipeline(self._akshare_adapter, tickers),
+            self._run_adapter_pipeline(self._gdelt_adapter, self._macro_writer, tickers),
+            self._run_adapter_pipeline(self._rss_adapter, self._macro_writer, tickers),
+            self._run_adapter_pipeline(self._akshare_adapter, self._symbol_writer, tickers),
         ]
 
         completed = await asyncio.gather(*coros, return_exceptions=True)
@@ -397,13 +408,14 @@ class IngestionScheduler:
     async def _run_adapter_pipeline(
         self,
         adapter: Any,
+        writer: Any,
         tickers: list[dict[str, str]],
     ) -> PipelineResult:
         """Run a single adapter pipeline with error isolation."""
         try:
             return await run_pipeline(
                 adapter=adapter,
-                writer=self._writer,
+                writer=writer,
                 tickers=tickers,
             )
         except Exception as exc:
