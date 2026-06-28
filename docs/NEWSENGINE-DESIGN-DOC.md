@@ -1,7 +1,7 @@
 # NewsEngine 设计文档
 
-**版本:** V2.2（宏观/个股管线拆分 + 数据质量修复）  
-**日期:** 2026-06-14  
+**版本:** V2.3（GDELT 三 CSV 整合 + EventEntity 新增）  
+**日期:** 2026-06-29  
 **作者:** Chief Architect  
 **依据文档:**
 - `NewsEngine Proposal V1.0` (2026-06-08)
@@ -17,6 +17,16 @@
 ---
 
 ## 版本说明
+
+### V2.3 变更摘要 (2026-06-29)
+
+1. **GDELT 三 CSV 整合** (§1.4.2, §3.2, §3.6.2): GDELT 从单一 GKG CSV 改为 Events + Mentions + GKG 三 CSV 整合，提供结构化事件骨架、传播追踪和语义元数据三层信息。
+2. **EventEntity 新增** (§2.8, §3.4.3, §3.2): 新增 EventEntity（MACRO 管线）和 SymbolEventEntity（SYMBOL 管线）作为第 6 个实体类型，支持结构化事件建模和跨管线关联。
+3. **Codebook 翻译层** (§3.1, §3.2): 新增 `gdelt_codebook.py` 模块，负责 CAMEO 事件码、Actor 代码和 Theme 代码的人类可读翻译，将 GDELT 原始代码转换为中文文本。
+4. **双层过滤策略** (§3.6.2): GDELT 过滤从单一 GKG Themes 白名单扩展为 GKG Themes + Events CAMEO 码双重过滤，提升金融相关事件命中率。
+5. **数据流更新** (§1.4.2): Events CSV → parse_events() → EventRecord，Mentions CSV → parse_mentions() → MentionRecord，GKG CSV → parse_gkg() → GKGRecord，三源合并后通过 Graphiti add_episode() 写入 Neo4j。
+6. **Episode body 结构化** (§3.2): `_build_episode_body()` 重构为包含事件骨架（Actor1→Actor2→CAMEO）、传播覆盖（Mentions count）、情感评分（Goldstein/Tone）的人类可读格式。
+7. **跨管线 Entity Type 关联** (§3.4.3): EventEntity 同时存在于 MACRO 和 SYMBOL 管线（字段集合不同），通过 Graphiti 实体消歧机制自动建立跨管线关联。
 
 ### V2.2 变更摘要 (2026-06-14)
 
@@ -98,8 +108,8 @@ V2.0 合并了 NewsEngine 的两份设计文档：
 │                           ▼                                          │
 │  ┌──────────────────────────────────────────────────────────┐       │
 │  │               Graphiti 引擎（核心）                         │       │
-│  │  • 实体提取: Stock / Sector / Country / Policy            │       │
-│  │  • 关系提取: AFFECTS / CAUSED_BY / MITIGATES              │       │
+│  │  • 实体提取: Stock / Sector / Country / Policy / Event     │       │
+│  │  • 关系提取: AFFECTS / CAUSED_BY / MITIGATES / RELATED_TO │       │
 │  │  • 时间窗口: valid_at / invalid_at（事实生命周期）          │       │
 │  │  • 增量写入: 新 Episode 自动关联已有实体                    │       │
 │  │  • 混合检索: 语义 + BM25 + 图遍历                         │       │
@@ -107,6 +117,7 @@ V2.0 合并了 NewsEngine 的两份设计文档：
 │  │  后端: Neo4j (Docker, WSL2)                                │       │
 │  │  Embedding: 阿里百炼 text-embedding-v3                     │       │
 │  │  LLM 提取: Qwen3.6-plus (百炼)                             │       │
+│  │  V2.3: Event 实体新增，支持结构化事件建模                  │       │
 │  └────────────────────────┬─────────────────────────────────┘       │
 │                           ▼                                          │
 │  ┌──────────────────────────────────────────────────────────┐       │
@@ -189,11 +200,14 @@ AkShare: Fetched 20 news items → wrote 1 episode
 │  ┌──────────────────────────────┐  ┌──────────────────────────────┐ │
 │  │     宏观管线 (MACRO)          │  │     个股管线 (SYMBOL)         │ │
 │  │                              │  │                              │ │
-│  │  GDELT CSV ──► theme 过滤 ──┤  │  AkShare ──► ticker 过滤 ──┤ │
-│  │  (824条/周期)  (19 核心主题)  │  │  (按白名单查询) (biz_code)    │ │
+│  │  GDELT CSV ──► CAMEO码+Theme │  │  AkShare ──► ticker 过滤 ──┤ │
+│  │  (Events+Mentions+GKG)       │  │  (按白名单查询) (biz_code)    │ │
+│  │  双层过滤+三源合并            │  │                              │ │
 │  │                              │  │                              │ │
 │  │  RSS ────────► 零过滤 ──────┤  │                              │ │
 │  │  (10条/周期)  (源头干净)      │  │                              │ │
+│  │                              │  │                              │ │
+│  │  V2.3: GDELT 三 CSV 整合     │  │                              │ │
 │  └──────────────┬───────────────┘  └──────────────┬───────────────┘ │
 │                 │                                  │                 │
 │                 ▼                                  ▼                 │
@@ -434,7 +448,8 @@ Host: localhost:8100
       "keywords": ["腾讯", "监管", "股价跳水"],
       "entities": [
         {"type": "stock", "ticker": "0700.HK", "name": "腾讯控股"},
-        {"type": "policy", "name": "反垄断调查", "status": "rumor"}
+        {"type": "policy", "name": "反垄断调查", "status": "rumor"},
+        {"type": "event", "name": "监管收紧传闻", "goldstein_scale": -3.2, "tone": -4.87, "event_date": "2026-06-08"}
       ],
       "relations": [
         {"type": "CAUSED_BY", "target_event_id": "evt-20260607-003"}
@@ -465,7 +480,7 @@ Host: localhost:8100
 | `events[].source_urls` | array | 否 | 来源链接列表 |
 | `events[].keywords` | array | 是 | 关键词 |
 | `events[].entities` | array | 是 | 关联实体 |
-| `events[].entities[].type` | string | 是 | 实体类型: `stock` / `sector` / `country` / `policy` |
+| `events[].entities[].type` | string | 是 | 实体类型: `stock` / `sector` / `country` / `policy` / `event` (V2.3) |
 | `events[].entities[].ticker` | string | 否 | ticker (仅 stock 类型) |
 | `events[].entities[].name` | string | 是 | 实体名称 |
 | `events[].entities[].status` | string | 否 | 状态 (仅 policy 类型): `rumor` / `confirmed` / `resolved` |
@@ -569,7 +584,8 @@ Host: localhost:8100
       "first_seen": "2026-06-08T10:00:00+08:00",
       "entities": [
         {"type": "stock", "ticker": "0700.HK", "name": "腾讯控股"},
-        {"type": "stock", "ticker": "9988.HK", "name": "阿里巴巴-W"}
+        {"type": "stock", "ticker": "9988.HK", "name": "阿里巴巴-W"},
+        {"type": "event", "name": "监管收紧传闻", "goldstein_scale": -3.2, "tone": -4.87}
       ]
     }
   ],
@@ -742,6 +758,7 @@ Host: localhost:8100
 | 行业 | `Entity` 节点 (label: `Entity:Sector`, 属性 `name`) | `EventEntityItem(type="sector")` | 同上 |
 | 国家 | `Entity` 节点 (label: `Entity:Country`) | `EventEntityItem(type="country")` | 同上 |
 | 政策 | `Entity` 节点 (label: `Entity:Policy`, 属性 `status`) | `EventEntityItem(type="policy")` | 同上 |
+| **事件实体 (V2.3)** | `Entity` 节点 (label: `Entity:Event`, 属性 `goldstein_scale/tone/cameo_code`) | `EventEntityItem(type="event")` | 同上 |
 | 事件-实体关系 | `RELATES_TO` 边 (属性 `name`: `AFFECTS`/`BELONGS_TO`/`CAUSED_BY`/…) | `EventRelationItem` | 同上 |
 | 社区/摘要 | `Community` / `Saga` 节点 | 无（当前未消费） | — |
 
@@ -862,6 +879,9 @@ NewsEngine/
 │   │   ├── base.py               # BaseAdapter 抽象基类【已实现】
 │   │   ├── models.py             # NormalizedEpisode / EntityItem【已实现】
 │   │   ├── gdelt_adapter.py      # GDELT CSV 适配器【已实现】
+│   │   ├── gdelt_codebook.py     # CAMEO/Actor/Theme 代码翻译【V2.3 新增】
+│   │   ├── gdelt_events_parser.py # Events CSV 解析【V2.3 新增】
+│   │   ├── gdelt_mentions_parser.py # Mentions CSV 解析【V2.3 新增】
 │   │   ├── rss_adapter.py        # RSS 抓取适配器【已实现】
 │   │   ├── akshare_adapter.py    # AkShare 个股新闻适配器【已实现】
 │   │   └── macro_themes.py       # GDELT 宏观主题白名单（19 核心主题）【V2.2 新增】
@@ -952,8 +972,11 @@ NewsEngine/
 | `core/config.py` | 配置加载、校验、环境变量解析 | `python-dotenv`, `pydantic-settings` | `Settings` 单例 |
 | `core/neo4j_client.py` | Neo4j Driver 生命周期管理 | `core/config.py`, `neo4j` 驱动 | `get_neo4j_driver()`, `close_neo4j_driver()` |
 | `core/graphiti_client.py` | Graphiti SDK 实例创建与配置 | `core/config.py`, `core/neo4j_client.py`, `graphiti/` | `create_graphiti()` |
-| `adapters/` | 原始数据 → `NormalizedEpisode` 转换 + 管线过滤（V2.2） | `core/config.py`, `adapters/models.py`, `adapters/macro_themes.py` | `BaseAdapter` 子类 |
+| `adapters/` | 原始数据 → `NormalizedEpisode` 转换 + 管线过滤（V2.2）+ GDELT 三 CSV 整合 + Codebook 翻译（V2.3） | `core/config.py`, `adapters/models.py`, `adapters/macro_themes.py`, `adapters/gdelt_codebook.py` (V2.3) | `BaseAdapter` 子类 |
 | `adapters/macro_themes.py` | GDELT 宏观主题白名单（19 核心金融主题）| 零依赖（纯常量） | `MACRO_THEME_KEYWORDS` |
+| `adapters/gdelt_codebook.py` (V2.3) | CAMEO/Actor/Theme 代码的人类可读翻译 | 零依赖（加载 JSON 码表） | `translate_cameo()`, `translate_actor()`, `translate_theme()` |
+| `adapters/gdelt_events_parser.py` (V2.3) | GDELT Events CSV 下载/解析/结构化 | `core/config.py`, `adapters/gdelt_codebook.py` | `parse_events()` |
+| `adapters/gdelt_mentions_parser.py` (V2.3) | GDELT Mentions CSV 下载/解析/关联 | `core/config.py` | `parse_mentions()` |
 | `graphiti/` | `NormalizedEpisode` → Neo4j 知识图写入 | `graphiti-core`, `adapters/models.py`, `core/neo4j_client.py` | `EpisodeWriter` |
 | `graphiti/translation.py` | Neo4j Episodic/Entity record → 业务模型 (EventItem/EventEntityItem) 共享翻译 | `graphiti/entity_types.py` | `translate_episode_to_event()`, `translate_entity_to_item()`, `SEVERITY_WEIGHT` |
 | `sync/` | SynapseEngine ticker 白名单管理 | `requests` | `get_ticker_whitelist()` |
@@ -1074,7 +1097,136 @@ main.py 启动流程（伪代码）:
 | 3 | `writer.close()` — 关闭 EpisodeWriter 资源 | `graphiti/episode_writer.py` |
 | 4 | `driver.close()` — 关闭 Neo4j 连接 | `core/neo4j_client.py` |
 
-### 3.4.3 依赖就绪检查
+### 3.4.3 Entity Types 定义 — EventEntity 和 SymbolEventEntity（V2.3 新增）
+
+**新增实体类型：Event**
+
+V2.3 新增 EventEntity 作为第 6 个实体类型，用于建模"谁对谁做了什么"的结构化事件。与 PolicyEntity 的区别：
+- **PolicyEntity**: 政策声明/监管行为（有状态机：rumor→announced→confirmed→implemented），重点在"说了什么"
+- **EventEntity**: 结构化事件（有定量评分：Goldstein/Tone），重点在"做了什么，造成了多大的正面/负面影响"
+
+**MACRO_ENTITY_TYPES（GDELT/RSS 管线）：**
+
+```python
+MACRO_ENTITY_TYPES = {
+    "Organization": OrganizationEntity,
+    "Country": CountryEntity,
+    "Topic": TopicEntity,
+    "Policy": PolicyEntity,
+    "Sector": SectorEntity,
+    "Event": EventEntity,  # V2.3 新增（完整版：含 cameo_code/goldstein_scale/tone）
+}
+```
+
+**EventEntity Pydantic 模型（MACRO 版）：**
+
+```python
+class EventEntity(BaseModel):
+    """事件实体 — 从 GDELT Events CSV 提取的结构化事件。
+    
+    Neo4j 节点标签: Entity:Event
+    """
+    entity_name: str = Field(
+        ...,
+        description="事件描述，一句话，使用中文。例如: '德国向乌克兰提供物资援助'"
+    )
+    actor1: str | None = Field(
+        default=None,
+        description="Actor1 名称（发起方），翻译后的中文名。例如: '德国'"
+    )
+    actor2: str | None = Field(
+        default=None,
+        description="Actor2 名称（接收方），翻译后的中文名。例如: '乌克兰'"
+    )
+    cameo_code: str | None = Field(
+        default=None,
+        description="CAMEO 事件代码。例如: '057' (提供援助), '173' (逮捕/拘留)"
+    )
+    goldstein_scale: float | None = Field(
+        default=None,
+        description="Goldstein 合作/冲突评分 (-10 ~ +10)。+10 = 最高合作，-10 = 最高冲突"
+    )
+    tone: float | None = Field(
+        default=None,
+        description="新闻语调评分 (-100 ~ +100，已归一化)。来源: GDELT AvgTone / 100"
+    )
+    event_date: str | None = Field(
+        default=None,
+        description="事件发生日期 (YYYY-MM-DD)。与 EpisodicNode.valid_at (文章发布时间) 是不同的概念"
+    )
+```
+
+**SYMBOL_ENTITY_TYPES（AkShare 管线）：**
+
+```python
+SYMBOL_ENTITY_TYPES = {
+    "Stock": StockEntity,
+    "Sector": SectorEntity,
+    "Organization": OrganizationEntity,
+    "Country": CountryEntity,
+    "Policy": PolicyEntity,
+    "Event": SymbolEventEntity,  # V2.3 新增（简化版：无 cameo_code/goldstein_scale/tone）
+}
+```
+
+**SymbolEventEntity Pydantic 模型（SYMBOL 版）：**
+
+```python
+class SymbolEventEntity(BaseModel):
+    """事件实体 — 从 AkShare 个股新闻提取的事件。
+    
+    与 MACRO 版的 EventEntity 区别：没有 cameo_code/goldstein_scale/tone，
+    因为 AkShare 数据源不提供这些结构化字段。
+    
+    Neo4j 节点标签: Entity:Event
+    """
+    entity_name: str = Field(
+        ...,
+        description="事件描述，一句话，使用中文。例如: '腾讯回购10亿港元'"
+    )
+    actor1: str | None = Field(
+        default=None,
+        description="Actor1 名称（发起方），例如: '腾讯控股'"
+    )
+    actor2: str | None = Field(
+        default=None,
+        description="Actor2 名称（接收方），例如: '香港交易所'"
+    )
+    event_date: str | None = Field(
+        default=None,
+        description="事件发生日期 (YYYY-MM-DD)"
+    )
+```
+
+**跨管线关联机制：**
+
+MACRO 版和 SYMBOL 版的 EventEntity 都映射到同一个 Neo4j 标签 `Entity:Event`，但字段集合不同。Graphiti 的 Pydantic schema 机制支持这种差异——不同管线使用不同的 entity_types 注册表。
+
+**EventEntity 关系类型：**
+
+| 关系 | 方向 | 示例 |
+|------|------|------|
+| Event → AFFECTS → Country | 事件对国家的影响 | "物资援助" → AFFECTS → "乌克兰" |
+| Event → AFFECTS → Organization | 事件对组织的影响 | "制裁" → AFFECTS → "华为" |
+| Event → CAUSED_BY → EventEntity | 事件因果链 | "制裁俄罗斯" → CAUSED_BY → "俄入侵乌" |
+| Event → RELATED_TO → Topic | 事件属于什么话题 | "加息" → RELATED_TO → "货币政策" |
+| Event → RELATED_TO → Sector | 事件影响什么行业 | "芯片出口管制" → RELATED_TO → "半导体" |
+
+**查询场景示例：**
+
+```cypher
+-- 查询高度正面的事件（Goldstein > 5）
+MATCH (e:Event)
+WHERE e.goldstein_scale > 5
+RETURN e.entity_name, e.actor1, e.actor2, e.goldstein_scale
+ORDER BY e.goldstein_scale DESC
+LIMIT 20
+
+-- 查询与“腾讯控股”相关的所有事件（宏观 + 个股）
+MATCH (org:Entity:Organization {entity_name: "腾讯控股"})-[:RELATES_TO]-(event:Entity:Event)
+RETURN event.entity_name AS event_name, event.event_date AS date
+ORDER BY event.event_date DESC
+```
 
 ```python
 # 文件: main.py — 启动时健康检查
@@ -1227,11 +1379,46 @@ def _update_adapter_tickers(self, tickers):
                 self._akshare_adapter._symbol_map[biz_code] = entry
 ```
 
-### 3.6.2 GDELT 宏观主题白名单（19 个核心主题）
+### 3.6.2 GDELT 双层过滤策略（V2.3 更新）
 
-**文件：** `src/adapters/macro_themes.py`
+**文件：** `src/adapters/macro_themes.py` + `src/adapters/gdelt_codebook.py`
 
-**匹配方式：** 子串匹配（`keyword.lower() in themes_text.lower()`），19 个关键词中**任一命中即保留**（OR 逻辑）。匹配对象为 GKG V2.8 Themes 列。
+**V2.3 变更：** 从单一 GKG Themes 白名单扩展为 GKG Themes + Events CAMEO 码双层过滤。
+
+**匹配方式：**
+
+**Layer A: GKG Themes 白名单过滤（V2.2 逻辑，保留）**
+- 子串匹配（`keyword.lower() in themes_text.lower()`）
+- 19 个关键词中**任一命中即保留**（OR 逻辑）
+- 匹配对象为 GKG V2.8 Themes 列
+
+**Layer B: Events CAMEO 码过滤（V2.3 新增）**
+- CAMEO 事件码匹配（基于 Codebook 翻译后的中文标签）
+- 匹配对象为 Events CSV 的 EventBaseCode 列
+- 金融相关 CAMEO 码白名单（如 012/057/064/082 等）
+
+**双层过滤逻辑：**
+```python
+def filter_relevant(self, records: list[dict]) -> list[dict]:
+    """双层宏观过滤：GKG Themes + Events CAMEO 码。"""
+    if not self._macro_theme_keywords and not self._macro_cameo_codes:
+        return records
+    
+    matched = []
+    for rec in records:
+        # Layer A: GKG Themes 子串匹配（现有逻辑，保留）
+        themes_text = (rec.get("themes") or "").lower()
+        theme_match = any(kw.lower() in themes_text for kw in self._macro_theme_keywords)
+        
+        # Layer B: CAMEO 码匹配（新增，基于 codebook 翻译后的中文标签）
+        cameo_code = rec.get("event_code", "")
+        cameo_match = cameo_code in self._macro_cameo_codes
+        
+        if theme_match or cameo_match:
+            matched.append(rec)
+    
+    return matched
+```
 
 **19 个核心主题：**
 
@@ -1946,7 +2133,37 @@ LIMIT 20  // 受 LLM context window 约束
 | `summary` | `Episodic.source_description` | 给 LLM 的正文输入 |
 | `keywords` | `Episodic.keywords` | 帮助 LLM 理解事件核心主题 |
 | `affected_tickers` / `affected_stocks` | `Entity.ticker` / `Entity.name` | 受影响标的列表 |
-| `entities` | 关联的 Entity 节点 | 实体上下文 |
+| `entities` | 关联的 Entity 节点（含 EventEntity） | 实体上下文（V2.3） |
+
+**V2.3 新增：EventEntity 作为输入素材**
+
+EventEntity 提供结构化事件信息，可显著增强行业简报的质量：
+
+| EventEntity 字段 | 简报增强效果 |
+|-----------------|-------------|
+| `entity_name` | 事件描述直接入简报正文 |
+| `actor1` / `actor2` | 明确事件参与者（"德国→乌克兰"） |
+| `goldstein_scale` | 定量评分辅助 severity 判断（>0 = 合作，<0 = 冲突） |
+| `tone` | 新闻语调评分辅助情绪判断 |
+| `event_date` | 区分"事件发生时间"与"文章发布时间" |
+
+**查询示例（含 EventEntity）:**
+
+```cypher
+// 查询行业相关的事件实体（V2.3 新增）
+MATCH (sector_ent:Entity:Sector {entity_name: $sector_name})
+OPTIONAL MATCH (sector_ent)-[:RELATES_TO]-(event_ent:Entity:Event)
+WHERE event_ent.goldstein_scale < 0  // 仅冲突事件
+RETURN
+  event_ent.entity_name AS event_description,
+  event_ent.actor1 AS actor1,
+  event_ent.actor2 AS actor2,
+  event_ent.goldstein_scale AS goldstein,
+  event_ent.tone AS tone,
+  event_ent.event_date AS event_date
+ORDER BY event_ent.goldstein_scale ASC
+LIMIT 10
+```
 
 ## 5.3 LLM 配置与 Prompt 设计
 

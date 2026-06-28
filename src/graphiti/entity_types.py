@@ -5,8 +5,8 @@ graphiti-core 通过 model_json_schema() 使用这些 Pydantic 模型生成 LLM
 提取的实体属性通过 EntityNode.attributes (dict) 存储为 Neo4j 节点属性。
 
 两套 entity_types:
-- MACRO_ENTITY_TYPES: 宏观管线（GDELT、RSS）使用。包含 Country, Policy, Organization, Topic, Sector
-- SYMBOL_ENTITY_TYPES: 个股管线（AkShare）使用。包含 Stock, Sector, Organization, Country, Policy
+- MACRO_ENTITY_TYPES: 宏观管线（GDELT、RSS）使用。包含 Country, Policy, Organization, Topic, Sector, Event
+- SYMBOL_ENTITY_TYPES: 个股管线（AkShare）使用。包含 Stock, Sector, Organization, Country, Policy, Event
 
 StockEntity.sector 与 SectorEntity.entity_name 统一使用中文行业名（如 "互联网平台"），保持语义一致。
 """
@@ -22,6 +22,8 @@ __all__ = [
     "PolicyEntity",
     "OrganizationEntity",
     "TopicEntity",
+    "EventEntity",
+    "SymbolEventEntity",
     "MACRO_ENTITY_TYPES",
     "SYMBOL_ENTITY_TYPES",
 ]
@@ -150,6 +152,89 @@ class TopicEntity(BaseModel):
     )
 
 
+class EventEntity(BaseModel):
+    """事件实体 — 从 GDELT Events CSV 或新闻文本中提取的 CAMEO 事件。
+
+    LLM 通过 MACRO_ENTITY_TYPES 提取事件时，按此 schema 填充字段。
+    用于建立 "事件→国家"、"事件→行业"、"事件→股票" 的因果关系网络。
+
+    字段说明:
+    - entity_name: 事件描述，使用中文，一句话概括事件内容
+    - actor1: 发起方名称，翻译后的中文名（如 "中国"）
+    - actor2: 接收方名称，翻译后的中文名（如 "美国"）
+    - cameo_code: CAMEO 事件代码，如 "141"、"173"
+    - goldstein_scale: Goldstein 合作/冲突评分 (-10 ~ +10)
+    - tone: 新闻语调评分 (-100 ~ +100，已归一化)
+    - event_date: 事件发生日期，格式 YYYY-MM-DD
+
+    Neo4j 节点标签: Entity:Event
+    """
+
+    entity_name: str = Field(
+        ...,
+        description="事件描述，使用中文，一句话概括事件内容，例如 '中国对美国加征关税'",
+    )
+    actor1: str | None = Field(
+        default=None,
+        description="Actor1 名称（发起方），翻译后的中文名，例如 '中国'",
+    )
+    actor2: str | None = Field(
+        default=None,
+        description="Actor2 名称（接收方），翻译后的中文名，例如 '美国'",
+    )
+    cameo_code: str | None = Field(
+        default=None,
+        description="CAMEO 事件代码，如 '141'、'173'、'163'",
+    )
+    goldstein_scale: float | None = Field(
+        default=None,
+        description="Goldstein 合作/冲突评分，范围 -10 ~ +10，数值越大越合作",
+    )
+    tone: float | None = Field(
+        default=None,
+        description="新闻语调评分，范围 -100 ~ +100，已归一化数值。"
+                    "GDELT GKG CSV 的 V2Tone 字段",
+    )
+    event_date: str | None = Field(
+        default=None,
+        description="事件发生日期，格式 YYYY-MM-DD",
+    )
+
+
+class SymbolEventEntity(BaseModel):
+    """简化事件实体 — 供个股管线（AkShare）使用的轻量事件类型。
+
+    SYMBOL 版本不含 CAMEO 字段（cameo_code、goldstein_scale、tone），
+    因为个股新闻通常不携带 CAMEO 编码，让 LLM 填写只会产生幻觉。
+    简化版减少 LLM token 消耗且降低噪音。
+
+    字段说明:
+    - entity_name: 事件描述，使用中文
+    - actor1: 发起方名称
+    - actor2: 接收方名称
+    - event_date: 事件发生日期，格式 YYYY-MM-DD
+
+    Neo4j 节点标签: Entity:Event
+    """
+
+    entity_name: str = Field(
+        ...,
+        description="事件描述，使用中文，例如 '腾讯被纳入恒生科技指数'",
+    )
+    actor1: str | None = Field(
+        default=None,
+        description="Actor1 名称（发起方），翻译后的中文名",
+    )
+    actor2: str | None = Field(
+        default=None,
+        description="Actor2 名称（接收方），翻译后的中文名",
+    )
+    event_date: str | None = Field(
+        default=None,
+        description="事件发生日期，格式 YYYY-MM-DD",
+    )
+
+
 # ── 实体类型注册表（两套） ─────────────────────────────────────────────
 
 MACRO_ENTITY_TYPES: dict[str, type[BaseModel]] = {
@@ -158,10 +243,11 @@ MACRO_ENTITY_TYPES: dict[str, type[BaseModel]] = {
     "Topic": TopicEntity,
     "Policy": PolicyEntity,
     "Sector": SectorEntity,
+    "Event": EventEntity,
 }
 """宏观管线使用的实体类型（GDELT、RSS）。
 
-包含: Organization, Country, Topic, Policy, Sector
+包含: Organization, Country, Topic, Policy, Sector, Event
 
 宏观新闻中提到的行业概念（如 "互联网平台监管"、"新能源补贴退坡"）提取为 SectorEntity。
 """
@@ -172,8 +258,9 @@ SYMBOL_ENTITY_TYPES: dict[str, type[BaseModel]] = {
     "Organization": OrganizationEntity,
     "Country": CountryEntity,
     "Policy": PolicyEntity,
+    "Event": SymbolEventEntity,
 }
 """个股管线使用的实体类型（AkShare）。
 
-包含: Stock, Sector, Organization, Country, Policy
+包含: Stock, Sector, Organization, Country, Policy, Event
 """

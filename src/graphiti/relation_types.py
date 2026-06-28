@@ -155,9 +155,20 @@ DEFAULT_EDGE_TYPE_MAP: dict[tuple[str, str], list[str]] = {
     ("Stock", "Sector"): ["BELONGS_TO"],
     ("Stock", "Country"): ["LOCATED_IN"],
     ("Entity", "Policy"): ["RELATED_TO"],
+    # Event 实体关系映射
+    ("Event", "Country"): ["AFFECTS"],
+    ("Event", "Organization"): ["AFFECTS"],
+    ("Event", "Sector"): ["AFFECTS"],
+    ("Event", "Topic"): ["RELATED_TO"],
 }
 """默认关系类型映射。
 
 定义哪些实体类型对之间可以提取哪些关系。
 传递给 graphiti-core 的 add_episode(edge_type_map=...) 参数。
+
+Event 实体类型映射:
+    - (Event, Country): [AFFECTS] — 事件影响国家
+    - (Event, Organization): [AFFECTS] — 事件影响组织
+    - (Event, Sector): [AFFECTS] — 事件影响行业/板块
+    - (Event, Topic): [RELATED_TO] — 事件与主题关联
 """

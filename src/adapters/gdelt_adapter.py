@@ -1,15 +1,23 @@
 """GDELT CSV Adapter — fetch, parse, and normalize GDELT GKG V2 data.
 
 Data flow::
-    fetch_lastupdate() → download_gkg() → parse_gkg() → filter_relevant()
-    → normalize() → dedup()
+    fetch_lastupdate() → download_all_csvs() → parse_gkg() + parse_events + parse_mentions
+    → merge_event_data() → filter_relevant() → normalize() → dedup()
 
 Only the HTTP CSV data plane (http://data.gdeltproject.org/) is used.
 HTTPS is avoided because the HTTPS endpoints are blocked by the GFW.
+
+V2.2 → G5: Refactored for triple CSV source integration:
+- fetch_lastupdate() returns (events_url, mentions_url, gkg_url)
+- download_all_csvs() uses asyncio.gather() for concurrent downloads
+- merge_event_data() LEFT JOINs by GlobalEventID
+- filter_relevant() implements dual-layer (Themes OR CAMEO) filtering
+- GKG-only fallback path when all three CSV sources fail
 """
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import hashlib
 import os
@@ -20,7 +28,7 @@ import zipfile
 # Python's default csv field size limit (128KB) is too small
 csv.field_size_limit(10485760)  # 10MB
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Any
 
 import requests
 from tenacity import (
@@ -31,12 +39,16 @@ from tenacity import (
 )
 
 from src.adapters.base import BaseAdapter
+from src.adapters.gdelt_codebook import translate_actor, translate_cameo, translate_theme
+from src.adapters.gdelt_events_parser import parse_events_file
+from src.adapters.gdelt_mentions_parser import parse_mentions, fetch_mentions_csv
 from src.adapters.models import (
     EntityItem,
     NormalizedEpisode,
     Severity,
 )
 from src.adapters.macro_themes import MACRO_THEME_KEYWORDS
+from src.adapters.cameo_event_codes_whitelist import CAMEO_EVENT_CODES_WHITELIST
 from src.utils.logging_config import get_logger
 from src.utils.time_utils import now_hkt
 
@@ -80,7 +92,7 @@ class GdeltFetchError(Exception):
 
 
 class GdeltDownloadError(Exception):
-    """Raised when downloading the GKG CSV zip fails after all retries."""
+    """Raised when downloading a CSV zip fails after all retries."""
 
 
 def _map_tone_to_severity(tone_str: str | None) -> Severity:
@@ -96,7 +108,10 @@ def _parse_location(location_str: str) -> str:
     """Clean a GKG V2.7 Location field, stripping coordinate metadata.
 
     Input:  "#1#2#Beijing,Beijing,China#CN#CN|#VNM"
-    Output: "Beijing, China"
+    Output: "Beijing, China (China)"
+
+    If a country code is present (sub[4]), it is translated via
+    ``translate_actor()`` and appended to the cleaned name.
 
     Multiple locations separated by '|' are joined with '; '.
     """
@@ -114,7 +129,6 @@ def _parse_location(location_str: str) -> str:
         if not name:
             continue
 
-        # Try to extract country from second code or from name itself
         # If name contains comma-separated parts like "Beijing,Beijing,China"
         # We want just the city and country (first + last meaningful)
         name_parts = [p.strip() for p in name.split(",") if p.strip()]
@@ -124,13 +138,28 @@ def _parse_location(location_str: str) -> str:
         else:
             cleaned = ", ".join(name_parts)
 
+        # Translate country code (sub[4]) via translate_actor and append
+        # Format: "Beijing, China (China)"
+        if len(sub) >= 5:
+            country_code = sub[4].strip()
+            if country_code:
+                translated = translate_actor(country_code)
+                if translated != country_code:
+                    # Translation succeeded — append as " (translated_name)"
+                    cleaned = f"{cleaned} ({translated})"
+
         cleaned_parts.append(cleaned)
 
     return "; ".join(cleaned_parts) if cleaned_parts else location_str
 
 
 def _parse_entities_from_record(record: dict) -> list[EntityItem]:
-    """Extract EntityItem list from a parsed GKG record."""
+    """Extract EntityItem list from a parsed GKG record.
+
+    Returns entities for Persons, Organizations, Locations only.
+    Themes are NOT included as entities — they go into keywords instead.
+    Events Actor entities (country/organization) are added when available.
+    """
     entities: list[EntityItem] = []
 
     # V2.5 — Persons
@@ -157,40 +186,76 @@ def _parse_entities_from_record(record: dict) -> list[EntityItem]:
         if cleaned:
             entities.append(EntityItem(type="location", name=cleaned))
 
-    # V2.8 — Themes
-    themes_raw = record.get("themes", "") or ""
-    for name in themes_raw.split(";"):
-        name = name.strip()
-        if name:
-            entities.append(EntityItem(type="theme", name=name))
+    # Events Actor entities — when merge data provides translatable actor codes
+    cameo_code = record.get("cameo_code") or None
+    actor1_code = record.get("actor1_code") or None
+    actor1_name = record.get("actor1_name") or ""
+    actor2_code = record.get("actor2_code") or None
+    actor2_name = record.get("actor2_name") or ""
+
+    # Add actor1 as entity if it's a translatable country/organization
+    if actor1_code and actor1_name and actor1_name != actor1_code:
+        entities.append(EntityItem(type="country", name=actor1_name))
+
+    # Add actor2 as entity if it's a translatable country/organization
+    if actor2_code and actor2_name and actor2_name != actor2_code:
+        entities.append(EntityItem(type="country", name=actor2_name))
 
     return entities
 
 
 def _build_episode_body(record: dict) -> str:
-    """Build a human-readable episode body from a GKG record."""
+    """Build a human-readable episode body from a merged record.
+
+    Include CAMEO event descriptions, actors, themes, persons,
+    organizations, locations, and source URL.
+    """
     parts: list[str] = []
 
-    themes = record.get("themes", "") or ""
-    parts.append(f"Themes: {themes}")
+    # CAMEO Event description (from merged Events data)
+    cameo_code = record.get("cameo_code") or ""
+    if cameo_code:
+        cameo_desc = translate_cameo(cameo_code)
+        parts.append(f"[CAMEO Event: {cameo_desc}]")
 
+    # Actors (from merged Events data)
+    actor1_name = record.get("actor1_name") or ""
+    actor2_name = record.get("actor2_name") or ""
+    if actor1_name or actor2_name:
+        actor_str = f"[Actors: {actor1_name}" if actor1_name else "[Actors: unknown"
+        if actor2_name:
+            actor_str += f" → {actor2_name}"
+        actor_str += "]"
+        parts.append(actor_str)
+
+    # Themes — translate to human-readable
+    themes = record.get("themes", "") or ""
+    translated_themes = "; ".join(
+        translate_theme(t.strip()) for t in themes.split(";") if t.strip()
+    )
+    if translated_themes:
+        parts.append(f"Themes: {translated_themes}")
+
+    # Persons
     persons = record.get("persons", "") or ""
     if persons:
         parts.append(f"Persons: {persons}")
 
+    # Organizations
     organizations = record.get("organizations", "") or ""
     if organizations:
         parts.append(f"Organizations: {organizations}")
 
+    # Locations (cleaned)
     locations = record.get("locations", "") or ""
     if locations:
-        # Clean locations for readability
         loc_cleaned = "; ".join(
             _parse_location(l) for l in locations.split(";") if l.strip()
         )
         if loc_cleaned:
             parts.append(f"Locations: {loc_cleaned}")
 
+    # Source URL
     source_url = record.get("source_url", "") or ""
     if source_url:
         parts.append(f"Source: {source_url}")
@@ -201,23 +266,25 @@ def _build_episode_body(record: dict) -> str:
 class GdeltAdapter(BaseAdapter):
     """GDELT GKG V2 CSV adapter.
 
-    Fetches the latest GKG CSV from data.gdeltproject.org, parses the
-    27-column tab-separated format, filters by 19 core macro themes (OR
-    matching), and normalises to NormalizedEpisode with content_scope=MACRO.
+    Fetches the latest Events, Mentions, and GKG CSV files from
+    data.gdeltproject.org, downloads them concurrently, parses each
+    using dedicated parser modules, merges by GlobalEventID (LEFT JOIN),
+    and filters by dual-layer (Themes OR CAMEO) criteria.
 
-    V2.2: Replaced ticker_whitelist filtering with macro theme filtering.
-    No longer receives or uses ticker whitelist.
+    G5: Triple CSV source integration with concurrent download and merge.
     """
 
     def __init__(
         self,
         macro_theme_keywords: set[str] | None = None,
+        cameo_event_codes_whitelist: set[str] | None = None,
         max_retries: int = 3,
         backoff_base: float = 1.0,
         dedup_cache: set[str] | None = None,
     ) -> None:
         super().__init__(dedup_cache=dedup_cache)
         self._macro_theme_keywords = macro_theme_keywords or MACRO_THEME_KEYWORDS
+        self._cameo_whitelist = cameo_event_codes_whitelist or CAMEO_EVENT_CODES_WHITELIST
         self.max_retries = max_retries
         self.backoff_base = backoff_base
         self._last_records: list[dict] = []
@@ -238,21 +305,22 @@ class GdeltAdapter(BaseAdapter):
             reraise=True,
         )
 
-    def fetch_lastupdate(self) -> str:
-        """Fetch the latest GKG CSV URL from lastupdate.txt.
+    def fetch_lastupdate(self) -> tuple[str, str, str]:
+        """Fetch the latest Events, Mentions, and GKG CSV URLs from lastupdate.txt.
 
         ``lastupdate.txt`` contains three lines (events, mentions, GKG).
-        The third line is the GKG CSV zip URL.
+        Each line has format: ``<date> <time> <csv_url>``.
 
-        Returns the URL string for the GKG CSV zip file.
+        Returns:
+            A tuple of (events_url, mentions_url, gkg_url).
 
         Raises:
-            GdeltFetchError: If all retry attempts fail.
+            GdeltFetchError: If all retry attempts fail or format is invalid.
         """
         retry_dec = self._make_retry_decorator()
 
         @retry_dec
-        def _do_fetch() -> str:
+        def _do_fetch() -> tuple[str, str, str]:
             logger.info("Fetching lastupdate.txt from %s", self._lastupdate_url)
             resp = requests.get(self._lastupdate_url, timeout=30)
             resp.raise_for_status()
@@ -261,18 +329,25 @@ class GdeltAdapter(BaseAdapter):
                 raise GdeltFetchError(
                     f"Expected ≥3 lines, got {len(lines)}: {resp.text[:200]}"
                 )
-            # Third line (index 2) is the GKG CSV line
-            gkg_line = lines[2].strip()
-            parts = gkg_line.split()
-            if len(parts) < 3:
-                raise GdeltFetchError(
-                    f"Expected ≥3 fields on GKG line, got {len(parts)}: {gkg_line[:200]}"
-                )
-            url = parts[2].strip()  # URL is the 3rd field on each line
-            if not url.startswith("http"):
-                raise GdeltFetchError(f"Invalid GKG URL: {url}")
-            logger.info("Latest GKG CSV URL: %s", url)
-            return url
+
+            urls: list[str] = []
+            for i, line in enumerate(lines[:3]):
+                parts = line.strip().split()
+                if len(parts) < 3:
+                    raise GdeltFetchError(
+                        f"Expected ≥3 fields on line {i}, got {len(parts)}: {line[:200]}"
+                    )
+                url = parts[2].strip()
+                if not url.startswith("http"):
+                    raise GdeltFetchError(f"Invalid URL on line {i}: {url}")
+                urls.append(url)
+
+            events_url, mentions_url, gkg_url = urls
+            logger.info(
+                "Latest CSV URLs: events=%s mentions=%s gkg=%s",
+                events_url, mentions_url, gkg_url,
+            )
+            return events_url, mentions_url, gkg_url
 
         try:
             return _do_fetch()
@@ -281,8 +356,152 @@ class GdeltAdapter(BaseAdapter):
                 f"Failed to fetch lastupdate.txt after {self.max_retries} retries: {exc}"
             ) from exc
 
+    def _download_single_csv(
+        self, csv_url: str, label: str
+    ) -> tuple[str, tempfile.TemporaryDirectory]:
+        """Download a single .csv.zip file and extract the CSV.
+
+        Uses ``tempfile.TemporaryDirectory`` and cleans up on failure.
+        The directory handle is returned as part of a tuple for the caller
+        to manage the lifecycle.
+
+        Args:
+            csv_url: The URL of the .csv.zip file.
+            label: Source label for logging (e.g. "events", "mentions", "gkg").
+
+        Returns:
+            A tuple of (csv_path, tmp_dir). The caller is responsible
+            for cleaning up tmp_dir after use.
+
+        Raises:
+            GdeltDownloadError: If all retry attempts fail.
+        """
+        retry_dec = self._make_retry_decorator()
+
+        @retry_dec
+        def _do_download() -> tuple[str, tempfile.TemporaryDirectory]:
+            _tmp = tempfile.TemporaryDirectory()
+            try:
+                logger.info("Downloading %s CSV from %s", label, csv_url)
+                resp = requests.get(csv_url, timeout=60)
+                resp.raise_for_status()
+                zip_path = os.path.join(_tmp.name, f"{label}.zip")
+                with open(zip_path, "wb") as f:
+                    f.write(resp.content)
+                with zipfile.ZipFile(zip_path, "r") as zf:
+                    csv_names = [n for n in zf.namelist() if n.endswith(".csv")]
+                    if not csv_names:
+                        raise GdeltDownloadError(
+                            f"No CSV found in {label} zip archive: {zf.namelist()}"
+                        )
+                    csv_name = csv_names[0]
+                    zf.extract(csv_name, _tmp.name)
+                    csv_path = os.path.join(_tmp.name, csv_name)
+                    logger.info("Extracted %s CSV: %s", label, csv_path)
+                return csv_path, _tmp
+            except Exception:
+                _tmp.cleanup()
+                raise
+
+        try:
+            return _do_download()
+        except Exception as exc:
+            raise GdeltDownloadError(
+                f"Failed to download {label} CSV after {self.max_retries} retries: {exc}"
+            ) from exc
+
+    async def download_all_csvs(
+        self, events_url: str, mentions_url: str, gkg_url: str
+    ) -> tuple[list[dict], dict[str, list], list[dict]]:
+        """Download and parse all three CSV files concurrently using asyncio.gather().
+
+        Each CSV download and parse runs in a thread executor to avoid blocking
+        the event loop.
+
+        Args:
+            events_url: URL to Events CSV zip.
+            mentions_url: URL to Mentions CSV zip.
+            gkg_url: URL to GKG CSV zip.
+
+        Returns:
+            A tuple of (events_records, mentions_by_event, gkg_records).
+            Failed sources return empty data.
+        """
+        # Local dict to hold temp directory handles, avoiding cross-coroutine shared state
+        _tmp_dirs: list[tempfile.TemporaryDirectory] = []
+
+        async def _do_one(label: str, url: str) -> tuple[str, tempfile.TemporaryDirectory] | None:
+            """Download one CSV zip and return (csv_path, tmp_dir), or None on failure."""
+            try:
+                csv_path, _tmp = await asyncio.get_event_loop().run_in_executor(
+                    None, self._download_single_csv, url, label
+                )
+                return csv_path, _tmp
+            except GdeltDownloadError as exc:
+                logger.warning("Failed to download %s CSV: %s", label, exc)
+                return None
+
+        # Download all three concurrently
+        gkg_result, events_result, mentions_result = await asyncio.gather(
+            _do_one("gkg", gkg_url),
+            _do_one("events", events_url),
+            _do_one("mentions", mentions_url),
+        )
+
+        gkg_path = gkg_result[0] if gkg_result else None
+        events_path = events_result[0] if events_result else None
+        mentions_path = mentions_result[0] if mentions_result else None
+
+        # Collect tmp dir handles for later cleanup
+        for result in (gkg_result, events_result, mentions_result):
+            if result is not None:
+                _tmp_dirs.append(result[1])
+
+        # Parse GKG
+        gkg_records: list[dict] = []
+        events_records: list[dict] = []
+        mentions_by_event: dict[str, list] = {}
+
+        if gkg_path is not None:
+            try:
+                gkg_records = self.parse_gkg(gkg_path)
+            except Exception as exc:
+                logger.warning("Failed to parse GKG CSV: %s", exc)
+
+        if events_path is not None:
+            try:
+                events_records = await asyncio.get_event_loop().run_in_executor(
+                    None, parse_events_file, events_path
+                )
+            except Exception as exc:
+                logger.warning("Failed to parse Events CSV: %s", exc)
+
+        if mentions_path is not None:
+            try:
+                raw_mentions = await asyncio.get_event_loop().run_in_executor(
+                    None, fetch_mentions_csv, mentions_path
+                )
+                mentions_by_event = parse_mentions(raw_mentions)
+            except Exception as exc:
+                logger.warning("Failed to parse Mentions CSV: %s", exc)
+
+        # Cleanup: remove all temporary directories after parsing is complete
+        for _tmp in _tmp_dirs:
+            try:
+                _tmp.cleanup()
+            except Exception:
+                pass  # Best-effort cleanup; directories under /tmp are ephemeral
+
+        logger.info(
+            "Download/parse results: gkg=%d events=%d mentions=%d event_groups",
+            len(gkg_records), len(events_records), len(mentions_by_event),
+        )
+        return events_records, mentions_by_event, gkg_records
+
     def download_gkg(self, csv_url: str) -> str:
-        """Download the GKG CSV zip file and extract the CSV.
+        """Download the GKG CSV zip file and extract the CSV (legacy single-source).
+
+        Kept for backward compatibility with the GKG-only fallback path.
 
         Args:
             csv_url: The URL of the .csv.zip file.
@@ -292,49 +511,10 @@ class GdeltAdapter(BaseAdapter):
 
         Raises:
             GdeltDownloadError: If all retry attempts fail.
-
-        Note:
-            Each tenacity retry creates a fresh TemporaryDirectory so that
-            a failed attempt's cleanup does not invalidate subsequent retries.
         """
-        retry_dec = self._make_retry_decorator()
-
-        @retry_dec
-        def _do_download() -> str:
-            # Create a new temp dir per retry attempt so cleanup from a failed
-            # attempt does not affect the next retry's temp dir.
-            _tmp = tempfile.TemporaryDirectory()
-            try:
-                logger.info("Downloading GKG CSV from %s", csv_url)
-                resp = requests.get(csv_url, timeout=60)
-                resp.raise_for_status()
-                zip_path = os.path.join(_tmp.name, "gkg.zip")
-                with open(zip_path, "wb") as f:
-                    f.write(resp.content)
-                # Extract
-                with zipfile.ZipFile(zip_path, "r") as zf:
-                    csv_names = [n for n in zf.namelist() if n.endswith(".csv")]
-                    if not csv_names:
-                        raise GdeltDownloadError(
-                            f"No CSV found in zip archive: {zf.namelist()}"
-                        )
-                    csv_name = csv_names[0]
-                    zf.extract(csv_name, _tmp.name)
-                    csv_path = os.path.join(_tmp.name, csv_name)
-                    logger.info("Extracted CSV: %s", csv_path)
-                # Keep a reference to prevent GC before parse_gkg reads the file
-                self._download_tmp_dir = _tmp  # type: ignore[attr-defined]
-                return csv_path
-            except Exception:
-                _tmp.cleanup()
-                raise
-
-        try:
-            return _do_download()
-        except Exception as exc:
-            raise GdeltDownloadError(
-                f"Failed to download GKG CSV after {self.max_retries} retries: {exc}"
-            ) from exc
+        csv_path, _tmp = self._download_single_csv(csv_url, "gkg")
+        _tmp.cleanup()
+        return csv_path
 
     def parse_gkg(self, csv_path: str) -> list[dict]:
         """Parse a GKG V2 CSV file (tab-separated, 27 columns).
@@ -382,41 +562,159 @@ class GdeltAdapter(BaseAdapter):
         logger.info("Parsed %d records from GKG CSV", len(records))
         return records
 
+    # ── merge ─────────────────────────────────────────────────────────
+
+    def merge_event_data(
+        self,
+        gkg_records: list[dict],
+        events_records: list[dict] | None = None,
+        mentions_by_event: dict[str, list] | None = None,
+    ) -> list[dict]:
+        """Merge GKG, Events, and Mentions data by GlobalEventID (LEFT JOIN).
+
+        GKG is the primary table. Events and Mentions data are LEFT JOINed
+        onto GKG records by GlobalEventID. Records without matching Events
+        or Mentions data keep only GKG fields.
+
+        Args:
+            gkg_records: Parsed GKG records, each with a ``global_event_id`` key.
+            events_records: List of EventRecord objects from parse_events_file(),
+                or None if Events data is unavailable.
+            mentions_by_event: Dict mapping event_id -> list[MentionRecord],
+                or None if Mentions data is unavailable.
+
+        Returns:
+            List of merged record dicts, one per GKG record, enriched with
+            optional Events/Mentions fields.
+        """
+        # Build lookup maps for O(1) access
+        events_map: dict[str, dict[str, Any]] = {}
+        if events_records is not None:
+            for ev in events_records:
+                # EventRecord dataclass — convert to dict-like access
+                eid = str(getattr(ev, "event_id", ""))
+                if eid:
+                    events_map[eid] = {
+                        "cameo_code": getattr(ev, "cameo_code", ""),
+                        "actor1_code": getattr(ev, "actor1_code", ""),
+                        "actor1_name": getattr(ev, "actor1_name", ""),
+                        "actor2_code": getattr(ev, "actor2_code", ""),
+                        "actor2_name": getattr(ev, "actor2_name", ""),
+                        "goldstein_scale": getattr(ev, "goldstein_scale", None),
+                        "avg_tone": getattr(ev, "avg_tone", None),
+                        "event_date": getattr(ev, "event_date", ""),
+                    }
+
+        merged: list[dict] = []
+        for gkg_rec in gkg_records:
+            eid = gkg_rec.get("global_event_id", "")
+
+            # Start with GKG fields
+            merged_rec = dict(gkg_rec)
+
+            # LEFT JOIN Events data
+            ev_data = events_map.get(eid, {})
+            merged_rec["cameo_code"] = ev_data.get("cameo_code")
+            merged_rec["actor1_code"] = ev_data.get("actor1_code")
+            merged_rec["actor1_name"] = ev_data.get("actor1_name")
+            merged_rec["actor2_code"] = ev_data.get("actor2_code")
+            merged_rec["actor2_name"] = ev_data.get("actor2_name")
+            merged_rec["goldstein_scale"] = ev_data.get("goldstein_scale")
+            merged_rec["avg_tone"] = ev_data.get("avg_tone")
+            merged_rec["event_date"] = ev_data.get("event_date")
+
+            # LEFT JOIN Mentions data
+            if mentions_by_event is not None:
+                m_records = mentions_by_event.get(eid)
+                if m_records:
+                    merged_rec["mentions"] = [
+                        {
+                            "mention_time": getattr(m, "mention_time", ""),
+                            "source_common_name": getattr(m, "source_common_name", ""),
+                            "document_identifier": getattr(m, "document_identifier", ""),
+                            "mention_confidence": getattr(m, "mention_confidence", 0),
+                            "mention_type": getattr(m, "mention_type", 0),
+                        }
+                        for m in m_records
+                    ]
+                else:
+                    merged_rec["mentions"] = None
+
+            merged.append(merged_rec)
+
+        logger.info(
+            "Merged %d records (events=%d, mentions=%d groups)",
+            len(merged),
+            len(events_map),
+            len(mentions_by_event) if mentions_by_event else 0,
+        )
+        return merged
+
     # ── record-level methods ─────────────────────────────────────────
 
     def filter_relevant(
         self, records: list[dict]
     ) -> list[dict]:
-        """Filter records by 19 core macro themes (OR matching).
+        """Filter records by dual-layer criteria (Layer A: Themes OR Layer B: CAMEO).
 
-        V2.2: Replaced ticker_whitelist filtering. Matches GKG V2.8 Themes
-        column against the 19 core financial theme keywords. Any single
-        match retains the record.
+        Layer A (GKG Themes): Match GKG V2.8 Themes column against
+        ``MACRO_THEME_KEYWORDS``. Any single match retains the record.
 
-        If ``_macro_theme_keywords`` is empty, returns all records.
+        Layer B (CAMEO Codes): Match merged ``cameo_code`` field against
+        ``CAMEO_EVENT_CODES_WHITELIST``. Exact prefix match retains the record.
+
+        Records pass if they match Layer A OR Layer B.
+
+        If both whitelists are empty, returns all records.
         """
-        if not self._macro_theme_keywords:
+        if not self._macro_theme_keywords and not self._cameo_whitelist:
             return records
 
         matched: list[dict] = []
+        layer_a_matches = 0
+        layer_b_matches = 0
+
         for rec in records:
+            # Layer A: GKG Themes match
             themes_text = (rec.get("themes") or "").lower()
-            if any(kw.lower() in themes_text for kw in self._macro_theme_keywords):
+            layer_a_hit = bool(
+                self._macro_theme_keywords
+                and any(kw.lower() in themes_text for kw in self._macro_theme_keywords)
+            )
+
+            # Layer B: CAMEO code match — prefix matching
+            # A whitelist parent code (e.g. "162") must match
+            # child codes (e.g. "1621", "1622") via startswith.
+            cameo_code = (rec.get("cameo_code") or "").strip()
+            layer_b_hit = False
+            if self._cameo_whitelist and cameo_code:
+                for wl_code in self._cameo_whitelist:
+                    if cameo_code.startswith(wl_code):
+                        layer_b_hit = True
+                        break
+
+            if layer_a_hit or layer_b_hit:
                 matched.append(rec)
+                if layer_a_hit:
+                    layer_a_matches += 1
+                if layer_b_hit:
+                    layer_b_matches += 1
 
         logger.info(
-            "GDELT theme filter: %d → %d records (themes=%s)",
+            "Dual-layer filter: %d → %d records (Layer A=%d, Layer B=%d, OR=%d)",
             len(records),
             len(matched),
-            "OR".join(sorted(self._macro_theme_keywords))[:80]
+            layer_a_matches,
+            layer_b_matches,
+            len(matched),
         )
         return matched
 
     def normalize(self, record: dict) -> NormalizedEpisode:
-        """Convert a single parsed GKG record to NormalizedEpisode.
+        """Convert a single merged record to NormalizedEpisode.
 
         Args:
-            record: A dict from parse_gkg().
+            record: A dict from merge_event_data().
 
         Returns:
             NormalizedEpisode with content_scope=MACRO in metadata.
@@ -438,7 +736,7 @@ class GdeltAdapter(BaseAdapter):
         for theme_str in (record.get("themes", "") or "").split(";"):
             theme = theme_str.strip()
             if theme:
-                keywords.append(theme)
+                keywords.append(translate_theme(theme))
 
         name = NormalizedEpisode.make_name(
             source_type="gdelt_csv",
@@ -464,27 +762,104 @@ class GdeltAdapter(BaseAdapter):
     # ── fetch orchestration ──────────────────────────────────────────
 
     async def fetch(self, **kwargs: Any) -> list[dict]:
-        """Full fetch pipeline: lastupdate → download → parse → filter.
+        """Full fetch pipeline: lastupdate → download_all → merge → filter.
 
-        Falls back to last successful records when download fails.
+        Falls back to GKG-only mode when all three CSV sources fail.
+        Partial failure (e.g. only GKG available) doesn't trigger degraded.
         """
         try:
-            csv_url = self.fetch_lastupdate()
-            csv_path = self.download_gkg(csv_url)
-            records = self.parse_gkg(csv_path)
-            records = self.filter_relevant(records)
-            self._last_records = records
-            return records
-        except (GdeltFetchError, GdeltDownloadError) as exc:
+            # Step 1: Get all three URLs
+            events_url, mentions_url, gkg_url = self.fetch_lastupdate()
+
+            # Step 2: Download and parse all three concurrently
+            events_records, mentions_by_event, gkg_records = await self.download_all_csvs(
+                events_url, mentions_url, gkg_url
+            )
+
+            # Check: did we get at least GKG data?
+            if not gkg_records:
+                logger.warning("GKG records are empty, falling back to cached records")
+                return self._last_records
+
+            # Step 3: Merge by GlobalEventID (LEFT JOIN)
+            merged_records = self.merge_event_data(
+                gkg_records=gkg_records,
+                events_records=events_records if events_records else None,
+                mentions_by_event=mentions_by_event if mentions_by_event else None,
+            )
+
+            # Step 4: Dual-layer filter
+            filtered = self.filter_relevant(merged_records)
+            self._last_records = filtered
+            return filtered
+
+        except GdeltFetchError as exc:
+            # All three URLs failed — fall back to GKG-only mode
             logger.warning(
-                "GDELT fetch failed: %s. Falling back to %d cached records.",
+                "GDELT triple-source fetch failed: %s. "
+                "Falling back to GKG-only mode with %d cached records.",
                 exc,
                 len(self._last_records),
             )
+            if not self._last_records:
+                # No cached records — try GKG-only fallback
+                try:
+                    gkg_url = self._fallback_fetch_gkg_only()
+                    csv_path = self.download_gkg(gkg_url)
+                    gkg_records = self.parse_gkg(csv_path)
+                    merged = self.merge_event_data(gkg_records)
+                    filtered = self.filter_relevant(merged)
+                    self._last_records = filtered
+                except Exception as fallback_exc:
+                    logger.warning(
+                        "GKG-only fallback also failed: %s",
+                        fallback_exc,
+                    )
+                    return self._last_records
+
             # Mark degraded episodes
             for rec in self._last_records:
                 rec["_degraded"] = True
             return self._last_records
+
+    def _fallback_fetch_gkg_only(self) -> str:
+        """Fallback: fetch only the GKG URL from lastupdate.txt.
+
+        Used when triple-source fetch fails completely. Returns only
+        the GKG CSV URL by re-fetching lastupdate.txt.
+
+        Returns:
+            GKG CSV URL string.
+
+        Raises:
+            GdeltFetchError: If fetching GKG URL fails.
+        """
+        # Re-fetch just the GKG URL using the original single-URL logic
+        retry_dec = self._make_retry_decorator()
+
+        @retry_dec
+        def _do_fetch() -> str:
+            logger.info("GKG-only fallback: fetching lastupdate.txt from %s", self._lastupdate_url)
+            resp = requests.get(self._lastupdate_url, timeout=30)
+            resp.raise_for_status()
+            lines = resp.text.strip().split("\n")
+            if len(lines) < 3:
+                raise GdeltFetchError(
+                    f"Expected ≥3 lines, got {len(lines)}: {resp.text[:200]}"
+                )
+            gkg_line = lines[2].strip()
+            parts = gkg_line.split()
+            if len(parts) < 3:
+                raise GdeltFetchError(
+                    f"Expected ≥3 fields on GKG line, got {len(parts)}: {gkg_line[:200]}"
+                )
+            url = parts[2].strip()
+            if not url.startswith("http"):
+                raise GdeltFetchError(f"Invalid GKG URL: {url}")
+            logger.info("GKG-only fallback URL: %s", url)
+            return url
+
+        return _do_fetch()
 
     async def run(self, **kwargs: Any) -> list[NormalizedEpisode]:
         """Full pipeline with degraded metadata."""
@@ -513,6 +888,3 @@ def _parse_gkg_datetime(raw: str) -> datetime:
             pass
     logger.warning("Could not parse GKG datetime '%s', using current HKT time", raw)
     return now_hkt()
-
-
-

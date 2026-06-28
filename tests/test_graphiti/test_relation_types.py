@@ -92,7 +92,8 @@ class TestEdgeTypesDict:
 
 class TestEdgeTypeMap:
     def test_has_five_groups(self):
-        assert len(DEFAULT_EDGE_TYPE_MAP) == 5
+        # 现有 5 个基础映射 + 4 个 Event 映射 = 9
+        assert len(DEFAULT_EDGE_TYPE_MAP) == 9
 
     def test_entity_entity_has_all_types(self):
         types = DEFAULT_EDGE_TYPE_MAP[("Entity", "Entity")]
@@ -114,3 +115,32 @@ class TestEdgeTypeMap:
 
     def test_entity_policy(self):
         assert "RELATED_TO" in DEFAULT_EDGE_TYPE_MAP[("Entity", "Policy")]
+
+
+class TestEventEntityMappings:
+    """测试 Event 实体类型关系映射。"""
+
+    def test_default_edge_type_map_has_event_mappings(self):
+        """DEFAULT_EDGE_TYPE_MAP 应包含 Event 实体类型的 4 个映射。"""
+        event_keys = [k for k in DEFAULT_EDGE_TYPE_MAP.keys() if k[0] == "Event"]
+        assert len(event_keys) == 4, f"Expected 4 Event mappings, got {len(event_keys)}"
+
+    def test_event_country_affects(self):
+        """Event -> Country 应映射为 AFFECTS 关系。"""
+        assert ("Event", "Country") in DEFAULT_EDGE_TYPE_MAP
+        assert "AFFECTS" in DEFAULT_EDGE_TYPE_MAP[("Event", "Country")]
+
+    def test_event_organization_affects(self):
+        """Event -> Organization 应映射为 AFFECTS 关系。"""
+        assert ("Event", "Organization") in DEFAULT_EDGE_TYPE_MAP
+        assert "AFFECTS" in DEFAULT_EDGE_TYPE_MAP[("Event", "Organization")]
+
+    def test_event_sector_affects(self):
+        """Event -> Sector 应映射为 AFFECTS 关系。"""
+        assert ("Event", "Sector") in DEFAULT_EDGE_TYPE_MAP
+        assert "AFFECTS" in DEFAULT_EDGE_TYPE_MAP[("Event", "Sector")]
+
+    def test_event_topic_related_to(self):
+        """Event -> Topic 应映射为 RELATED_TO 关系。"""
+        assert ("Event", "Topic") in DEFAULT_EDGE_TYPE_MAP
+        assert "RELATED_TO" in DEFAULT_EDGE_TYPE_MAP[("Event", "Topic")]

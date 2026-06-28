@@ -84,6 +84,35 @@ class TestParseLocation:
         result = _parse_location("")
         assert result == ""
 
+    def test_location_with_country_code_translated(self):
+        """Country code (sub[4]) is translated via translate_actor and appended."""
+        result = _parse_location(
+            "#1#2#Beijing,Beijing,China#CHN#CN"
+        )
+        # CHN translates to "China" → output: "Beijing, China (China)"
+        assert "Beijing" in result
+        assert " (China)" in result
+
+    def test_location_with_untranslated_country_code(self):
+        """2-letter country code not in actor codebook leaves name unchanged."""
+        result = _parse_location(
+            "#1#2#Beijing,Beijing,China#CN#CN"
+        )
+        # CN is not a 3-letter ISO code in the actor codebook, so no translation
+        assert "Beijing" in result
+        assert "China" in result
+        # No parenthetical appended
+        assert " (" not in result
+
+    def test_location_with_vnm_translated(self):
+        """VNM is in the actor codebook and should be translated."""
+        result = _parse_location(
+            "#1#2#Hanoi,Hanoi,Vietnam#VNM#VN"
+        )
+        # VNM translates to "Vietnam" → output: "Hanoi, Vietnam (Vietnam)"
+        assert "Hanoi" in result
+        assert " (Vietnam)" in result
+
 
 class TestParseDatetime:
     """GKG datetime parsing."""
@@ -125,6 +154,11 @@ class TestGdeltNormalize:
         locs = [e.name for e in episode.entities if e.type == "location"]
         assert any("Beijing" in l for l in locs)
         assert any("Shanghai" in l for l in locs)
+
+        # Verify theme entity names are translated
+        themes = [e.name for e in episode.entities if e.type == "theme"]
+        assert any("ECON_FINANCIAL_MARKET" in t for t in themes)
+        assert any("TAX_FNCACT_REG_INVEST" in t for t in themes)
 
         # Verify content_hash is valid
         assert len(episode.content_hash) == 64

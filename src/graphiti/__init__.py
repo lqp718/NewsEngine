@@ -13,6 +13,8 @@ from .entity_types import (
     PolicyEntity,
     OrganizationEntity,
     TopicEntity,
+    EventEntity,
+    SymbolEventEntity,
     MACRO_ENTITY_TYPES,
     SYMBOL_ENTITY_TYPES,
 )
@@ -30,6 +32,8 @@ __all__ = [
     "PolicyEntity",
     "OrganizationEntity",
     "TopicEntity",
+    "EventEntity",
+    "SymbolEventEntity",
     "MACRO_ENTITY_TYPES",
     "SYMBOL_ENTITY_TYPES",
     # Episode writer exports
