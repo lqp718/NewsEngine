@@ -26,6 +26,7 @@ from src.adapters.models import NormalizedEpisode
 from src.utils.content_fetcher import ContentResult
 from src.utils.logging_config import get_logger
 from src.utils.time_utils import now_hkt
+from src.utils.yaml_parser import strip_yaml_front_matter
 
 logger = get_logger(__name__)
 
@@ -297,7 +298,10 @@ class RssAdapter(BaseAdapter):
 
         # Build episode body: prefer full_text over summary (never mix both)
         if full_text:
-            episode_body = _build_episode_body(title, full_text)
+            pure_text, yaml_meta = strip_yaml_front_matter(full_text)
+            episode_body = _build_episode_body(title, pure_text)
+            if yaml_meta:
+                metadata["extracted_metadata"] = yaml_meta
         else:
             episode_body = _build_episode_body(title, summary)
 

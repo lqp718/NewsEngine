@@ -331,14 +331,17 @@ class ContentFetcher:
         try:
             import trafilatura
 
-            extracted = trafilatura.extract(
+            result = trafilatura.extract_with_metadata(
                 html,
                 url=url,
-                no_fallback=False,
                 favor_precision=True,
+                include_tables=True,
                 output_format="txt",
             )
-            return extracted
+            # extract_with_metadata 返回 Document 对象
+            if hasattr(result, 'text'):
+                return result.text
+            return str(result) if result else ""
 
         except ImportError:
             logger.warning("Trafilatura not installed")

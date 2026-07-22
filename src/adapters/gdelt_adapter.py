@@ -54,6 +54,7 @@ from src.adapters.cameo_event_codes_whitelist import CAMEO_EVENT_CODES_WHITELIST
 from src.utils.content_fetcher import ContentResult
 from src.utils.logging_config import get_logger
 from src.utils.time_utils import now_hkt
+from src.utils.yaml_parser import strip_yaml_front_matter
 
 logger = get_logger(__name__)
 
@@ -931,7 +932,10 @@ class GdeltAdapter(BaseAdapter):
                     )
 
         if full_text:
-            body = _build_episode_body_with_full_text(record, full_text)
+            pure_text, yaml_meta = strip_yaml_front_matter(full_text)
+            body = _build_episode_body_with_full_text(record, pure_text)
+            if yaml_meta:
+                metadata["extracted_metadata"] = yaml_meta
         else:
             body = _build_episode_body(record)
 
