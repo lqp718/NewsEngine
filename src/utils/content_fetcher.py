@@ -1,11 +1,15 @@
 """ContentFetcher — fetch and extract article body text from URLs.
 
-Uses Scrapling Spider AsyncStealthySession for unified fetch+extract
-with built-in anti-bot and Cloudflare bypass capabilities.
+Uses NewsSpider (built on Scrapling FetcherSession + AsyncStealthySession)
+for unified fetch+extract with built-in anti-bot and Cloudflare bypass capabilities.
 
-V3.0: Refactored to use Scrapling Spider framework exclusively.
+V4.0: Refactored to use NewsSpider for 10-concurrent Spider-like dispatch
+with domain-level rate limiting (2 concurrent/domain). ``AsyncStealthySession``
+is configured with ``solve_cloudflare=True`` for Investing.com and similar
+protected sites.
 
 Usage::
+
     fetcher = ContentFetcher()
     result = await fetcher.fetch_async("https://example.com/article")
     if result.success:
@@ -26,6 +30,13 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from src.utils.news_spider import (
+    DEFAULT_CONCURRENT_PER_DOMAIN,
+    DEFAULT_CONCURRENT_REQUESTS,
+    DEFAULT_TIMEOUT_MS,
+    SpiderResult,
+    fetch_urls_with_spider,
+)
 from src.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -91,8 +102,8 @@ class ContentResult:
 class ContentFetcher:
     """Fetch and extract article body text from news article URLs.
 
-    Uses Scrapling Spider AsyncStealthySession for unified crawling
-    with automatic anti-bot detection bypass and Cloudflare solving.
+    Uses NewsSpider for concurrent fetching with automatic anti-bot
+    detection bypass and Cloudflare solving.
 
     Rate-limited per domain with configurable minimum gap.
     """
@@ -115,6 +126,7 @@ class ContentFetcher:
             batch_cooldown: Seconds between batches.
         """
         self._timeout = timeout
+        self._timeout_ms = timeout * 1000
         self._rate_limit = rate_limit
         self._max_concurrent = max_concurrent
         self._batch_size = batch_size
@@ -138,7 +150,7 @@ class ContentFetcher:
         with concurrent.futures.ThreadPoolExecutor() as executor:
             future = executor.submit(
                 asyncio.run,
-                self._fetch_single(url)
+                self._fetch_single(url),
             )
             return future.result(timeout=120)
 
@@ -156,7 +168,7 @@ class ContentFetcher:
         return await self._fetch_single(url)
 
     async def fetch_batch(self, urls: list[str]) -> list[ContentResult]:
-        """Fetch multiple URLs concurrently.
+        """Fetch multiple URLs using NewsSpider.
 
         Args:
             urls: List of article URLs to fetch.
@@ -175,10 +187,10 @@ class ContentFetcher:
 
         return results
 
-    # ── Internal: Unified fetch with Spider ───────────────────────────
+    # ── Internal: Unified fetch with NewsSpider ──────────────────────
 
     async def _fetch_single(self, url: str) -> ContentResult:
-        """Fetch a single URL using Spider.
+        """Fetch a single URL using NewsSpider.
 
         Args:
             url: URL to fetch.
@@ -189,36 +201,31 @@ class ContentFetcher:
         await self._enforce_rate_limit(url)
 
         try:
-            from scrapling.fetchers import AsyncStealthySession
-
-            async with AsyncStealthySession(max_pages=1) as session:
-                page = await session.fetch(url)
-                if page:
-                    return self._process_page(page, url)
-                else:
-                    return ContentResult(
-                        url=url,
-                        success=False,
-                        error="AsyncStealthySession returned no page"
-                    )
+            spider_results = await fetch_urls_with_spider(
+                urls=[url],
+                timeout_ms=self._timeout_ms,
+                concurrent_requests=10,
+                concurrent_per_domain=2,
+            )
+            return self._spider_result_to_content(spider_results[0], url)
 
         except ImportError as exc:
-            logger.error("AsyncStealthySession not available: %s", exc)
+            logger.error("NewsSpider dependencies not available: %s", exc)
             return ContentResult(
                 url=url,
                 success=False,
-                error=f"AsyncStealthySession not available: {exc}"
+                error=f"NewsSpider dependencies not available: {exc}",
             )
         except Exception as exc:
-            logger.warning("AsyncStealthySession fetch failed for %s: %s", url, exc)
+            logger.warning("NewsSpider fetch failed for %s: %s", url, exc)
             return ContentResult(
                 url=url,
                 success=False,
-                error=str(exc)
+                error=str(exc),
             )
 
     async def _fetch_batch_internal(self, urls: list[str]) -> list[ContentResult]:
-        """Fetch a batch of URLs using Spider with session reuse.
+        """Fetch a batch of URLs using NewsSpider.
 
         Args:
             urls: URLs to fetch.
@@ -227,97 +234,88 @@ class ContentFetcher:
             List of ContentResult in input order.
         """
         try:
-            from scrapling.fetchers import AsyncStealthySession
-
-            async with AsyncStealthySession(max_pages=SPIDER_MAX_PAGES) as session:
-                # Fetch all URLs concurrently using asyncio.gather
-                tasks = [session.fetch(url) for url in urls]
-                pages = await asyncio.gather(*tasks, return_exceptions=True)
-
-                # Process results
-                results: list[ContentResult] = []
-                for i, url in enumerate(urls):
-                    page = pages[i]
-                    if page is not None and not isinstance(page, Exception):
-                        result = self._process_page(page, url)
-                        results.append(result)
-                    else:
-                        error_msg = str(page) if isinstance(page, Exception) else "No page returned"
-                        results.append(ContentResult(
-                            url=url,
-                            success=False,
-                            error=error_msg
-                        ))
-
-                return results
+            spider_results = await fetch_urls_with_spider(
+                urls=urls,
+                timeout_ms=self._timeout_ms,
+                concurrent_requests=10,
+                concurrent_per_domain=2,
+            )
+            return [
+                self._spider_result_to_content(spider_result, url)
+                for spider_result, url in zip(spider_results, urls)
+            ]
 
         except ImportError as exc:
-            logger.error("AsyncStealthySession not available: %s", exc)
+            logger.error("NewsSpider not available: %s", exc)
             return [
-                ContentResult(url=url, success=False, error=f"AsyncStealthySession not available: {exc}")
+                ContentResult(
+                    url=url, success=False, error=f"NewsSpider not available: {exc}",
+                )
                 for url in urls
             ]
         except Exception as exc:
-            logger.error("AsyncStealthySession batch fetch failed: %s", exc)
+            logger.error("NewsSpider batch fetch failed: %s", exc)
             return [
                 ContentResult(url=url, success=False, error=str(exc))
                 for url in urls
             ]
 
-    def _process_page(self, page: Any, url: str) -> ContentResult:
-        """Process a fetched page and extract content.
+    def _spider_result_to_content(
+        self, spider_result: SpiderResult, url: str
+    ) -> ContentResult:
+        """Convert a SpiderResult to a ContentResult with text extraction.
 
         Args:
-            page: Scrapling Page object.
+            spider_result: Raw result from NewsSpider.
             url: Original URL.
 
         Returns:
-            ContentResult with extracted text.
+            ContentResult with extracted article text.
         """
-        try:
-            if hasattr(page, 'status') and page.status != 200:
-                return ContentResult(
-                    url=url,
-                    success=False,
-                    error=f"HTTP {page.status}"
-                )
-
-            html_content = page.html_content if hasattr(page, 'html_content') else None
-            if not html_content:
-                return ContentResult(
-                    url=url,
-                    success=False,
-                    error="Empty HTML content"
-                )
-
-            # Extract with Trafilatura
-            extracted = self._extract_content(html_content, url)
-
-            if extracted and extracted.strip():
-                logger.debug(
-                    "Extracted %d chars from %s",
-                    len(extracted.strip()),
-                    url
-                )
-                return ContentResult(
-                    url=url,
-                    text=extracted.strip(),
-                    success=True,
-                    engine="spider+trafilatura"
-                )
-            else:
-                return ContentResult(
-                    url=url,
-                    success=False,
-                    error="Trafilatura returned empty content"
-                )
-
-        except Exception as exc:
-            logger.warning("Content processing failed for %s: %s", url, exc)
+        # Check fetch-level failure (no HTML content)
+        if spider_result.error:
             return ContentResult(
                 url=url,
                 success=False,
-                error=str(exc)
+                error=spider_result.error,
+            )
+
+        if spider_result.status != 200:
+            return ContentResult(
+                url=url,
+                success=False,
+                error=f"HTTP {spider_result.status}",
+            )
+
+        html_content = spider_result.html_content
+        if not html_content:
+            return ContentResult(
+                url=url,
+                success=False,
+                error="Empty HTML content",
+            )
+
+        # Extract with Trafilatura
+        extracted = self._extract_content(html_content, url)
+        if extracted and extracted.strip():
+            engine = "news_spider+trafilatura"
+            logger.debug(
+                "Extracted %d chars from %s%s",
+                len(extracted.strip()),
+                url,
+                " (stealth)" if spider_result.used_stealth else "",
+            )
+            return ContentResult(
+                url=url,
+                text=extracted.strip(),
+                success=True,
+                engine=engine,
+            )
+        else:
+            return ContentResult(
+                url=url,
+                success=False,
+                error="Trafilatura returned empty content",
             )
 
     def _extract_content(self, html: str, url: str) -> str | None:
@@ -338,7 +336,7 @@ class ContentFetcher:
                 url=url,
                 no_fallback=False,
                 favor_precision=True,
-                output_format="txt"
+                output_format="txt",
             )
             return extracted
 
@@ -367,7 +365,7 @@ class ContentFetcher:
                 logger.debug(
                     "Rate-limiting domain %s: waiting %.1fs",
                     domain,
-                    wait
+                    wait,
                 )
                 await asyncio.sleep(wait)
             self._domain_last_fetch[domain] = time.monotonic()

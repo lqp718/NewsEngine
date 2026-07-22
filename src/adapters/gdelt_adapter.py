@@ -51,6 +51,7 @@ from src.adapters.models import (
 )
 from src.adapters.macro_themes import MACRO_THEME_KEYWORDS
 from src.adapters.cameo_event_codes_whitelist import CAMEO_EVENT_CODES_WHITELIST
+from src.utils.content_fetcher import ContentResult
 from src.utils.logging_config import get_logger
 from src.utils.time_utils import now_hkt
 
@@ -864,11 +865,20 @@ class GdeltAdapter(BaseAdapter):
             rejected,
         )
         return matched
-    async def normalize(self, record: dict) -> NormalizedEpisode:
+    async def normalize(
+        self,
+        record: dict,
+        fetch_results: dict[str, ContentResult] | None = None,
+    ) -> NormalizedEpisode:
         """Convert a single merged record to NormalizedEpisode.
+
+        If ``fetch_results`` is provided, uses pre-fetched ContentResult
+        from batch fetch to avoid per-URL fetch overhead.
 
         Args:
             record: A dict from merge_event_data().
+            fetch_results: Optional dict of pre-fetched content results
+                keyed by URL (from batch fetch).
 
         Returns:
             NormalizedEpisode with content_scope=MACRO in metadata.
@@ -889,23 +899,36 @@ class GdeltAdapter(BaseAdapter):
         full_text: str | None = None
 
         if self._content_fetcher and source_url:
-            try:
-                result = self._content_fetcher.fetch(source_url)
+            # Prefer pre-fetched result from batch
+            if fetch_results and source_url in fetch_results:
+                result = fetch_results[source_url]
                 if result.success and result.text:
                     full_text = result.text
                     metadata["content_fetched"] = True
                 else:
                     logger.debug(
-                        "ContentFetcher failed for %s: %s — using GKG summary only",
+                        "Pre-fetched content failed for %s: %s — using GKG summary only",
                         source_url,
                         result.error,
                     )
-            except Exception as exc:
-                logger.debug(
-                    "ContentFetcher error for %s: %s — using GKG summary only",
-                    source_url,
-                    exc,
-                )
+            else:
+                try:
+                    result = self._content_fetcher.fetch(source_url)
+                    if result.success and result.text:
+                        full_text = result.text
+                        metadata["content_fetched"] = True
+                    else:
+                        logger.debug(
+                            "ContentFetcher failed for %s: %s — using GKG summary only",
+                            source_url,
+                            result.error,
+                        )
+                except Exception as exc:
+                    logger.debug(
+                        "ContentFetcher error for %s: %s — using GKG summary only",
+                        source_url,
+                        exc,
+                    )
 
         if full_text:
             body = _build_episode_body_with_full_text(record, full_text)
@@ -1056,8 +1079,45 @@ class GdeltAdapter(BaseAdapter):
         return _do_fetch()
 
     async def run(self, **kwargs: Any) -> list[NormalizedEpisode]:
-        """Full pipeline with degraded metadata."""
-        episodes = await super().run(**kwargs)
+        """Full pipeline with batch content fetch + degraded metadata.
+
+        Phase 1: Fetch raw GDELT records.
+        Phase 2: Batch-fetch all article source URLs using NewsSpider.
+        Phase 3: Normalize each record (passing pre-fetched content).
+        Phase 4: Dedup + degraded metadata tagging.
+        """
+        records = await self.fetch(**kwargs)
+
+        # Phase 1: batch fetch all article source URLs
+        source_urls = [
+            r.get("source_url") for r in records if r.get("source_url")
+        ]
+        fetch_results: dict[str, ContentResult] = {}
+        if self._content_fetcher and source_urls:
+            try:
+                results = await self._content_fetcher.fetch_batch(source_urls)
+                fetch_results = {r.url: r for r in results}
+                logger.debug(
+                    "Batch-fetched %d/%d GDELT article contents",
+                    sum(1 for r in results if r.success),
+                    len(results),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Batch content fetch failed for GDELT: %s — "
+                    "falling back to per-URL fetch",
+                    exc,
+                )
+
+        # Phase 2: normalize all records with pre-fetched content
+        episodes = await asyncio.gather(
+            *[
+                self.normalize(r, fetch_results=fetch_results)
+                for r in records
+            ],
+        )
+        episodes = self.dedup(list(episodes))
+
         # Tag episodes originated from degraded fallback
         if self._last_records and any(
             r.get("_degraded") for r in self._last_records

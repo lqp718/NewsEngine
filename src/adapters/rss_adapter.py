@@ -9,6 +9,7 @@ pre-ingestion filtering — all entries are preserved.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import socket
 from datetime import datetime, timezone
@@ -22,6 +23,7 @@ _RSS_SOCKET_TIMEOUT: int = 15
 
 from src.adapters.base import BaseAdapter
 from src.adapters.models import NormalizedEpisode
+from src.utils.content_fetcher import ContentResult
 from src.utils.logging_config import get_logger
 from src.utils.time_utils import now_hkt
 
@@ -187,14 +189,60 @@ class RssAdapter(BaseAdapter):
         )
         return all_entries
 
+    # ── run override — batch fetch + normalize ──────────────────────
+
+    async def run(self, **kwargs: Any) -> list[NormalizedEpisode]:
+        """Full pipeline: fetch → batch content fetch → normalize → dedup.
+
+        Phase 1: Fetch raw RSS records.
+        Phase 2: Batch-fetch all article links using NewsSpider.
+        Phase 3: Normalize each record (passing pre-fetched content).
+        Phase 4: Dedup.
+
+        This avoids the overhead of creating a separate browser session
+        per URL (saves ~3s startup per URL).
+        """
+        records = await self.fetch(**kwargs)
+
+        # Phase 1: batch fetch all article links
+        links = [r.get("link") for r in records if r.get("link")]
+        fetch_results: dict[str, ContentResult] = {}
+        if self._content_fetcher and links:
+            try:
+                results = await self._content_fetcher.fetch_batch(links)
+                fetch_results = {r.url: r for r in results}
+                logger.debug(
+                    "Batch-fetched %d/%d RSS article contents",
+                    sum(1 for r in results if r.success),
+                    len(results),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Batch content fetch failed for RSS: %s — falling back to per-URL",
+                    exc,
+                )
+
+        # Phase 2: normalize all records with pre-fetched content
+        episodes = await asyncio.gather(
+            *[self.normalize(r, fetch_results=fetch_results) for r in records],
+        )
+        return self.dedup(list(episodes))
+
     # ── normalization ────────────────────────────────────────────────
 
-    async def normalize(self, record: dict) -> NormalizedEpisode:
+    async def normalize(
+        self,
+        record: dict,
+        fetch_results: dict[str, ContentResult] | None = None,
+    ) -> NormalizedEpisode:
         """Convert a single RSS entry to NormalizedEpisode.
 
-        If ``self._content_fetcher`` is configured, attempts to fetch
-        the full article body from the entry's ``link`` URL and append
-        it to the episode body.
+        If ``self._content_fetcher`` is configured and ``fetch_results`` is
+        provided, uses the pre-fetched ContentResult from the batch fetch
+        to avoid per-URL browser startup overhead.
+
+        When ``fetch_results`` is ``None``, falls back to single-URL fetch
+        via ``self._content_fetcher.fetch_async()`` for backward compatibility.
 
         Sets content_scope=MACRO in metadata.
         """
@@ -212,30 +260,40 @@ class RssAdapter(BaseAdapter):
             "content_fetched": False,
         }
 
-        # ContentFetcher enrichment (V2.4: replace summary with full text on success)
+        # ContentFetcher enrichment
         # Plan: success → title + full_text; failure → title + summary (fallback)
-        # V2.5: Use fetch_async() to avoid asyncio.run() in existing event loop
         full_text: str | None = None
         if self._content_fetcher and link:
-            try:
-                result = await self._content_fetcher.fetch_async(link)
+            # Prefer pre-fetched result from batch
+            if fetch_results and link in fetch_results:
+                result = fetch_results[link]
                 if result.success and result.text:
                     full_text = result.text
                     metadata["content_fetched"] = True
                 else:
-                    # Failure fallback: use summary only
                     logger.debug(
-                        "ContentFetcher failed for %s: %s — using feed summary only",
+                        "Pre-fetched content failed for %s: %s — using feed summary only",
                         link,
                         result.error,
                     )
-            except Exception as exc:
-                # Exception fallback: use summary only
-                logger.debug(
-                    "ContentFetcher error for %s: %s — using feed summary only",
-                    link,
-                    exc,
-                )
+            else:
+                try:
+                    result = await self._content_fetcher.fetch_async(link)
+                    if result.success and result.text:
+                        full_text = result.text
+                        metadata["content_fetched"] = True
+                    else:
+                        logger.debug(
+                            "ContentFetcher failed for %s: %s — using feed summary only",
+                            link,
+                            result.error,
+                        )
+                except Exception as exc:
+                    logger.debug(
+                        "ContentFetcher error for %s: %s — using feed summary only",
+                        link,
+                        exc,
+                    )
 
         # Build episode body: prefer full_text over summary (never mix both)
         if full_text:
