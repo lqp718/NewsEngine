@@ -50,3 +50,5 @@ test_graphiti_*.py
 .claude/
 AGENTS.md
 CLAUDE.md
+
+output/

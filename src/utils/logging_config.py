@@ -107,10 +107,13 @@ def setup_logging(level: str = "INFO", log_file: str = "") -> None:
 
 
 def get_logger(name: str) -> logging.Logger:
-    """Get a logger configured with JSON formatting.
+    """Get a logger, ensuring at least a basic console handler exists on root.
 
-    Ensures logging is set up with ``JsonFormatter`` on the root logger
-    before returning the named logger.  Safe to call at module level.
+    Adds a minimal stdout handler with ``JsonFormatter`` to the root logger
+    if none exists yet.  This is a lightweight bootstrap so that module-level
+    loggers created before ``setup_logging()`` can still emit records.
+    The full ``setup_logging()`` call (from main) will replace this handler
+    with the user-configured level and optional file output.
 
     Args:
         name: Logger name, typically ``__name__``.
@@ -120,7 +123,12 @@ def get_logger(name: str) -> logging.Logger:
     """
     root = logging.getLogger(None)
     if not root.handlers:
-        setup_logging()
+        # Lightweight bootstrap: add a handler without logging a "configured" message
+        json_formatter = JsonFormatter()
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setFormatter(json_formatter)
+        root.addHandler(console_handler)
+        root.setLevel(logging.INFO)
     return logging.getLogger(name)
 
 

@@ -11,18 +11,29 @@ from src.adapters.models import NormalizedEpisode
 
 @pytest.fixture
 def sample_gkg_record() -> dict[str, Any]:
-    """A synthetic GKG V2 record for unit testing."""
+    """A synthetic GKG V2 record for unit testing.
+
+    Reflects the corrected column mapping (V2.3):
+    - ``domain`` from CSV col 3 (added)
+    - ``source_url`` from CSV col 4 (full URL, not domain)
+    - ``themes`` from CSV col 7
+    - ``locations`` from CSV col 9
+    - ``persons`` from CSV col 11
+    - ``organizations`` from CSV col 13
+    - ``tone`` from CSV col 15 (comma-separated avg_tone,pos,neg,...)
+    """
     return {
         "global_event_id": "1234567890",
         "valid_at": "20250609010101",
         "source_collection": "1",
+        "domain": "example.com",
         "source_url": "http://example.com/article1",
         "language": "Eng",
+        "themes": "ECON_FINANCIAL_MARKET; TAX_FNCACT_REG_INVEST",
+        "locations": "#1#2#Beijing,Beijing,China#CN#CN|#1#2#Shanghai,Shanghai,China#CN#CN",
         "persons": "Xi Jinping; John Doe",
         "organizations": "Tencent; Alibaba",
-        "locations": "#1#2#Beijing,Beijing,China#CN#CN|#1#2#Shanghai,Shanghai,China#CN#CN",
-        "themes": "ECON_FINANCIAL_MARKET; TAX_FNCACT_REG_INVEST",
-        "tone": "-8.7",
+        "tone": "-8.7,0.57,3.15,0.82,-1.25",
     }
 
 

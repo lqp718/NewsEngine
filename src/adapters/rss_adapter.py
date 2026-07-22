@@ -10,10 +10,15 @@ pre-ingestion filtering — all entries are preserved.
 from __future__ import annotations
 
 import hashlib
+import socket
 from datetime import datetime, timezone
 from typing import Any
 
 import feedparser
+
+# Default socket timeout for RSS feed fetches (seconds).
+# Prevents indefinite hangs on unreachable feeds.
+_RSS_SOCKET_TIMEOUT: int = 15
 
 from src.adapters.base import BaseAdapter
 from src.adapters.models import NormalizedEpisode
@@ -72,9 +77,11 @@ class RssAdapter(BaseAdapter):
         self,
         feed_urls: list[str] | None = None,
         dedup_cache: set[str] | None = None,
+        content_fetcher: Any | None = None,
     ) -> None:
         super().__init__(dedup_cache=dedup_cache)
         self.feed_urls = feed_urls or []
+        self._content_fetcher = content_fetcher
 
     # ── feed fetching ────────────────────────────────────────────────
 
@@ -89,19 +96,46 @@ class RssAdapter(BaseAdapter):
         """
         try:
             logger.info("Fetching RSS feed: %s", feed_url)
-            parsed = feedparser.parse(feed_url)
+            # Set socket timeout to prevent indefinite hangs
+            old_timeout = socket.getdefaulttimeout()
+            socket.setdefaulttimeout(_RSS_SOCKET_TIMEOUT)
+            try:
+                parsed = feedparser.parse(feed_url)
+            finally:
+                socket.setdefaulttimeout(old_timeout)
         except Exception as exc:
             logger.warning(
                 "Failed to fetch RSS feed %s: %s", feed_url, exc
             )
             return []
 
-        if parsed.bozo and not parsed.entries:
+        # Check HTTP status — feedparser silently follows redirects but doesn't expose status
+        http_status = parsed.get("status", 0)
+        if http_status and http_status >= 400:
             logger.warning(
-                "RSS feed %s parse error (bozo): %s",
+                "RSS feed %s returned HTTP %d — feed is likely dead or moved",
                 feed_url,
-                parsed.bozo_exception,
+                http_status,
             )
+            return []
+
+        if parsed.bozo and not parsed.entries:
+            # Diagnose: HTML returned instead of XML is the most common cause
+            bozo_exc = str(parsed.bozo_exception)
+            content_type = parsed.get("content-type", "")
+            if "not well-formed" in bozo_exc or "mismatched tag" in bozo_exc or "syntax error" in bozo_exc:
+                logger.warning(
+                    "RSS feed %s returned non-XML content (likely HTML or JSON). "
+                    "Content-Type: %s. Feed URL may be dead — consider disabling it.",
+                    feed_url,
+                    content_type or "unknown",
+                )
+            else:
+                logger.warning(
+                    "RSS feed %s parse error (bozo): %s",
+                    feed_url,
+                    parsed.bozo_exception,
+                )
             return []
 
         entries: list[dict[str, Any]] = []
@@ -155,8 +189,12 @@ class RssAdapter(BaseAdapter):
 
     # ── normalization ────────────────────────────────────────────────
 
-    def normalize(self, record: dict) -> NormalizedEpisode:
+    async def normalize(self, record: dict) -> NormalizedEpisode:
         """Convert a single RSS entry to NormalizedEpisode.
+
+        If ``self._content_fetcher`` is configured, attempts to fetch
+        the full article body from the entry's ``link`` URL and append
+        it to the episode body.
 
         Sets content_scope=MACRO in metadata.
         """
@@ -165,13 +203,49 @@ class RssAdapter(BaseAdapter):
         summary = record.get("summary", "") or None
         feed_url = record.get("feed_url", "unknown")
 
-        episode_body = _build_episode_body(title, summary)
+        # Feed name from URL
+        feed_name = feed_url.split("/")[2] if "//" in feed_url else "feed"
+
+        metadata: dict[str, Any] = {
+            "content_scope": "MACRO",
+            "feed_url": feed_url,
+            "content_fetched": False,
+        }
+
+        # ContentFetcher enrichment (V2.4: replace summary with full text on success)
+        # Plan: success → title + full_text; failure → title + summary (fallback)
+        # V2.5: Use fetch_async() to avoid asyncio.run() in existing event loop
+        full_text: str | None = None
+        if self._content_fetcher and link:
+            try:
+                result = await self._content_fetcher.fetch_async(link)
+                if result.success and result.text:
+                    full_text = result.text
+                    metadata["content_fetched"] = True
+                else:
+                    # Failure fallback: use summary only
+                    logger.debug(
+                        "ContentFetcher failed for %s: %s — using feed summary only",
+                        link,
+                        result.error,
+                    )
+            except Exception as exc:
+                # Exception fallback: use summary only
+                logger.debug(
+                    "ContentFetcher error for %s: %s — using feed summary only",
+                    link,
+                    exc,
+                )
+
+        # Build episode body: prefer full_text over summary (never mix both)
+        if full_text:
+            episode_body = _build_episode_body(title, full_text)
+        else:
+            episode_body = _build_episode_body(title, summary)
+
         content_hash = hashlib.sha256(episode_body.encode("utf-8")).hexdigest()
         valid_at = _extract_published(record)
         keywords = _extract_keywords(title)
-
-        # Feed name from URL
-        feed_name = feed_url.split("/")[2] if "//" in feed_url else "feed"
 
         name = NormalizedEpisode.make_name(
             source_type="rss",
@@ -191,5 +265,5 @@ class RssAdapter(BaseAdapter):
             severity="medium",
             keywords=keywords,
             entities=[],
-            metadata={"content_scope": "MACRO", "feed_url": feed_url},
+            metadata=metadata,
         )

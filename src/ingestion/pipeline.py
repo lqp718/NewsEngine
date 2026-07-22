@@ -44,6 +44,12 @@ class PipelineResult:
     elapsed_seconds: float = 0.0
     error: Exception | None = None
     health: SourceHealth | None = None
+    episodes: list = field(default_factory=list)
+    """Populated with NormalizedEpisode list only in dry-run mode. Empty in normal mode."""
+    fetch_count: int = 0
+    """Raw fetch count before relevance filtering. Populated only in dry-run mode."""
+    filtered_count: int = 0
+    """Count removed by relevance filtering + dedup. Populated only in dry-run mode."""
 
 
 # ── Global health registry ─────────────────────────────────────────────
@@ -65,25 +71,34 @@ async def run_pipeline(
     adapter: Any,
     writer: Any,
     tickers: list[dict[str, str]] | None = None,
+    dry_run: bool = False,
 ) -> PipelineResult:
     """Run a full pipeline cycle for one adapter.
 
     Stages:
         1. adapter.run(tickers=tickers) → fetch → normalize → dedup
-        2. EpisodeWriter.write_batch(episodes) if any episodes
-        3. Update health metadata
+        2. EpisodeWriter.write_batch(episodes) if any episodes (skipped in dry-run)
+        3. Update health metadata (skipped in dry-run)
+
+    Args:
+        adapter: Data source adapter instance.
+        writer: EpisodeWriter instance (None in dry-run mode).
+        tickers: Optional ticker whitelist.
+        dry_run: When True, skip write_batch and health tracking, return episodes.
 
     Returns:
-        PipelineResult with outcome and health status.
+        PipelineResult with outcome, health (None in dry-run), and episodes (dry-run).
     """
     source_type = _resolve_source_type(adapter)
     start = time.monotonic()
     result = PipelineResult(source_type=source_type)
 
-    # ── Ensure health entry exists ──────────────────────────────────
-    if source_type not in _HEALTH_REGISTRY:
-        _HEALTH_REGISTRY[source_type] = SourceHealth(source_type=source_type)
-    health = _HEALTH_REGISTRY[source_type]
+    # ── In dry-run mode, skip health tracking ─────────────────────
+    health = None
+    if not dry_run:
+        if source_type not in _HEALTH_REGISTRY:
+            _HEALTH_REGISTRY[source_type] = SourceHealth(source_type=source_type)
+        health = _HEALTH_REGISTRY[source_type]
 
     try:
         # Stage 1: adapter run (fetch → normalize → dedup)
@@ -92,9 +107,25 @@ async def run_pipeline(
             kwargs["tickers"] = tickers
         episodes = await adapter.run(**kwargs)
 
-        # Stage 2: write to graphiti
-        episode_count = 0
-        if episodes:
+        # Stage 2: write to graphiti (skipped in dry-run mode)
+        episode_count = len(episodes)
+
+        if dry_run:
+            # Dry-run: populate episodes directly, skip write_batch
+            result.episodes = episodes
+            result.episode_count = episode_count
+            # Read pre-filter count from adapter (set during fetch before relevance filtering)
+            pre_filter = getattr(adapter, '_pre_filter_count', 0)
+            result.fetch_count = pre_filter if pre_filter else episode_count
+            result.filtered_count = max(0, pre_filter - episode_count) if pre_filter else 0
+            logger.info(
+                "pipeline [%s] dry-run: %d episodes (pre_filter=%d, filtered=%d)",
+                source_type,
+                episode_count,
+                pre_filter,
+                result.filtered_count,
+            )
+        elif episodes:
             write_result = await writer.write_batch(episodes)
             episode_count = write_result.ok
             logger.info(
@@ -109,11 +140,12 @@ async def run_pipeline(
         else:
             logger.debug("pipeline [%s]: no new episodes", source_type)
 
-        # ── Update health: success path ────────────────────────────
-        health.last_run_time = datetime.now(timezone.utc)
-        health.last_success_time = health.last_run_time
-        health.consecutive_errors = 0
-        health.total_episodes += episode_count
+        # ── Update health: success path (skipped in dry-run) ───────
+        if not dry_run and health is not None:
+            health.last_run_time = datetime.now(timezone.utc)
+            health.last_success_time = health.last_run_time
+            health.consecutive_errors = 0
+            health.total_episodes += episode_count
 
         result.success = True
         result.episode_count = episode_count
@@ -129,18 +161,19 @@ async def run_pipeline(
             exc_info=True,
         )
 
-        # ── Update health: error path ──────────────────────────────
-        health.last_run_time = datetime.now(timezone.utc)
-        health.consecutive_errors += 1
-        health.last_error = str(exc)
+        # ── Update health: error path (skipped in dry-run) ─────────
+        if not dry_run and health is not None:
+            health.last_run_time = datetime.now(timezone.utc)
+            health.consecutive_errors += 1
+            health.last_error = str(exc)
 
-        if health.consecutive_errors >= 6:
-            logger.critical(
-                "pipeline [%s]: %d consecutive failures (>= 1.5 hours). "
-                "Source is degraded.",
-                source_type,
-                health.consecutive_errors,
-            )
+            if health.consecutive_errors >= 6:
+                logger.critical(
+                    "pipeline [%s]: %d consecutive failures (>= 1.5 hours). "
+                    "Source is degraded.",
+                    source_type,
+                    health.consecutive_errors,
+                )
 
         result.success = False
         result.episode_count = 0
@@ -148,7 +181,8 @@ async def run_pipeline(
 
     finally:
         result.elapsed_seconds = time.monotonic() - start
-        result.health = health
+        if not dry_run:
+            result.health = health
 
     return result
 

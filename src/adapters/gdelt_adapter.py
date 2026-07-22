@@ -7,12 +7,14 @@ Data flow::
 Only the HTTP CSV data plane (http://data.gdeltproject.org/) is used.
 HTTPS is avoided because the HTTPS endpoints are blocked by the GFW.
 
-V2.2 → G5: Refactored for triple CSV source integration:
-- fetch_lastupdate() returns (events_url, mentions_url, gkg_url)
-- download_all_csvs() uses asyncio.gather() for concurrent downloads
-- merge_event_data() LEFT JOINs by GlobalEventID
-- filter_relevant() implements dual-layer (Themes OR CAMEO) filtering
-- GKG-only fallback path when all three CSV sources fail
+V2.2 → G5: Refactored for triple CSV source integration.
+V2.3 → GKG pipeline fix:
+- Fixed GKG V2 column mapping: col 3→domain, col 4→source_url, col 7→themes, col 9→locations, col 11→persons, col 13→organizations, col 15→tone
+- merge_event_data() changed to passthrough (GKG global_event_id format incompatible with Events event_id)
+- _build_episode_body() now uses themes-based natural language summary (no CAMEO/actor dependency)
+- Keywords deduplicated with set, capped at 20
+- Layer B CAMEO filtering marked as inactive (requires GKG-Events join)
+- New Layer C domain whitelist filtering (Phase 2)
 """
 
 from __future__ import annotations
@@ -55,33 +57,35 @@ from src.utils.time_utils import now_hkt
 logger = get_logger(__name__)
 
 GKG_V2_COLUMN_NAMES: list[str] = [
-    "v2_1_global_event_id",  # 0  — not used directly
-    "v2_1_date",  # 1          — YYYYMMDDHHMMSS (actually col 1 after id)
-    "v2_2_source_collection",  # 2
-    "v2_3_source_url",  # 3
-    "v2_4_language",  # 4
-    "v2_5_persons",  # 5
-    "v2_6_organizations",  # 6
-    "v2_7_locations",  # 7
-    "v2_8_themes",  # 8
-    "v2_9_tone_img",  # 9
-    "v2_10_pagerank_avg",  # 10
-    "v2_11_pagerank_max",  # 11
-    "v2_12_pagerank_min",  # 12
-    "v2_13_parse_count",  # 13
-    "v2_14_tone",  # 14
-    "v2_15_positive_score",  # 15
-    "v2_16_negative_score",  # 16
-    "v2_17_polarity",  # 17
-    "v2_18_activity_refs",  # 18
-    "v2_19_activity_geo",  # 19
-    "v2_20_activity_maybe",  # 20
-    "v2_21_activity_geo_maybe",  # 21
-    "v2_22_relations",  # 22
-    "v2_23_relation_geo",  # 23
-    "v2_24_relation_maybe",  # 24
-    "v2_25_relation_geo_maybe",  # 25
-    "v2_26_mentions",  # 26
+    # Verified against actual GKG V2 CSV data (27 columns, tab-separated)
+    # Core fields used by adapter are noted with (*)
+    "v2_0_global_event_id",       # 0  (*) — YYYYMMDDHHMMSS-N format (timestamp-sequence)
+    "v2_1_date",                  # 1  (*) — YYYYMMDDHHMMSS
+    "v2_2_source_collection",     # 2  (*) — collection method (1=web, 2=social)
+    "v2_3_domain",                # 3  (*) — source domain (e.g. reuters.com)
+    "v2_4_source_url",            # 4  (*) — full source URL
+    "v2_5_language",              # 5  (*) — language code
+    "v2_6_untagged",              # 6     — reserved/unused
+    "v2_7_themes",                # 7  (*) — semicolon-separated theme codes
+    "v2_8_untagged",              # 8     — reserved/unused
+    "v2_9_locations",             # 9  (*) — GDELT location encoding
+    "v2_10_untagged",             # 10    — reserved/unused
+    "v2_11_persons",              # 11 (*) — semicolon-separated person names
+    "v2_12_untagged",             # 12    — reserved/unused
+    "v2_13_organizations",        # 13 (*) — semicolon-separated org names
+    "v2_14_untagged",             # 14    — reserved/unused
+    "v2_15_tone",                 # 15 (*) — comma-separated: avg_tone,pos,neg,polarity,...
+    "v2_16_positive_score",       # 16
+    "v2_17_negative_score",       # 17
+    "v2_18_polarity",             # 18
+    "v2_19_activity_refs",        # 19
+    "v2_20_activity_geo",         # 20
+    "v2_21_activity_maybe",       # 21
+    "v2_22_activity_geo_maybe",   # 22
+    "v2_23_relations",            # 23
+    "v2_24_relation_geo",         # 24
+    "v2_25_relation_maybe",       # 25
+    "v2_26_relation_geo_maybe",   # 26
 ]
 
 LASTUPDATE_URL = "http://data.gdeltproject.org/gdeltv2/lastupdate.txt"
@@ -96,12 +100,73 @@ class GdeltDownloadError(Exception):
 
 
 def _map_tone_to_severity(tone_str: str | None) -> Severity:
-    """GDELT GKG tone format ("entity,score;...") is not a single severity value.
+    """Map GKG V2 tone (col 15) to severity.
 
-    Severity is determined later by L-4 rule-based enricher (severity_enricher.py).
-    This function just returns a neutral placeholder.
+    Tone format is comma-separated floats: avg_tone,positive_score,negative_score,polarity,...
+    Extracts the first value (average tone) for mapping.
+
+    | Tone range    | severity  |
+    |---------------|-----------|
+    | > 5.0         | low       |
+    | -5.0 ~ 5.0    | medium    |
+    | -10.0 ~ -5.0  | high      |
+    | < -10.0       | critical  |
+
+    Returns "medium" for invalid/missing tone values.
     """
-    return "medium"
+    if not tone_str:
+        return "medium"
+    try:
+        first_val = tone_str.split(",")[0].strip()
+        tone_val = float(first_val)
+    except (ValueError, IndexError):
+        return "medium"
+    if tone_val > 5.0:
+        return "low"
+    elif tone_val >= -5.0:
+        return "medium"
+    elif tone_val >= -10.0:
+        return "high"
+    else:
+        return "critical"
+
+
+def _parse_persons_organizations(raw: str) -> str:
+    """Parse GKG V2 Persons (col 5) or Organizations (col 6) field.
+
+    GKG V2 can contain two formats:
+    1. Plain text: "John Doe; Jane Smith" (normal names, ";" separated)
+    2. GDELT entity mention encoding: "KILL#2##0######; CRISISLEX_CRISISLEXREC#2##0######"
+       (each segment is CODE#count##offset#####length or similar)
+
+    For plain text: split by ";" and return the joined names.
+    For GDELT encoding (contains "#"): split by ";", then take only
+    segments that look like real names (no "#"). If none found, return empty string
+    so downstream code doesn't create spurious entities.
+
+    Returns a "; "-joined string of parsed names, or empty string.
+    """
+    raw = raw.strip()
+    if not raw:
+        return ""
+
+    # Check if this is GDELT encoded format (contains "#")
+    if "#" in raw:
+        # GDELT encoding: split by ";" and filter out encoded segments
+        clean_names: list[str] = []
+        for segment in raw.split(";"):
+            segment = segment.strip()
+            if not segment:
+                continue
+            # If the segment contains "#", it's a GDELT code — skip it
+            if "#" in segment:
+                continue
+            clean_names.append(segment)
+        return "; ".join(clean_names)
+
+    # Plain text format — just clean up whitespace
+    names = [n.strip() for n in raw.split(";") if n.strip()]
+    return "; ".join(names)
 
 
 def _parse_location(location_str: str) -> str:
@@ -150,7 +215,7 @@ def _parse_location(location_str: str) -> str:
 
         cleaned_parts.append(cleaned)
 
-    return "; ".join(cleaned_parts) if cleaned_parts else location_str
+    return "; ".join(cleaned_parts) if cleaned_parts else ""
 
 
 def _parse_entities_from_record(record: dict) -> list[EntityItem]:
@@ -185,6 +250,8 @@ def _parse_entities_from_record(record: dict) -> list[EntityItem]:
         cleaned = _parse_location(loc_str)
         if cleaned:
             entities.append(EntityItem(type="location", name=cleaned))
+        # If _parse_location returned empty string, the location is invalid (e.g. theme code)
+        # — don't add it as an entity
 
     # Events Actor entities — when merge data provides translatable actor codes
     cameo_code = record.get("cameo_code") or None
@@ -205,62 +272,145 @@ def _parse_entities_from_record(record: dict) -> list[EntityItem]:
 
 
 def _build_episode_body(record: dict) -> str:
-    """Build a human-readable episode body from a merged record.
+    """Build a themes-based natural-language Markdown episode body.
 
-    Include CAMEO event descriptions, actors, themes, persons,
-    organizations, locations, and source URL.
+    Generates summary from GKG fields only — does NOT depend on
+    CAMEO event codes or actor names (these are always None after
+    GKG-Events decoupling).
+
+    Summary strategy:
+        1. Translate top 3-5 themes via ``translate_theme()``
+        2. Generate "News coverage related to ..." sentence
+        3. Fallback: "A news development from {domain or unknown source}"
     """
-    parts: list[str] = []
+    lines: list[str] = []
 
-    # CAMEO Event description (from merged Events data)
-    cameo_code = record.get("cameo_code") or ""
-    if cameo_code:
-        cameo_desc = translate_cameo(cameo_code)
-        parts.append(f"[CAMEO Event: {cameo_desc}]")
-
-    # Actors (from merged Events data)
-    actor1_name = record.get("actor1_name") or ""
-    actor2_name = record.get("actor2_name") or ""
-    if actor1_name or actor2_name:
-        actor_str = f"[Actors: {actor1_name}" if actor1_name else "[Actors: unknown"
-        if actor2_name:
-            actor_str += f" → {actor2_name}"
-        actor_str += "]"
-        parts.append(actor_str)
-
-    # Themes — translate to human-readable
-    themes = record.get("themes", "") or ""
-    translated_themes = "; ".join(
-        translate_theme(t.strip()) for t in themes.split(";") if t.strip()
-    )
-    if translated_themes:
-        parts.append(f"Themes: {translated_themes}")
-
-    # Persons
-    persons = record.get("persons", "") or ""
-    if persons:
-        parts.append(f"Persons: {persons}")
-
-    # Organizations
-    organizations = record.get("organizations", "") or ""
-    if organizations:
-        parts.append(f"Organizations: {organizations}")
-
-    # Locations (cleaned)
-    locations = record.get("locations", "") or ""
-    if locations:
-        loc_cleaned = "; ".join(
-            _parse_location(l) for l in locations.split(";") if l.strip()
-        )
-        if loc_cleaned:
-            parts.append(f"Locations: {loc_cleaned}")
-
-    # Source URL
+    themes_raw = record.get("themes", "") or ""
     source_url = record.get("source_url", "") or ""
-    if source_url:
-        parts.append(f"Source: {source_url}")
+    domain = record.get("domain", "") or ""
+    valid_at = record.get("valid_at", "") or ""
+    persons_raw = record.get("persons", "") or ""
+    organizations_raw = record.get("organizations", "") or ""
+    locations_raw = record.get("locations", "") or ""
 
-    return " | ".join(parts)
+    lines.append("## GDELT News Report")
+    lines.append("")
+
+    # Date
+    if valid_at:
+        lines.append(f"**Date**: {valid_at} UTC")
+
+    # Domain
+    if domain:
+        lines.append(f"**Domain**: {domain}")
+
+    lines.append("")
+
+    # Summary paragraph — themes-based natural language
+    theme_codes = [t.strip() for t in themes_raw.split(";") if t.strip()]
+    translated_themes = [
+        translate_theme(t.split(",")[0].strip())
+        for t in theme_codes
+    ]
+    filtered_themes = [t for t in translated_themes if t]
+
+    if filtered_themes:
+        # Take top 3-5 for summary sentence
+        summary_themes = filtered_themes[:5]
+        if len(summary_themes) == 1:
+            summary = f"News coverage related to {summary_themes[0]}."
+        elif len(summary_themes) == 2:
+            summary = f"News coverage related to {summary_themes[0]} and {summary_themes[1]}."
+        else:
+            summary = (
+                "News coverage related to "
+                + ", ".join(summary_themes[:-1])
+                + f", and {summary_themes[-1]}."
+            )
+    elif domain:
+        summary = f"A news development from {domain}."
+    else:
+        summary = "A news development from an unknown source."
+
+    lines.append(f"**Summary**: {summary}")
+    lines.append("")
+
+    # Key Topics (themes) — top 10 translated themes
+    if filtered_themes:
+        lines.append(f"**Key Topics**: {', '.join(filtered_themes[:10])}")
+        lines.append("")
+
+    # Key Persons
+    if persons_raw:
+        persons_list = [n.strip() for n in persons_raw.split(";") if n.strip()]
+        lines.append(f"**Key Persons**: {', '.join(persons_list)}")
+        lines.append("")
+
+    # Key Organizations
+    if organizations_raw:
+        orgs_list = [n.strip() for n in organizations_raw.split(";") if n.strip()]
+        lines.append(f"**Key Organizations**: {', '.join(orgs_list)}")
+        lines.append("")
+
+    # Key Locations
+    if locations_raw:
+        locs = locations_raw.split(";")
+        cleaned_locs: list[str] = []
+        for loc_str in locs:
+            loc_str = loc_str.strip()
+            if not loc_str:
+                continue
+            cleaned = _parse_location(loc_str)
+            if cleaned:
+                cleaned_locs.append(cleaned)
+        if cleaned_locs:
+            lines.append(f"**Key Locations**: {'; '.join(cleaned_locs)}")
+            lines.append("")
+
+    # Source
+    if source_url:
+        lines.append(f"**Source**: {source_url}")
+
+    return "\n".join(lines)
+
+
+def _build_episode_body_with_full_text(record: dict, full_text: str) -> str:
+    """Build episode body with full article text replacing the GKG summary.
+
+    Same metadata structure as _build_episode_body(), but replaces the
+    themes-based summary with the actual article content fetched by
+    ContentFetcher. This ensures Graphiti receives consistent input:
+    either full text (on success) or GKG summary (on failure).
+    """
+    lines: list[str] = []
+
+    source_url = record.get("source_url", "") or ""
+    domain = record.get("domain", "") or ""
+    valid_at = record.get("valid_at", "") or ""
+
+    lines.append("## GDELT News Report")
+    lines.append("")
+
+    # Date
+    if valid_at:
+        lines.append(f"**Date**: {valid_at} UTC")
+
+    # Domain
+    if domain:
+        lines.append(f"**Domain**: {domain}")
+
+    lines.append("")
+
+    # Full article text (replaces the themes-based summary)
+    lines.append(full_text)
+    lines.append("")
+
+    # Source
+    if source_url:
+        lines.append(f"**Source**: {source_url}")
+
+    return "\n".join(lines)
+
 
 
 class GdeltAdapter(BaseAdapter):
@@ -269,7 +419,7 @@ class GdeltAdapter(BaseAdapter):
     Fetches the latest Events, Mentions, and GKG CSV files from
     data.gdeltproject.org, downloads them concurrently, parses each
     using dedicated parser modules, merges by GlobalEventID (LEFT JOIN),
-    and filters by dual-layer (Themes OR CAMEO) criteria.
+    and filters by Plan D (authoritative media OR macro theme).
 
     G5: Triple CSV source integration with concurrent download and merge.
     """
@@ -278,17 +428,20 @@ class GdeltAdapter(BaseAdapter):
         self,
         macro_theme_keywords: set[str] | None = None,
         cameo_event_codes_whitelist: set[str] | None = None,
+        # ── REMOVED: domain_whitelist, enable_domain_filter ──
         max_retries: int = 3,
         backoff_base: float = 1.0,
         dedup_cache: set[str] | None = None,
+        content_fetcher: Any | None = None,
     ) -> None:
         super().__init__(dedup_cache=dedup_cache)
-        self._macro_theme_keywords = macro_theme_keywords or MACRO_THEME_KEYWORDS
-        self._cameo_whitelist = cameo_event_codes_whitelist or CAMEO_EVENT_CODES_WHITELIST
+        self._macro_theme_keywords = macro_theme_keywords if macro_theme_keywords is not None else MACRO_THEME_KEYWORDS
+        self._cameo_whitelist = cameo_event_codes_whitelist if cameo_event_codes_whitelist is not None else CAMEO_EVENT_CODES_WHITELIST
         self.max_retries = max_retries
         self.backoff_base = backoff_base
         self._last_records: list[dict] = []
         self._lastupdate_url = LASTUPDATE_URL
+        self._content_fetcher = content_fetcher
 
     # ── fetch helpers ────────────────────────────────────────────────
 
@@ -389,7 +542,7 @@ class GdeltAdapter(BaseAdapter):
                 with open(zip_path, "wb") as f:
                     f.write(resp.content)
                 with zipfile.ZipFile(zip_path, "r") as zf:
-                    csv_names = [n for n in zf.namelist() if n.endswith(".csv")]
+                    csv_names = [n for n in zf.namelist() if n.lower().endswith(".csv")]
                     if not csv_names:
                         raise GdeltDownloadError(
                             f"No CSV found in {label} zip archive: {zf.namelist()}"
@@ -519,6 +672,19 @@ class GdeltAdapter(BaseAdapter):
     def parse_gkg(self, csv_path: str) -> list[dict]:
         """Parse a GKG V2 CSV file (tab-separated, 27 columns).
 
+        Corrected column mapping (V2.3):
+            col 0  → global_event_id
+            col 1  → valid_at (YYYYMMDDHHMMSS)
+            col 2  → source_collection
+            col 3  → domain (source domain, for Layer C filtering)
+            col 4  → source_url (full URL)
+            col 5  → language
+            col 7  → themes (semicolon-separated theme codes)
+            col 9  → locations (GDELT location encoding)
+            col 11 → persons (semicolon-separated names)
+            col 13 → organizations (semicolon-separated names)
+            col 15 → tone (comma-separated: avg_tone,positive,negative,polarity,...)
+
         Args:
             csv_path: Local path to the extracted .csv file.
 
@@ -526,37 +692,36 @@ class GdeltAdapter(BaseAdapter):
             List of parsed record dicts.
         """
         records: list[dict] = []
-        expected_cols = 27
+        # We need at least 16 columns (0-15) for tone
+        min_required_cols = 16
 
         with open(csv_path, "r", encoding="utf-8", errors="replace") as f:
             reader = csv.reader(f, delimiter="\t")
             for row_num, row in enumerate(reader, start=1):
                 if not row or len(row) < 2:
                     continue  # skip completely empty lines
-                if len(row) < expected_cols:
+                if len(row) < min_required_cols:
                     logger.warning(
                         "Skipping row %d: expected %d columns, got %d",
                         row_num,
-                        expected_cols,
+                        min_required_cols,
                         len(row),
                     )
                     continue
-
-                # Pad shorter rows to 27 columns
-                if len(row) < expected_cols:
-                    row = row + [""] * (expected_cols - len(row))
 
                 record: dict[str, Any] = {}
                 record["global_event_id"] = row[0].strip()
                 record["valid_at"] = row[1].strip()
                 record["source_collection"] = row[2].strip()
-                record["source_url"] = row[3].strip()
-                record["language"] = row[4].strip()
-                record["persons"] = row[5].strip()
-                record["organizations"] = row[6].strip()
-                record["locations"] = row[7].strip()
-                record["themes"] = row[8].strip()
-                record["tone"] = row[14].strip()
+                record["domain"] = row[3].strip()
+                record["source_url"] = row[4].strip()
+                record["language"] = row[5].strip()
+                record["themes"] = row[7].strip()
+                record["locations"] = row[9].strip()
+                # Parse persons and organizations — they can be GDELT encoded or plain text
+                record["persons"] = _parse_persons_organizations(row[11].strip())
+                record["organizations"] = _parse_persons_organizations(row[13].strip())
+                record["tone"] = row[15].strip()
                 records.append(record)
 
         logger.info("Parsed %d records from GKG CSV", len(records))
@@ -570,147 +735,136 @@ class GdeltAdapter(BaseAdapter):
         events_records: list[dict] | None = None,
         mentions_by_event: dict[str, list] | None = None,
     ) -> list[dict]:
-        """Merge GKG, Events, and Mentions data by GlobalEventID (LEFT JOIN).
+        """Passthrough merge — returns GKG records without Events/Mentions JOIN.
 
-        GKG is the primary table. Events and Mentions data are LEFT JOINed
-        onto GKG records by GlobalEventID. Records without matching Events
-        or Mentions data keep only GKG fields.
+        GKG ``global_event_id`` format (``20260718034500-0``) is incompatible with
+        Events CSV ``event_id`` format (``1314163330``).  These are different
+        ID namespaces and cannot be directly joined.
+
+        **GKG-Events decoupled (V2.3)**: Events and Mentions CSV data are still
+        downloaded (preserving infrastructure) but NOT joined to GKG records.
+        All Events/Mentions derived fields are set to ``None`` defaults.
+
+        If GDELT provides a cross-table lookup index in the future (e.g. via
+        Mentions DocumentIdentifier reverse lookup), the JOIN path can be restored.
 
         Args:
-            gkg_records: Parsed GKG records, each with a ``global_event_id`` key.
-            events_records: List of EventRecord objects from parse_events_file(),
-                or None if Events data is unavailable.
-            mentions_by_event: Dict mapping event_id -> list[MentionRecord],
-                or None if Mentions data is unavailable.
+            gkg_records: Parsed GKG records.
+            events_records: Ignored (preserved for future JOIN restoration).
+            mentions_by_event: Ignored (preserved for future JOIN restoration).
 
         Returns:
-            List of merged record dicts, one per GKG record, enriched with
-            optional Events/Mentions fields.
+            List of GKG record dicts with Events/Mentions fields set to None.
         """
-        # Build lookup maps for O(1) access
-        events_map: dict[str, dict[str, Any]] = {}
-        if events_records is not None:
-            for ev in events_records:
-                # EventRecord dataclass — convert to dict-like access
-                eid = str(getattr(ev, "event_id", ""))
-                if eid:
-                    events_map[eid] = {
-                        "cameo_code": getattr(ev, "cameo_code", ""),
-                        "actor1_code": getattr(ev, "actor1_code", ""),
-                        "actor1_name": getattr(ev, "actor1_name", ""),
-                        "actor2_code": getattr(ev, "actor2_code", ""),
-                        "actor2_name": getattr(ev, "actor2_name", ""),
-                        "goldstein_scale": getattr(ev, "goldstein_scale", None),
-                        "avg_tone": getattr(ev, "avg_tone", None),
-                        "event_date": getattr(ev, "event_date", ""),
-                    }
-
         merged: list[dict] = []
         for gkg_rec in gkg_records:
-            eid = gkg_rec.get("global_event_id", "")
+            rec = dict(gkg_rec)
+            rec["cameo_code"] = None
+            rec["actor1_code"] = None
+            rec["actor1_name"] = None
+            rec["actor2_code"] = None
+            rec["actor2_name"] = None
+            rec["goldstein_scale"] = None
+            rec["avg_tone"] = None
+            rec["event_date"] = None
+            rec["mentions"] = None
+            merged.append(rec)
 
-            # Start with GKG fields
-            merged_rec = dict(gkg_rec)
-
-            # LEFT JOIN Events data
-            ev_data = events_map.get(eid, {})
-            merged_rec["cameo_code"] = ev_data.get("cameo_code")
-            merged_rec["actor1_code"] = ev_data.get("actor1_code")
-            merged_rec["actor1_name"] = ev_data.get("actor1_name")
-            merged_rec["actor2_code"] = ev_data.get("actor2_code")
-            merged_rec["actor2_name"] = ev_data.get("actor2_name")
-            merged_rec["goldstein_scale"] = ev_data.get("goldstein_scale")
-            merged_rec["avg_tone"] = ev_data.get("avg_tone")
-            merged_rec["event_date"] = ev_data.get("event_date")
-
-            # LEFT JOIN Mentions data
-            if mentions_by_event is not None:
-                m_records = mentions_by_event.get(eid)
-                if m_records:
-                    merged_rec["mentions"] = [
-                        {
-                            "mention_time": getattr(m, "mention_time", ""),
-                            "source_common_name": getattr(m, "source_common_name", ""),
-                            "document_identifier": getattr(m, "document_identifier", ""),
-                            "mention_confidence": getattr(m, "mention_confidence", 0),
-                            "mention_type": getattr(m, "mention_type", 0),
-                        }
-                        for m in m_records
-                    ]
-                else:
-                    merged_rec["mentions"] = None
-
-            merged.append(merged_rec)
-
-        logger.info(
-            "Merged %d records (events=%d, mentions=%d groups)",
+        logger.debug(
+            "merge_event_data passthrough: %d GKG records (Events/Mentions JOIN disabled)",
             len(merged),
-            len(events_map),
-            len(mentions_by_event) if mentions_by_event else 0,
         )
         return merged
 
     # ── record-level methods ─────────────────────────────────────────
 
+    @property
+    def _authoritative_domains(self) -> set[str]:
+        """Lazy-load authoritative media domains (Plan D)."""
+        try:
+            return self.__authoritative_domains
+        except AttributeError:
+            from src.adapters.authoritative_media import AUTHORITATIVE_MEDIA_DOMAINS
+            self.__authoritative_domains = AUTHORITATIVE_MEDIA_DOMAINS
+            return self.__authoritative_domains
+
     def filter_relevant(
         self, records: list[dict]
     ) -> list[dict]:
-        """Filter records by dual-layer criteria (Layer A: Themes OR Layer B: CAMEO).
+        """Filter records by Plan D: authoritative media OR macro theme.
 
-        Layer A (GKG Themes): Match GKG V2.8 Themes column against
-        ``MACRO_THEME_KEYWORDS``. Any single match retains the record.
+        Plan D replaces the former Layer A + Layer C AND-logic:
 
-        Layer B (CAMEO Codes): Match merged ``cameo_code`` field against
-        ``CAMEO_EVENT_CODES_WHITELIST``. Exact prefix match retains the record.
+        1. **Authoritative media**: If the record's domain is in
+           ``AUTHORITATIVE_MEDIA_DOMAINS``, it passes unconditionally
+           (no theme keyword check).
 
-        Records pass if they match Layer A OR Layer B.
+        2. **Non-authoritative media with macro theme**: If the domain
+           is NOT authoritative, the record passes only if its GKG Themes
+           contain at least one ``MACRO_THEME_KEYWORDS`` substring.
 
-        If both whitelists are empty, returns all records.
+        3. **Otherwise**: Record is rejected.
+
+        Layer B (CAMEO) remains inactive.
+
+        Filter logic: authoritative_domain OR (Layer A themes match)
+
+        If macro_theme_keywords is empty, returns all records
+        (no filtering applied).
         """
-        if not self._macro_theme_keywords and not self._cameo_whitelist:
+        if not self._macro_theme_keywords:
             return records
 
         matched: list[dict] = []
-        layer_a_matches = 0
-        layer_b_matches = 0
+        authoritative_passed = 0
+        theme_passed = 0
+        rejected = 0
+
+        authoritative_domains = self._authoritative_domains
 
         for rec in records:
-            # Layer A: GKG Themes match
-            themes_text = (rec.get("themes") or "").lower()
-            layer_a_hit = bool(
-                self._macro_theme_keywords
-                and any(kw.lower() in themes_text for kw in self._macro_theme_keywords)
-            )
+            domain = (rec.get("domain") or "").strip().lower()
 
-            # Layer B: CAMEO code match — prefix matching
-            # A whitelist parent code (e.g. "162") must match
-            # child codes (e.g. "1621", "1622") via startswith.
-            cameo_code = (rec.get("cameo_code") or "").strip()
-            layer_b_hit = False
-            if self._cameo_whitelist and cameo_code:
-                for wl_code in self._cameo_whitelist:
-                    if cameo_code.startswith(wl_code):
-                        layer_b_hit = True
-                        break
-
-            if layer_a_hit or layer_b_hit:
+            # Plan D check 1: authoritative domain -> unconditional pass
+            if domain and domain in authoritative_domains:
                 matched.append(rec)
-                if layer_a_hit:
-                    layer_a_matches += 1
-                if layer_b_hit:
-                    layer_b_matches += 1
+                authoritative_passed += 1
+                continue
+
+            # Plan D check 2: non-authoritative -> macro theme match required
+            # GKG themes format: "THEME1;THEME2,123;THEME3,456"
+            # Use word boundary matching to avoid false positives like "WAR" matching "WARSAW"
+            import re
+            themes_text = (rec.get("themes") or "").upper()
+            
+            # Check if any macro theme keyword appears as a whole word
+            matched_theme = None
+            for kw in self._macro_theme_keywords:
+                # Word boundary match: keyword must be surrounded by word boundaries
+                # This prevents "WAR" from matching "WARSAW" or "TRADE" from matching "TRADEMARK"
+                pattern = r'\b' + re.escape(kw) + r'\b'
+                if re.search(pattern, themes_text):
+                    matched_theme = kw
+                    break
+            
+            if matched_theme:
+                matched.append(rec)
+                theme_passed += 1
+                continue
+
+            # Plan D check 3: reject
+            rejected += 1
 
         logger.info(
-            "Dual-layer filter: %d → %d records (Layer A=%d, Layer B=%d, OR=%d)",
+            "Plan D filter: %d -> %d records (authoritative_passed=%d, theme_passed=%d, rejected=%d)",
             len(records),
             len(matched),
-            layer_a_matches,
-            layer_b_matches,
-            len(matched),
+            authoritative_passed,
+            theme_passed,
+            rejected,
         )
         return matched
-
-    def normalize(self, record: dict) -> NormalizedEpisode:
+    async def normalize(self, record: dict) -> NormalizedEpisode:
         """Convert a single merged record to NormalizedEpisode.
 
         Args:
@@ -727,16 +881,54 @@ class GdeltAdapter(BaseAdapter):
 
         entities = _parse_entities_from_record(record)
 
-        body = _build_episode_body(record)
-        content_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
-
         source_url = record.get("source_url", "") or None
 
-        keywords: list[str] = []
+        # Build episode body: prefer full_text over summary (never mix both)
+        # Same pattern as RSS adapter for Graphiti consistency
+        metadata: dict[str, Any] = {"content_scope": "MACRO", "content_fetched": False}
+        full_text: str | None = None
+
+        if self._content_fetcher and source_url:
+            try:
+                result = self._content_fetcher.fetch(source_url)
+                if result.success and result.text:
+                    full_text = result.text
+                    metadata["content_fetched"] = True
+                else:
+                    logger.debug(
+                        "ContentFetcher failed for %s: %s — using GKG summary only",
+                        source_url,
+                        result.error,
+                    )
+            except Exception as exc:
+                logger.debug(
+                    "ContentFetcher error for %s: %s — using GKG summary only",
+                    source_url,
+                    exc,
+                )
+
+        if full_text:
+            body = _build_episode_body_with_full_text(record, full_text)
+        else:
+            body = _build_episode_body(record)
+
+        content_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+        keywords_raw: set[str] = set()
         for theme_str in (record.get("themes", "") or "").split(";"):
             theme = theme_str.strip()
             if theme:
-                keywords.append(translate_theme(theme))
+                # Strip ",数字" suffix before lookup (e.g. "WB_2453_ORGANIZED_CRIME,810")
+                translated = translate_theme(theme.split(",")[0].strip())
+                if translated:
+                    keywords_raw.add(translated)
+        keywords = sorted(keywords_raw)[:20]
+        if len(keywords_raw) > 20:
+            logger.debug(
+                "Keywords truncated: %d unique themes → %d keywords (capped at 20)",
+                len(keywords_raw),
+                len(keywords),
+            )
 
         name = NormalizedEpisode.make_name(
             source_type="gdelt_csv",
@@ -789,6 +981,7 @@ class GdeltAdapter(BaseAdapter):
             )
 
             # Step 4: Dual-layer filter
+            self._pre_filter_count = len(merged_records)
             filtered = self.filter_relevant(merged_records)
             self._last_records = filtered
             return filtered
@@ -808,6 +1001,7 @@ class GdeltAdapter(BaseAdapter):
                     csv_path = self.download_gkg(gkg_url)
                     gkg_records = self.parse_gkg(csv_path)
                     merged = self.merge_event_data(gkg_records)
+                    self._pre_filter_count = len(merged)
                     filtered = self.filter_relevant(merged)
                     self._last_records = filtered
                 except Exception as fallback_exc:

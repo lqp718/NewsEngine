@@ -11,14 +11,16 @@ import pytest
 
 from src.adapters.models import NormalizedEpisode
 from src.adapters.rss_adapter import RssAdapter, _build_episode_body, _extract_published
+import asyncio
 
 
 class TestRssNormalize:
     """RssAdapter.normalize() output fields."""
 
-    def test_normalize_rss_entry(self, sample_rss_entry):
+    @pytest.mark.asyncio
+    async def test_normalize_rss_entry(self, sample_rss_entry):
         adapter = RssAdapter()
-        episode = adapter.normalize(sample_rss_entry)
+        episode = await adapter.normalize(sample_rss_entry)
 
         assert isinstance(episode, NormalizedEpisode)
         assert episode.source_type == "rss"
@@ -37,7 +39,8 @@ class TestRssNormalize:
         assert episode.name.startswith("rss-")
         assert "example.com" in episode.source_description
 
-    def test_normalize_atom_entry(self):
+    @pytest.mark.asyncio
+    async def test_normalize_atom_entry(self):
         """Atom format compatibility."""
         from time import struct_time
         import time
@@ -55,11 +58,12 @@ class TestRssNormalize:
             "feed_url": "http://atom.example.com/feed",
         }
         adapter = RssAdapter()
-        episode = adapter.normalize(entry)
+        episode = await adapter.normalize(entry)
         assert episode.source_type == "rss"
         assert episode.valid_at.year == 2025
 
-    def test_missing_published_date(self, sample_rss_entry):
+    @pytest.mark.asyncio
+    async def test_missing_published_date(self, sample_rss_entry):
         """Missing published date defaults to current UTC time."""
         entry = dict(sample_rss_entry)
         entry["published"] = ""
@@ -67,7 +71,7 @@ class TestRssNormalize:
         entry["updated_parsed"] = None
 
         adapter = RssAdapter()
-        episode = adapter.normalize(entry)
+        episode = await adapter.normalize(entry)
 
         # Should default to now (within last 10 seconds)
         import time as time_module
@@ -75,7 +79,8 @@ class TestRssNormalize:
         delta = abs((now - episode.valid_at).total_seconds())
         assert delta < 10, f"valid_at too far from now: {episode.valid_at} vs {now}"
 
-    def test_dedup_by_link(self):
+    @pytest.mark.asyncio
+    async def test_dedup_by_link(self):
         """Same link → only first retained."""
         adapter = RssAdapter()
         entry1 = {
@@ -92,16 +97,17 @@ class TestRssNormalize:
         # We need different content_hash for url-based dedup to show
         entry2["summary"] = "Content 2"
 
-        ep1 = adapter.normalize(entry1)
-        ep2 = adapter.normalize(entry2)
+        ep1 = await adapter.normalize(entry1)
+        ep2 = await adapter.normalize(entry2)
 
         result = adapter.dedup([ep1, ep2])
         assert len(result) == 1
         assert result[0].name == ep1.name
 
-    def test_keywords_extracted(self, sample_rss_entry):
+    @pytest.mark.asyncio
+    async def test_keywords_extracted(self, sample_rss_entry):
         adapter = RssAdapter()
-        episode = adapter.normalize(sample_rss_entry)
+        episode = await adapter.normalize(sample_rss_entry)
         assert len(episode.keywords) > 0
 
 

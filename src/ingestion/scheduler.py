@@ -36,6 +36,12 @@ from .pipeline import PipelineResult, run_pipeline
 logger = get_logger(__name__)
 
 # ── Default RSS feed URLs (financial news feeds) ───────────────────────
+# Path to RSS feed configuration JSON file
+_RSS_FEEDS_JSON_PATH: str = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "data",
+    "rss_feeds.json",
+)
 
 _DEFAULT_RSS_FEEDS: list[str] = [
     "https://feeds.content.dowjones.io/public/rss/mw_topstories",
@@ -125,6 +131,9 @@ class IngestionScheduler:
         whitelist_path: str | None = None,
         interval_sec: int | None = None,
         min_cycle_gap_sec: int | None = None,
+        dry_run: bool = False,
+        source_filter: str | None = None,
+        fetch_content: bool = False,
     ) -> None:
         """Initialize scheduler and create all sub-components.
 
@@ -134,12 +143,21 @@ class IngestionScheduler:
             feed_urls: RSS feed URLs. If None, uses defaults.
             whitelist_path: Path to ticker whitelist cache file.
             interval_sec: Ingestion cycle interval.
+            min_cycle_gap_sec: Minimum gap between cycles.
+            dry_run: When True, skip Graphiti/EpisodeWriter/Neo4j initialization.
+            source_filter: Filter adapters ("gdelt", "rss", "akshare", None for all).
+            fetch_content: When True, enable ContentFetcher for RSS (dry-run mode).
         """
+        self._dry_run = dry_run
+        self._source_filter = source_filter
+        self._fetch_content = fetch_content
+
         settings = get_settings()
 
-        self._neo4j_driver = neo4j_driver or get_neo4j_driver()
+        self._neo4j_driver = neo4j_driver
         self._graphiti = graphiti
         self._feed_urls = feed_urls or _DEFAULT_RSS_FEEDS
+        self._feed_urls_explicit = feed_urls is not None
         self._whitelist_path = whitelist_path or str(
             os.path.join(
                 os.path.dirname(
@@ -164,19 +182,24 @@ class IngestionScheduler:
         self._akshare_adapter: Any = None
 
         # ── Briefing Aggregator ───────────────────────────────────
-        self._aggregator = SectorBriefingAggregator()
+        self._aggregator = SectorBriefingAggregator() if not dry_run else None
 
         # ── TTL cleanup state (V2.2) ──────────────────────────────
         self._last_ttl_cleanup_date: str | None = None
+
+        # ── Lazy-init guard ───────────────────────────────────────
+        self._components_initialized: bool = False
 
         # ── Lifecycle state ───────────────────────────────────────
         self._running = False
         self._task: asyncio.Task[None] | None = None
 
         logger.info(
-            "IngestionScheduler initialized (interval=%ds, whitelist=%s)",
+            "IngestionScheduler initialized (interval=%ds, whitelist=%s, dry_run=%s, source_filter=%s)",
             self._interval_sec,
             self._whitelist_path,
+            dry_run,
+            source_filter or "all",
         )
 
     # ── Lifecycle ─────────────────────────────────────────────────────
@@ -213,7 +236,75 @@ class IngestionScheduler:
 
         logger.info("IngestionScheduler stopped")
 
+    # ── Internal: RSS feed loading ─────────────────────────────────────
+
+    def _load_rss_feeds(self) -> list[str]:
+        """Load RSS feed URLs from ``data/rss_feeds.json``.
+
+        Reads the JSON config file, filters to ``enabled: true`` feeds,
+        and returns the list of feed URLs. Falls back to ``_DEFAULT_RSS_FEEDS``
+        if the file is missing, invalid, or all feeds are disabled.
+
+        Returns:
+            List of RSS feed URL strings.
+        """
+        rss_json_path = getattr(self, '_rss_json_path', _RSS_FEEDS_JSON_PATH)
+        if not os.path.exists(rss_json_path):
+            logger.warning(
+                "rss_feeds.json not found at %s, using default feeds",
+                rss_json_path,
+            )
+            return list(_DEFAULT_RSS_FEEDS)
+
+        try:
+            with open(rss_json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning(
+                "rss_feeds.json parse error: %s, using default feeds",
+                exc,
+            )
+            return list(_DEFAULT_RSS_FEEDS)
+
+        feeds = data.get("feeds", [])
+        if not isinstance(feeds, list) or not feeds:
+            logger.warning(
+                "rss_feeds.json has no 'feeds' array, using default feeds"
+            )
+            return list(_DEFAULT_RSS_FEEDS)
+
+        enabled_urls: list[str] = []
+        for feed in feeds:
+            if not isinstance(feed, dict):
+                continue
+            if feed.get("enabled", True) and feed.get("url"):
+                enabled_urls.append(feed["url"])
+
+        if not enabled_urls:
+            logger.warning(
+                "rss_feeds.json has no enabled feeds, using default feeds"
+            )
+            return list(_DEFAULT_RSS_FEEDS)
+
+        logger.info(
+            "Loaded %d RSS feeds from %s",
+            len(enabled_urls),
+            rss_json_path,
+        )
+        return enabled_urls
+
     # ── Internal: component lazy init ─────────────────────────────────
+
+    def _resolve_sources(self) -> set[str]:
+        """Resolve which data sources to run based on source_filter.
+
+        Returns:
+            Set of source names ("gdelt", "rss", "akshare").
+        """
+        source_filter = self._source_filter
+        if source_filter is None or source_filter == "all":
+            return {"gdelt", "rss", "akshare"}
+        return {source_filter}
 
     def _lazy_init_components(self) -> None:
         """Create adapter and writer instances on first cycle.
@@ -223,57 +314,117 @@ class IngestionScheduler:
 
         V2.2: Macro/Stock pipeline split — each adapter receives its
         own filtering configuration.
+
+        In dry-run mode: skips Graphiti, EpisodeWriter, Neo4j connections
+        and only creates the requested adapters.
         """
-        if self._macro_writer is not None or self._symbol_writer is not None:
+        if self._components_initialized:
             return
+        self._components_initialized = True
 
         # ── Import adapter classes (lazy, to avoid circular deps) ───
         from src.adapters.gdelt_adapter import GdeltAdapter
         from src.adapters.rss_adapter import RssAdapter
         from src.adapters.akshare_adapter import AkShareAdapter
-        from src.graphiti.episode_writer import EpisodeWriter
-        from src.graphiti.entity_types import MACRO_ENTITY_TYPES, SYMBOL_ENTITY_TYPES
-        from src.core.graphiti_client import create_graphiti
 
-        if self._graphiti is None:
-            self._graphiti = create_graphiti()
+        # ── Resolve which sources to instantiate ───────────────────
+        sources = self._resolve_sources()
 
-        self._macro_writer = EpisodeWriter(
-            graphiti=self._graphiti,
-            neo4j_driver=self._neo4j_driver,
-            entity_types=MACRO_ENTITY_TYPES,
-        )
+        # ── In normal mode, create Graphiti + EpisodeWriter ────────
+        if not self._dry_run:
+            from src.graphiti.episode_writer import EpisodeWriter
+            from src.graphiti.entity_types import MACRO_ENTITY_TYPES, SYMBOL_ENTITY_TYPES
+            from src.core.graphiti_client import create_graphiti
 
-        self._symbol_writer = EpisodeWriter(
-            graphiti=self._graphiti,
-            neo4j_driver=self._neo4j_driver,
-            entity_types=SYMBOL_ENTITY_TYPES,
-        )
+            if self._neo4j_driver is None:
+                from src.core.neo4j_client import get_neo4j_driver
+                self._neo4j_driver = get_neo4j_driver()
+
+            if self._graphiti is None:
+                self._graphiti = create_graphiti()
+
+            self._macro_writer = EpisodeWriter(
+                graphiti=self._graphiti,
+                neo4j_driver=self._neo4j_driver,
+                entity_types=MACRO_ENTITY_TYPES,
+            )
+
+            self._symbol_writer = EpisodeWriter(
+                graphiti=self._graphiti,
+                neo4j_driver=self._neo4j_driver,
+                entity_types=SYMBOL_ENTITY_TYPES,
+            )
+        else:
+            logger.info("Dry-run mode: skipping Graphiti/EpisodeWriter/Neo4j initialization")
+
+        # ── Initialize ContentFetcher conditionally ────────────────
+        # ContentFetcher is shared between GDELT and RSS adapters
+        content_fetcher = None
+        if self._fetch_content:
+            from src.utils.content_fetcher import ContentFetcher
+            content_fetcher = ContentFetcher(
+                timeout=30,
+                max_concurrent=5,
+                batch_size=50,
+                batch_cooldown=5.0,
+            )
+            logger.info("Dry-run: ContentFetcher enabled (V2.4 batch scheduling, network_idle=False)")
+        elif not self._dry_run:
+            # Normal mode: always enable ContentFetcher
+            from src.utils.content_fetcher import ContentFetcher
+            content_fetcher = ContentFetcher(
+                timeout=30,
+                max_concurrent=5,
+                batch_size=50,
+                batch_cooldown=5.0,
+            )
+            logger.info("ContentFetcher enabled for GDELT and RSS (network_idle=False)")
 
         # ── Macro pipeline: GDELT uses macro theme keywords (not tickers) ──
-        from src.adapters.macro_themes import MACRO_THEME_KEYWORDS
+        if "gdelt" in sources:
+            from src.adapters.macro_themes import MACRO_THEME_KEYWORDS
 
-        self._gdelt_adapter = GdeltAdapter(
-            macro_theme_keywords=MACRO_THEME_KEYWORDS,
-            dedup_cache=self._dedup_cache,
-        )
+            self._gdelt_adapter = GdeltAdapter(
+                macro_theme_keywords=MACRO_THEME_KEYWORDS,
+                dedup_cache=self._dedup_cache,
+                content_fetcher=content_fetcher,
+            )
+            logger.debug("GdeltAdapter initialized (Plan D filter, content_fetcher=%s)", "yes" if content_fetcher else "no")
+        else:
+            logger.info("Dry-run: GDELT adapter skipped (source_filter=%s)", self._source_filter)
 
         # ── Macro pipeline: RSS uses zero filtering (no tickers) ───
-        self._rss_adapter = RssAdapter(
-            feed_urls=self._feed_urls,
-            dedup_cache=self._dedup_cache,
-        )
+        if "rss" in sources:
+            # Load RSS feeds from JSON config, with explicit feed_urls override
+            rss_urls = self._feed_urls
+            # Only load from JSON if feed_urls was not explicitly provided
+            if rss_urls == _DEFAULT_RSS_FEEDS and not getattr(self, '_feed_urls_explicit', False):
+                rss_urls = self._load_rss_feeds()
+
+            self._rss_adapter = RssAdapter(
+                feed_urls=rss_urls,
+                dedup_cache=self._dedup_cache,
+                content_fetcher=content_fetcher,
+            )
+        else:
+            logger.info("Dry-run: RSS adapter skipped (source_filter=%s)", self._source_filter)
 
         # ── Stock pipeline: AkShare uses ticker whitelist ──────────
-        self._akshare_adapter = AkShareAdapter(
-            dedup_cache=self._dedup_cache,
-        )
+        if "akshare" in sources:
+            self._akshare_adapter = AkShareAdapter(
+                dedup_cache=self._dedup_cache,
+            )
+        else:
+            logger.info("Dry-run: AkShare adapter skipped (source_filter=%s)", self._source_filter)
 
         logger.info(
             "Scheduler components initialized: "
-            "GDELT[theme-filter] + RSS[zero-filter](macro pipeline, MACRO_ENTITY_TYPES), "
-            "AkShare[ticker-filter](stock pipeline, SYMBOL_ENTITY_TYPES), "
-            "SectorBriefingAggregator"
+            "GDELT=%s, RSS=%s feeds, AkShare=%s"
+            "%s",
+            "yes" if self._gdelt_adapter else "no",
+            len(self._rss_adapter.feed_urls) if self._rss_adapter else "no",
+            "yes" if self._akshare_adapter else "no",
+            " [dry-run mode]" if self._dry_run else ""
         )
 
     # ── Internal: cycle loop ──────────────────────────────────────────
@@ -537,6 +688,93 @@ class IngestionScheduler:
             "TTL cleanup complete: %s",
             ", ".join(f"{k}={v}" for k, v in results.items()),
         )
+        return results
+
+    # ── Dry-run cycle (one-shot) ──────────────────────────────────────────
+
+    async def run_dry_cycle(self) -> list[PipelineResult]:
+        """Execute one-shot dry-run pipeline.
+
+        Runs all instantiated adapters sequentially (not concurrently for
+        simplicity), skips TTL cleanup, severity enrichment, and briefing
+        aggregation.
+
+        Returns:
+            List of PipelineResult with episodes populated.
+        """
+        self._lazy_init_components()
+
+        # Load ticker whitelist for AkShare (same as normal cycle)
+        tickers = get_ticker_whitelist(self._whitelist_path)
+        if tickers and self._akshare_adapter is not None:
+            self._update_adapter_tickers(tickers)
+            logger.info("Dry-run: loaded %d tickers for AkShare", len(tickers))
+
+        results: list[PipelineResult] = []
+        adapters_to_run: list[tuple[Any, str]] = []
+
+        if self._gdelt_adapter is not None:
+            adapters_to_run.append((self._gdelt_adapter, "gdelt_csv"))
+        if self._rss_adapter is not None:
+            adapters_to_run.append((self._rss_adapter, "rss"))
+        if self._akshare_adapter is not None:
+            adapters_to_run.append((self._akshare_adapter, "akshare"))
+
+        if not adapters_to_run:
+            logger.warning("Dry-run: no adapters to run (all skipped by source_filter)")
+            return results
+
+        logger.info(
+            "=== Dry-run cycle starting: %d adapter(s) ===",
+            len(adapters_to_run),
+        )
+
+        for adapter, source_name in adapters_to_run:
+            source_type = getattr(adapter, "SOURCE_TYPE", source_name)
+            logger.info("Dry-run: running %s...", source_type)
+            try:
+                result = await run_pipeline(
+                    adapter=adapter,
+                    writer=None,
+                    tickers=tickers if source_name == "akshare" else None,
+                    dry_run=True,
+                )
+                results.append(result)
+                if result.success:
+                    logger.info(
+                        "Dry-run [%s]: %d episodes in %.1fs",
+                        source_type,
+                        result.episode_count,
+                        result.elapsed_seconds,
+                    )
+                else:
+                    logger.error(
+                        "Dry-run [%s]: FAILED after %.1fs: %s",
+                        source_type,
+                        result.elapsed_seconds,
+                        result.error,
+                    )
+            except Exception as exc:
+                logger.error(
+                    "Dry-run [%s] threw unhandled exception: %s",
+                    source_type,
+                    exc,
+                    exc_info=True,
+                )
+                results.append(
+                    PipelineResult(
+                        source_type=source_type,
+                        success=False,
+                        error=exc,
+                    )
+                )
+
+        logger.info(
+            "=== Dry-run cycle complete: %d/%d adapters successful ===",
+            sum(1 for r in results if r.success),
+            len(results),
+        )
+
         return results
 
     # ── Logging ─────────────────────────────────────────────────────────

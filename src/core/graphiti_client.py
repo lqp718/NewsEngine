@@ -10,7 +10,7 @@ import os
 from typing import TYPE_CHECKING, Any
 
 from graphiti_core import Graphiti
-from graphiti_core.llm_client.gemini_client import GeminiClient, LLMConfig
+from graphiti_core.llm_client.config import LLMConfig
 from graphiti_core.cross_encoder.bge_reranker_client import BGERerankerClient
 
 if TYPE_CHECKING:
@@ -35,16 +35,27 @@ def create_graphiti(graph_driver: GraphDriver | None = None) -> Graphiti:
     """
     settings = get_settings()
 
-    # # LLM: Gemini (native structured output — eliminates Schema Echo issues)
-    # Also inject OPENAI_API_KEY so Graphiti SDK internal layers can read it
-    # os.environ["OPENAI_API_KEY"] = settings.gemini_api_key
-
-    llm_client = GeminiClient(
-        config=LLMConfig(
-            api_key=settings.gemini_api_key,
-            model=settings.gemini_model,
-        ),
-    )
+    # LLM: 根据 graphiti_llm_provider 配置选择
+    # - "gemini": 原生 Gemini API（免费但不稳定，偶发 503/JSON 解析失败）
+    # - "openai": 百炼 OpenAI 兼容接口（稳定，收费）
+    if settings.graphiti_llm_provider == "gemini":
+        from graphiti_core.llm_client.gemini_client import GeminiClient
+        llm_client = GeminiClient(
+            config=LLMConfig(
+                api_key=settings.gemini_api_key,
+                model=settings.gemini_model,
+            ),
+        )
+    else:  # openai (百炼)
+        from .bailian_llm_client import BailianOpenAIClient
+        llm_client = BailianOpenAIClient(
+            config=LLMConfig(
+                api_key=settings.bailian_api_key,
+                model=settings.llm_model,
+                base_url=settings.openai_base_url,
+            ),
+            structured_output_mode='json_object',  # 百炼不支持 json_schema
+        )
 
     # Embedder: 百炼 text-embedding-v4 (keep existing Bailian Embedder with 10-item batch limit)
     embedder_client = BailianEmbedder(

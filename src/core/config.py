@@ -27,6 +27,12 @@ class Settings(BaseSettings):
         description="阿里百炼 API Key - 必填字段，无默认值",
     )
 
+    # === Graphiti LLM Provider ===
+    graphiti_llm_provider: str = Field(
+        "openai",
+        description="Graphiti LLM provider: 'gemini' or 'openai' (百炼)",
+    )
+
     # === Google Gemini API ===
     gemini_api_key: str = Field(
         "",

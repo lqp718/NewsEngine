@@ -16,9 +16,6 @@ from .neo4j_client import (
     get_neo4j_driver,
     close_neo4j_driver,
 )
-from .graphiti_client import (
-    create_graphiti,
-)
 
 __all__ = [
     # Config exports
@@ -29,6 +26,4 @@ __all__ = [
     # Neo4j client exports
     "get_neo4j_driver",
     "close_neo4j_driver",
-    # Graphiti client exports
-    "create_graphiti",
 ]

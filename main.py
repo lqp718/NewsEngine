@@ -2,8 +2,9 @@
 
 Usage:
     python main.py                     # normal start
-    python main.py                     # Ctrl+C for graceful shutdown
-    NEO4J_URI=bolt://... python main.py  # override via env
+    python main.py --dry-run           # dry-run (no Neo4j/Graphiti/uvicorn)
+    python main.py --dry-run --source rss  # dry-run, RSS only
+    NEO4J_URI=bolt://... python main.py    # override via env
 
 Startup order (FIFO):
     1. Load .env config via get_settings()
@@ -14,6 +15,12 @@ Startup order (FIFO):
     6. Create EpisodeWriter
     7. Start IngestionScheduler background task
     8. Start uvicorn Server (programmatic API, shared event loop)
+
+Dry-run mode:
+    python main.py --dry-run [--source {gdelt|rss|akshare|all}] [--fetch-content]
+    1. Load .env config via get_settings()
+    2. Initialize structured JSON logging
+    3. Run adapters one-shot → JSON output → stdout summary → exit
 
 Shutdown order (LIFO):
     1. Stop IngestionScheduler
@@ -29,8 +36,12 @@ Signal handling:
 
 from __future__ import annotations
 
+import argparse
 import asyncio
+import json
+import os
 import signal
+from datetime import datetime
 import sys
 from typing import Any
 
@@ -38,10 +49,8 @@ import uvicorn
 
 from src.api.server import create_app
 from src.core.config import get_settings
-from src.core.graphiti_client import create_graphiti
-from src.core.neo4j_client import get_neo4j_driver, close_neo4j_driver
-from src.graphiti.episode_writer import EpisodeWriter
 from src.ingestion.scheduler import IngestionScheduler
+from src.ingestion.pipeline import PipelineResult
 from src.utils.logging_config import setup_logging, get_logger
 
 # ── Module-level state ──────────────────────────────────────────────────
@@ -94,6 +103,8 @@ async def _shutdown_sequence(
 
     # LIFO step 4
     try:
+        from src.core.neo4j_client import close_neo4j_driver
+
         close_neo4j_driver()
         _logger.info("LIFO step 4/4: Neo4j driver closed")
     except Exception as exc:
@@ -210,6 +221,8 @@ async def main() -> None:
     # ═════════════════════════════════════════════════════════════════
     _logger.info("FIFO step 3/8: connecting to Neo4j...")
     try:
+        from src.core.neo4j_client import get_neo4j_driver
+
         driver = get_neo4j_driver()
         _logger.info(
             "FIFO step 3/8: Neo4j connection OK — %s", settings.neo4j_uri
@@ -243,6 +256,8 @@ async def main() -> None:
     # ═════════════════════════════════════════════════════════════════
     _logger.info("FIFO step 5/8: initializing Graphiti SDK...")
     try:
+        from src.core.graphiti_client import create_graphiti
+
         gti = create_graphiti()
         _logger.info("FIFO step 5/8: Graphiti SDK ready")
     except Exception as exc:
@@ -256,6 +271,8 @@ async def main() -> None:
     # ═════════════════════════════════════════════════════════════════
     _logger.info("FIFO step 6/8: creating EpisodeWriter...")
     try:
+        from src.graphiti.episode_writer import EpisodeWriter
+
         writer = EpisodeWriter(graphiti=gti)
         _logger.info("FIFO step 6/8: EpisodeWriter ready")
     except Exception as exc:
@@ -359,8 +376,156 @@ async def main() -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# Dry-run mode
+# ═══════════════════════════════════════════════════════════════════════
+
+
+async def main_dry_run(args: argparse.Namespace) -> None:
+    """Execute one-shot dry-run: fetch → normalize → dedup → JSON → summary.
+
+    Steps:
+        1. Load and validate .env configuration
+        2. Initialize logging
+        3. Create IngestionScheduler in dry-run mode
+        4. Run one-shot dry cycle
+        5. Serialize episodes to JSON
+        6. Print stdout summary
+    """
+    # ── Step 1: Load and validate .env configuration ────────────────
+    try:
+        settings = get_settings()
+    except Exception as exc:
+        print(f"CRITICAL: Config loading failed: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    # ── Step 2: Initialize structured JSON logging ─────────────────
+    try:
+        setup_logging(level=settings.log_level, log_file=settings.log_file)
+    except Exception as exc:
+        print(
+            f"WARNING: Logging setup failed, falling back to stdout: {exc}",
+            file=sys.stderr,
+        )
+    logger = get_logger(__name__)
+
+    logger.info("=== NewsEngine dry-run mode ===")
+    logger.info(
+        "Settings: source=%s, fetch_content=%s, api_port=%d, log_level=%s",
+        args.source,
+        args.fetch_content,
+        settings.api_port,
+        settings.log_level,
+    )
+
+    # ── Step 3: Create scheduler in dry-run mode ───────────────────
+    scheduler = IngestionScheduler(
+        dry_run=True,
+        source_filter=args.source,
+        fetch_content=args.fetch_content,
+    )
+
+    # ── Step 4: Run one-shot dry cycle ─────────────────────────────
+    logger.info("Starting dry-run cycle...")
+    results = await scheduler.run_dry_cycle()
+
+    # ── Step 5: Collect all episodes ───────────────────────────────
+    all_episodes: list[dict[str, Any]] = []
+    for r in results:
+        if r.success and r.episodes:
+            for ep in r.episodes:
+                all_episodes.append(ep.model_dump(mode='json'))
+
+    # ── Step 6: Write JSON output ──────────────────────────────────
+    os.makedirs("output", exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_path = f"output/dry_run_{timestamp}.json"
+
+    json_write_failed = False
+    try:
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(all_episodes, f, ensure_ascii=False, indent=2)
+        logger.info(
+            "Dry-run output written to %s (%d episodes)",
+            output_path,
+            len(all_episodes),
+        )
+    except Exception as exc:
+        logger.critical("Failed to write output file %s: %s", output_path, exc)
+        json_write_failed = True
+        output_path = f"{output_path} (WRITE FAILED)"
+
+    # ── Step 7: Print stdout summary ───────────────────────────────
+    _print_dry_run_summary(results, output_path)
+
+    logger.info("=== Dry-run complete ===")
+
+    if json_write_failed:
+        sys.exit(1)
+    sys.exit(0)
+
+
+def _print_dry_run_summary(
+    results: list[PipelineResult],
+    output_path: str,
+) -> None:
+    """Print the dry-run summary table to stdout."""
+    print()
+    print("=== DRY RUN SUMMARY ===")
+    print(f"{'Source':<12} {'Fetched':<9} {'Filtered':<9} {'Normalized':<11} {'Time':<6}")
+
+    total_fetched = 0
+    total_filtered = 0
+    total_normalized = 0
+    total_time = 0.0
+
+    for r in results:
+        elapsed = r.elapsed_seconds
+        total_time += elapsed
+        if r.success:
+            fetched = r.fetch_count or r.episode_count
+            filtered = r.filtered_count
+            normalized = r.episode_count
+            print(f"{r.source_type:<12} {fetched:<9} {filtered:<9} {normalized:<11} {elapsed:.1f}s")
+            total_fetched += fetched
+            total_filtered += filtered
+            total_normalized += normalized
+        else:
+            print(f"{r.source_type:<12} {'ERROR':<9} {'ERROR':<9} {'ERROR':<11} {elapsed:.1f}s")
+
+    print(f"{'---':<12} {'---':<9} {'---':<9} {'---':<11} {'---':<6}")
+    print(f"{'TOTAL':<12} {total_fetched:<9} {total_filtered:<9} {total_normalized:<11} {total_time:.1f}s")
+    print(f"Output: {output_path}")
+    print()
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # Script entry point
 # ═══════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    parser = argparse.ArgumentParser(
+        description="NewsEngine — multi-source news ingestion and knowledge graph",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run one-shot validation mode (no Neo4j/Graphiti/uvicorn)",
+    )
+    parser.add_argument(
+        "--source",
+        choices=["gdelt", "rss", "akshare", "all"],
+        default="all",
+        help="Filter which data source adapters to run (default: all)",
+    )
+    parser.add_argument(
+        "--fetch-content",
+        action="store_true",
+        help="Enable ContentFetcher for RSS article body enrichment (dry-run mode)",
+    )
+
+    parsed_args = parser.parse_args()
+
+    if parsed_args.dry_run:
+        asyncio.run(main_dry_run(parsed_args))
+    else:
+        asyncio.run(main())

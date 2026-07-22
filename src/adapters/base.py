@@ -29,6 +29,8 @@ class BaseAdapter(ABC):
 
     def __init__(self, dedup_cache: set[str] | None = None) -> None:
         self.dedup_cache: set[str] = dedup_cache or set()
+        self._pre_filter_count: int = 0
+        """Record count before relevance filtering. Set by fetch(); read by pipeline for dry-run stats."""
 
     # ── abstract methods ──────────────────────────────────────────────
 
@@ -40,7 +42,7 @@ class BaseAdapter(ABC):
         """
 
     @abstractmethod
-    def normalize(self, record: dict) -> NormalizedEpisode:
+    async def normalize(self, record: dict) -> NormalizedEpisode:
         """Convert a single raw record into a NormalizedEpisode."""
 
     # ── concrete methods ─────────────────────────────────────────────
@@ -88,5 +90,7 @@ class BaseAdapter(ABC):
         Convenience method that chains the three stages.
         """
         records = await self.fetch(**kwargs)
-        episodes = [self.normalize(r) for r in records]
+        # Normalize all records concurrently since normalize() is now async
+        import asyncio
+        episodes = await asyncio.gather(*[self.normalize(r) for r in records])
         return self.dedup(episodes)
