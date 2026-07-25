@@ -288,7 +288,7 @@ class NewsSpider(Spider):
     name = "news_spider"
     concurrent_requests = DEFAULT_CONCURRENT_REQUESTS
     concurrent_requests_per_domain = DEFAULT_CONCURRENT_PER_DOMAIN
-    logging_level = logging.INFO  # Override Scrapling's default DEBUG to prevent OOM
+    logging_level = logging.WARNING  # Suppress INFO logs; respect user's LOG_LEVEL setting
 
     def __init__(
         self,
