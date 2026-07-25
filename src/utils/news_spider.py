@@ -22,6 +22,7 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
 
 from scrapling.fetchers import AsyncStealthySession, FetcherSession
@@ -120,6 +121,10 @@ def _patch_cloudflare_solver():
 
 # Apply patch on module import
 _patch_cloudflare_solver()
+
+# Set Scrapling spider engine log level to INFO to prevent DEBUG from
+# printing full HTML (multi-MB pages → OOM).  See newsengine-spider-oom-fix.
+logging.getLogger("scrapling.spiders.engine").setLevel(logging.INFO)
 
 
 # ── Configuration ──────────────────────────────────────────────────────
@@ -266,8 +271,34 @@ class NewsSpider(Spider):
     # ── Blocked detection & retry ─────────────────────────────────────
 
     async def is_blocked(self, response: Response) -> bool:
-        """Return True only for the status codes that trigger stealth retry."""
-        return response.status in BLOCKED_STATUS_CODES
+        """Return True only for blocked status codes WITH Cloudflare challenge."""
+        if response.status not in BLOCKED_STATUS_CODES:
+            return False
+
+        # Check response body for Cloudflare challenge markers
+        html = str(response.html_content or "")
+        if self._has_cloudflare_challenge(html):
+            return True
+
+        # 403/429/503 but no Cloudflare challenge (other anti-bot) → don't retry
+        logger.debug(
+            "Status %d but no Cloudflare challenge detected — not retrying for %s",
+            response.status,
+            response.url,
+        )
+        return False
+
+    def _has_cloudflare_challenge(self, html: str) -> bool:
+        """Detect whether HTML contains Cloudflare challenge markers."""
+        cf_markers = [
+            "just a moment",       # CF challenge page title "Just a moment..."
+            "cloudflare",          # generic keyword
+            "cf-challenge",        # CF challenge CSS class
+            "challenge-platform",  # CF challenge platform div
+            "turnstile",           # Cloudflare Turnstile
+        ]
+        html_lower = html.lower()
+        return any(marker in html_lower for marker in cf_markers)
 
     async def retry_blocked_request(
         self, request: Request, response: Response
