@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from typing import Any
 
 from scrapling.fetchers import AsyncStealthySession, FetcherSession
@@ -289,9 +288,7 @@ class NewsSpider(Spider):
     name = "news_spider"
     concurrent_requests = DEFAULT_CONCURRENT_REQUESTS
     concurrent_requests_per_domain = DEFAULT_CONCURRENT_PER_DOMAIN
-    # Read logging level from env to stay consistent with logging_config.py
-    # Default to WARNING to avoid verbose Scrapling internal logs
-    logging_level = getattr(logging, os.environ.get("LOG_LEVEL", "WARNING").upper(), logging.WARNING)
+    logging_level = logging.WARNING  # Suppress INFO logs; respect user's LOG_LEVEL setting
 
     def __init__(
         self,
