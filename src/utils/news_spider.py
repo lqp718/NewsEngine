@@ -123,6 +123,89 @@ def _patch_cloudflare_solver():
 _patch_cloudflare_solver()
 
 
+# ── Monkey-patch: fix scrapling's engine log bugs ──────────────────
+# Scrapling's CrawlerEngine._run_callbacks has two logging bugs:
+# 1. Line 157: log.debug(f"...\n{pprint.pformat(processed_result)}")
+#    The f-string is eagerly evaluated BEFORE log.debug() checks level.
+#    pprint.pformat() on a 100KB+ HTML dict wastes CPU/memory on EVERY request.
+# 2. Line 164: log.warning(f"Dropped from ...\n{processed_result}")
+#    WARNING is always output → full 100KB+ HTML in log → "Unable to print" error.
+# Fix: wrap _run_callbacks to guard expensive formatting.
+
+_MAX_LOG_PREVIEW_CHARS = 500
+
+
+def _patch_engine_logging():
+    """Patch CrawlerEngine._run_callbacks to avoid expensive/huge log formatting."""
+    try:
+        from scrapling.spiders.engine import CrawlerEngine
+    except ImportError:
+        logger.warning("Could not import CrawlerEngine for logging patch")
+        return
+
+    import pprint as _pprint
+
+    _original_run_callbacks = CrawlerEngine._run_callbacks
+
+    async def _patched_run_callbacks(self, request, response):
+        """Patched _run_callbacks: guard expensive log formatting."""
+        callback = request.callback if request.callback else self.spider.parse
+        try:
+            async for result in callback(response):
+                if isinstance(result, Request):
+                    if self._is_domain_allowed(result):
+                        self._normalize_request(result)
+                        await self.scheduler.enqueue(result)
+                    else:
+                        self.stats.offsite_requests_count += 1
+                        # Original: log.debug(f"Filtered offsite ...")  — safe, no huge data
+                        if self.spider.logger.isEnabledFor(logging.DEBUG):
+                            from scrapling.core.utils import log
+                            log.debug(f"Filtered offsite request to: {result.url}")
+                elif isinstance(result, dict):
+                    processed_result = await self.spider.on_scraped_item(result)
+                    if processed_result:
+                        self.stats.items_scraped += 1
+                        # FIX: only pprint when DEBUG is actually enabled
+                        if self.spider.logger.isEnabledFor(logging.DEBUG):
+                            from scrapling.core.utils import log
+                            log.debug(
+                                f"Scraped from {str(response)}\n"
+                                f"{_pprint.pformat(processed_result)}"
+                            )
+                        if self._item_stream:
+                            await self._item_stream.send(processed_result)
+                        else:
+                            self._items.append(processed_result)
+                    else:
+                        self.stats.items_dropped += 1
+                        # FIX: truncate dict preview to avoid "Unable to print"
+                        from scrapling.core.utils import log
+                        preview = str(processed_result)
+                        if len(preview) > _MAX_LOG_PREVIEW_CHARS:
+                            preview = preview[:_MAX_LOG_PREVIEW_CHARS] + "... [truncated]"
+                        log.warning(f"Dropped from {str(response)}\n{preview}")
+                elif result is not None:
+                    from scrapling.core.utils import log
+                    log.error(
+                        f"Spider must return Request, dict or None, got '{type(result)}' in {request}"
+                    )
+        except Exception as e:
+            from scrapling.core.utils import log
+            msg = f"Spider error processing {request}:\n {e}"
+            log.error(msg, exc_info=e)
+            await self.spider.on_error(request, e)
+
+    CrawlerEngine._run_callbacks = _patched_run_callbacks
+    logger.info(
+        f"Patched CrawlerEngine._run_callbacks: lazy DEBUG + truncated WARNING "
+        f"(max {_MAX_LOG_PREVIEW_CHARS} chars)"
+    )
+
+
+_patch_engine_logging()
+
+
 # ── Configuration ──────────────────────────────────────────────────────
 
 DEFAULT_CONCURRENT_REQUESTS: int = 10
