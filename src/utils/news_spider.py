@@ -307,7 +307,9 @@ class NewsSpider(Spider):
 
     def configure_sessions(self, manager):
         """Configure two session tiers: fast (default) and stealth (lazy)."""
-        manager.add("fast", FetcherSession(impersonate="chrome"))
+        # follow_redirects=True bypasses SSRF protection for sites like EastMoney
+        # that may have redirect chains through internal IPs (anti-bot mechanisms)
+        manager.add("fast", FetcherSession(impersonate="chrome", follow_redirects=True))
         manager.add(
             "stealth",
             AsyncStealthySession(
