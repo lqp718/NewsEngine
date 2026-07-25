@@ -13,6 +13,7 @@ from typing import Any
 
 from src.adapters.base import BaseAdapter
 from src.adapters.models import EntityItem, NormalizedEpisode
+from src.utils.content_fetcher import ContentResult
 from src.utils.logging_config import get_logger
 from src.utils.time_utils import now_hkt
 
@@ -93,10 +94,12 @@ class AkShareAdapter(BaseAdapter):
         ticker_whitelist: list[dict[str, str]] | None = None,
         rate_limit_sec: float = 0.5,
         dedup_cache: set[str] | None = None,
+        content_fetcher: Any | None = None,
     ) -> None:
         super().__init__(dedup_cache=dedup_cache)
         self.ticker_whitelist = ticker_whitelist or []
         self.rate_limit_sec = rate_limit_sec
+        self._content_fetcher = content_fetcher
         # Build symbol → metadata map from whitelist
         self._symbol_map: dict[str, dict[str, str]] = {}
         for entry in self.ticker_whitelist:
@@ -172,18 +175,78 @@ class AkShareAdapter(BaseAdapter):
         logger.info("Total AkShare items fetched: %d", len(all_items))
         return all_items
 
+    # ── run override — batch fetch + normalize ──────────────────────
+
+    async def run(self, **kwargs: Any) -> list[NormalizedEpisode]:
+        """Full pipeline: fetch → batch content fetch → normalize → dedup.
+
+        Phase 1: Fetch raw AkShare records.
+        Phase 2: Batch-fetch all article links using ContentFetcher.
+        Phase 3: Normalize each record (passing pre-fetched content).
+        Phase 4: Dedup.
+        """
+        records = await self.fetch(**kwargs)
+
+        # Phase 1: batch fetch all article links
+        links = [r.get("link") for r in records if r.get("link")]
+        fetch_results: dict[str, ContentResult] = {}
+        if self._content_fetcher and links:
+            try:
+                results = await self._content_fetcher.fetch_batch(links)
+                fetch_results = {r.url: r for r in results}
+                logger.debug(
+                    "Batch-fetched %d/%d AkShare article contents",
+                    sum(1 for r in results if r.success),
+                    len(results),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Batch content fetch failed for AkShare: %s — falling back to API summary",
+                    exc,
+                )
+
+        # Phase 2: normalize all records with pre-fetched content
+        episodes = await asyncio.gather(
+            *[self.normalize(r, fetch_results=fetch_results) for r in records],
+        )
+        return self.dedup(list(episodes))
+
     # ── normalization ────────────────────────────────────────────────
 
-    def normalize(self, record: dict) -> NormalizedEpisode:
-        """Convert a single AkShare news item to NormalizedEpisode."""
+    async def normalize(
+        self,
+        record: dict,
+        fetch_results: dict[str, ContentResult] | None = None,
+    ) -> NormalizedEpisode:
+        """Convert a single AkShare news item to NormalizedEpisode.
+
+        If ``fetch_results`` is provided, uses the pre-fetched ContentResult
+        to get full article text. Falls back to API summary on failure.
+        """
         title = record.get("title", "")
-        content = record.get("content", "") or None
+        api_summary = record.get("content", "") or None
+        link = record.get("link", "") or None
         symbol = record.get("symbol", "")
         ticker_name = record.get("_ticker_name", "")
         ticker_full = record.get("_ticker_full", "")
         ticker_sector = record.get("_ticker_sector", "")
         ticker_exchange = record.get("_ticker_exchange", "")
 
+        # Prefer pre-fetched full text over API summary
+        full_text: str | None = None
+        if fetch_results and link and link in fetch_results:
+            result = fetch_results[link]
+            if result.success and result.text:
+                full_text = result.text
+            else:
+                logger.debug(
+                    "Pre-fetched content failed for %s: %s — using API summary",
+                    link,
+                    result.error,
+                )
+
+        # Build episode body: prefer full_text, fall back to API summary
+        content = full_text or api_summary
         episode_body = _build_episode_body(title, content)
         content_hash = hashlib.sha256(episode_body.encode("utf-8")).hexdigest()
         valid_at = _parse_akshare_time(record.get("time"))
@@ -216,7 +279,7 @@ class AkShareAdapter(BaseAdapter):
             name=name,
             source_description=f"AkShare Stock News: {symbol}",
             source_type="akshare",
-            source_url=None,
+            source_url=record.get("link") or None,
             valid_at=valid_at,
             content_hash=content_hash,
             severity="medium",

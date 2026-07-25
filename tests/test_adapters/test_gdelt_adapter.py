@@ -294,15 +294,15 @@ class TestGdeltPlanDFilter:
     def test_authoritative_domain_unconditional_pass(self):
         """Authoritative domain passes without theme check."""
         adapter = GdeltAdapter(macro_theme_keywords={"TRADE"})
-        # Bloomberg is authoritative; SPORTS_NEWS doesn't match TRADE
-        record = self._make_record("bloomberg.com", themes="SPORTS_NEWS")
+        # Bloomberg is authoritative; SPORTS NEWS doesn't match TRADE
+        record = self._make_record("bloomberg.com", themes="SPORTS NEWS")
         filtered = adapter.filter_relevant([record])
         assert len(filtered) == 1
 
     def test_non_authoritative_theme_pass(self):
         """Non-authoritative domain passes if theme matches."""
         adapter = GdeltAdapter(macro_theme_keywords={"TRADE"})
-        record = self._make_record("example-news.com", themes="TRADE_WARS")
+        record = self._make_record("example-news.com", themes="ECON_FINANCIAL; TRADE")
         filtered = adapter.filter_relevant([record])
         assert len(filtered) == 1
 
@@ -316,7 +316,7 @@ class TestGdeltPlanDFilter:
     def test_empty_domain_treated_as_non_authoritative(self):
         """Empty domain is treated as non-authoritative; needs theme match."""
         adapter = GdeltAdapter(macro_theme_keywords={"TRADE"})
-        record = self._make_record("", themes="TRADE_WARS")
+        record = self._make_record("", themes="ECON_FINANCIAL; TRADE")
         filtered = adapter.filter_relevant([record])
         assert len(filtered) == 1
 
@@ -339,11 +339,11 @@ class TestGdeltPlanDFilter:
         """Multiple records with mixed authoritative/non-authoritative."""
         adapter = GdeltAdapter(macro_theme_keywords={"TRADE"})
         records = [
-            self._make_record("reuters.com", themes="SPORTS_NEWS"),       # authoritative -> pass
-            self._make_record("example.com", themes="TRADE_WARS"),        # theme match -> pass
-            self._make_record("example.com", themes="SPORTS_NEWS"),       # no match -> reject
+            self._make_record("reuters.com", themes="SPORTS NEWS"),       # authoritative -> pass
+            self._make_record("example.com", themes="ECON_FINANCIAL; TRADE"),  # theme match -> pass
+            self._make_record("example.com", themes="SPORTS NEWS"),       # no match -> reject
             self._make_record("bloomberg.com", themes="ENTERTAINMENT"),   # authoritative -> pass
-            self._make_record("wsj.com", themes="CRYPTO_NEWS"),          # authoritative -> pass
+            self._make_record("wsj.com", themes="CRYPTO NEWS"),          # authoritative -> pass
         ]
         filtered = adapter.filter_relevant(records)
         assert len(filtered) == 4  # 3 authoritative + 1 theme pass

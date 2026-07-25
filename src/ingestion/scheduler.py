@@ -179,6 +179,7 @@ class IngestionScheduler:
         # ── Adapter instances (lazy init) ─────────────────────────
         self._gdelt_adapter: Any = None
         self._rss_adapter: Any = None
+        self._eastmoney_adapter: Any = None
         self._akshare_adapter: Any = None
 
         # ── Briefing Aggregator ───────────────────────────────────
@@ -409,20 +410,31 @@ class IngestionScheduler:
         else:
             logger.info("Dry-run: RSS adapter skipped (source_filter=%s)", self._source_filter)
 
-        # ── Stock pipeline: AkShare uses ticker whitelist ──────────
+        # ── Stock pipeline: EastMoney (primary) + AkShare (fallback) ──
         if "akshare" in sources:
+            from src.adapters.eastmoney_adapter import EastMoneyAdapter
+
+            settings = get_settings()
+            self._eastmoney_adapter = EastMoneyAdapter(
+                page_size=settings.eastmoney_page_size,
+                dedup_cache=self._dedup_cache,
+                content_fetcher=content_fetcher,
+            )
+
             self._akshare_adapter = AkShareAdapter(
                 dedup_cache=self._dedup_cache,
+                content_fetcher=content_fetcher,
             )
         else:
-            logger.info("Dry-run: AkShare adapter skipped (source_filter=%s)", self._source_filter)
+            logger.info("Dry-run: EastMoney/AkShare adapters skipped (source_filter=%s)", self._source_filter)
 
         logger.info(
             "Scheduler components initialized: "
-            "GDELT=%s, RSS=%s feeds, AkShare=%s"
+            "GDELT=%s, RSS=%s feeds, EastMoney=%s, AkShare=%s"
             "%s",
             "yes" if self._gdelt_adapter else "no",
             len(self._rss_adapter.feed_urls) if self._rss_adapter else "no",
+            "yes" if self._eastmoney_adapter else "no",
             "yes" if self._akshare_adapter else "no",
             " [dry-run mode]" if self._dry_run else ""
         )
@@ -491,17 +503,40 @@ class IngestionScheduler:
         # Stock pipeline (AkShare) uses SYMBOL_ENTITY_TYPES
         pipeline_results: list[PipelineResult] = []
 
-        coros = [
+        # ── Step 2a: Macro pipelines run concurrently ──────────────
+        async def _stock_pipeline() -> PipelineResult:
+            """Stock pipeline: EastMoney (primary) → AkShare (fallback)."""
+            em_result = await self._run_adapter_pipeline(
+                self._eastmoney_adapter, self._symbol_writer, tickers
+            )
+            if em_result.success and em_result.episode_count > 0:
+                logger.info(
+                    "Stock pipeline: EastMoney returned %d episodes",
+                    em_result.episode_count,
+                )
+                return em_result
+
+            # Fallback to AkShare
+            logger.info(
+                "EastMoney returned 0 episodes, falling back to AkShare"
+            )
+            return await self._run_adapter_pipeline(
+                self._akshare_adapter, self._symbol_writer, tickers
+            )
+
+        macro_coros = [
             self._run_adapter_pipeline(self._gdelt_adapter, self._macro_writer, tickers),
             self._run_adapter_pipeline(self._rss_adapter, self._macro_writer, tickers),
-            self._run_adapter_pipeline(self._akshare_adapter, self._symbol_writer, tickers),
         ]
 
-        completed = await asyncio.gather(*coros, return_exceptions=True)
+        # Run macro pipelines + stock pipeline concurrently
+        all_coros = [*macro_coros, _stock_pipeline()]
 
+        completed = await asyncio.gather(*all_coros, return_exceptions=True)
+
+        source_names = ["gdelt_csv", "rss", "stock"]
         for i, result in enumerate(completed):
             if isinstance(result, Exception):
-                source_names = ["gdelt_csv", "rss", "akshare"]
                 logger.error(
                     "Adapter pipeline [%s] threw unhandled exception: %s",
                     source_names[i] if i < len(source_names) else f"adapter_{i}",
@@ -583,16 +618,28 @@ class IngestionScheduler:
     def _update_adapter_tickers(
         self, tickers: list[dict[str, str]]
     ) -> None:
-        """Update ticker whitelists — only for AkShare stock pipeline.
+        """Update ticker whitelists for EastMoney and AkShare stock pipelines.
 
-        V2.2: GDELT/RSS macro pipeline no longer uses ticker whitelist.
-        Only AkShare receives ticker updates.
+        - EastMoneyAdapter: name-based search (uses stock Chinese name)
+        - AkShareAdapter: symbol-based search (uses biz_code)
+
+        GDELT/RSS macro pipeline no longer uses ticker whitelist.
         """
         # GDELT: no longer receives ticker whitelist (uses macro theme filter)
         # RSS: no longer receives ticker whitelist (zero filter)
+
+        # EastMoneyAdapter: index by stock name
+        if self._eastmoney_adapter is not None:
+            self._eastmoney_adapter.ticker_whitelist = tickers
+            self._eastmoney_adapter._name_map = {}
+            for entry in tickers:
+                name = entry.get("name", "")
+                if name:
+                    self._eastmoney_adapter._name_map[name] = entry
+
+        # AkShareAdapter: index by biz_code (fallback)
         if self._akshare_adapter is not None:
             self._akshare_adapter.ticker_whitelist = tickers
-            # AkShareAdapter rebuilds symbol map from whitelist each cycle
             self._akshare_adapter._symbol_map = {}
             for entry in tickers:
                 biz_code = entry.get("biz_code", "")
@@ -704,11 +751,11 @@ class IngestionScheduler:
         """
         self._lazy_init_components()
 
-        # Load ticker whitelist for AkShare (same as normal cycle)
+        # Load ticker whitelist for EastMoney & AkShare (same as normal cycle)
         tickers = get_ticker_whitelist(self._whitelist_path)
-        if tickers and self._akshare_adapter is not None:
+        if tickers:
             self._update_adapter_tickers(tickers)
-            logger.info("Dry-run: loaded %d tickers for AkShare", len(tickers))
+            logger.info("Dry-run: loaded %d tickers", len(tickers))
 
         results: list[PipelineResult] = []
         adapters_to_run: list[tuple[Any, str]] = []
@@ -717,6 +764,10 @@ class IngestionScheduler:
             adapters_to_run.append((self._gdelt_adapter, "gdelt_csv"))
         if self._rss_adapter is not None:
             adapters_to_run.append((self._rss_adapter, "rss"))
+
+        # Stock pipeline: EastMoney (primary) + AkShare (fallback)
+        if self._eastmoney_adapter is not None:
+            adapters_to_run.append((self._eastmoney_adapter, "eastmoney"))
         if self._akshare_adapter is not None:
             adapters_to_run.append((self._akshare_adapter, "akshare"))
 
@@ -736,7 +787,7 @@ class IngestionScheduler:
                 result = await run_pipeline(
                     adapter=adapter,
                     writer=None,
-                    tickers=tickers if source_name == "akshare" else None,
+                    tickers=tickers if source_name in ("akshare", "eastmoney") else None,
                     dry_run=True,
                 )
                 results.append(result)

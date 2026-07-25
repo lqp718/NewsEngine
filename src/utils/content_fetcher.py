@@ -55,7 +55,7 @@ MAX_CONCURRENT: int = 5
 BATCH_SIZE: int = 50
 """Number of URLs per batch."""
 
-BATCH_COOLDOWN_SEC: float = 5.0
+BATCH_COOLDOWN_SEC: float = 1.0
 """Cooldown seconds between batches."""
 
 SPIDER_MAX_PAGES: int = 5
@@ -167,11 +167,15 @@ class ContentFetcher:
         """
         return await self._fetch_single(url)
 
-    async def fetch_batch(self, urls: list[str]) -> list[ContentResult]:
+    async def fetch_batch(
+        self, urls: list[str], batch_timeout: float | None = None
+    ) -> list[ContentResult]:
         """Fetch multiple URLs using NewsSpider.
 
         Args:
             urls: List of article URLs to fetch.
+            batch_timeout: Optional timeout in seconds for each batch.
+                If None, no timeout is applied.
 
         Returns:
             List of ``ContentResult`` in the same order as input URLs.
@@ -182,8 +186,32 @@ class ContentFetcher:
             if batch_idx > 0:
                 await asyncio.sleep(self._batch_cooldown)
 
-            batch_results = await self._fetch_batch_internal(batch)
-            results.extend(batch_results)
+            try:
+                if batch_timeout:
+                    batch_results = await asyncio.wait_for(
+                        self._fetch_batch_internal(batch),
+                        timeout=batch_timeout,
+                    )
+                else:
+                    batch_results = await self._fetch_batch_internal(batch)
+                results.extend(batch_results)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Batch %d/%d timed out after %.1fs, skipping %d URLs",
+                    batch_idx + 1,
+                    len(self._split_batches(urls)),
+                    batch_timeout,
+                    len(batch),
+                )
+                # Add failure results for skipped URLs
+                for url in batch:
+                    results.append(
+                        ContentResult(
+                            url=url,
+                            success=False,
+                            error=f"Batch timeout after {batch_timeout}s",
+                        )
+                    )
 
         return results
 
@@ -374,18 +402,36 @@ class ContentFetcher:
             self._domain_last_fetch[domain] = time.monotonic()
 
     def _split_batches(self, urls: list[str]) -> list[list[str]]:
-        """Split URL list into batches.
+        """Split URL list into domain-grouped batches for Cloudflare cookie reuse.
+
+        Groups URLs by domain so each batch contains URLs from the same domain.
+        This maximizes Cloudflare cookie reuse — the first request in a batch
+        triggers Cloudflare verification, subsequent requests in the same batch
+        reuse the cookies.
 
         Args:
             urls: Full list of URLs.
 
         Returns:
-            List of URL sub-lists.
+            List of URL sub-lists, grouped by domain.
         """
-        return [
-            urls[i:i + self._batch_size]
-            for i in range(0, len(urls), self._batch_size)
-        ]
+        from urllib.parse import urlparse
+        from collections import defaultdict
+
+        # Group URLs by domain
+        domain_groups: dict[str, list[str]] = defaultdict(list)
+        for url in urls:
+            try:
+                domain = urlparse(url).netloc
+            except Exception:
+                domain = "unknown"
+            domain_groups[domain].append(url)
+
+        # Convert to list of batches
+        # Each batch is a list of URLs from the same domain
+        batches = list(domain_groups.values())
+
+        return batches
 
 
 __all__ = [

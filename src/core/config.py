@@ -144,6 +144,12 @@ class Settings(BaseSettings):
         0.5,
         description="AkShare 查询间隔（秒）",
     )
+
+    # === EastMoney ===
+    eastmoney_page_size: int = Field(
+        20,
+        description="EastMoney 个股新闻每页条数（默认 20 条）",
+    )
     
     # === Risk Summary 缓存 ===
     risk_summary_cache_ttl_sec: int = Field(

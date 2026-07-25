@@ -21,6 +21,7 @@ Usage::
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from scrapling.fetchers import AsyncStealthySession, FetcherSession
@@ -29,6 +30,96 @@ from scrapling.spiders import Request, Response, Spider
 from src.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
+
+
+# ── Monkey-patch: fix scrapling's Cloudflare solver bugs ──────
+# 1. "managed" type is incorrectly handled like "interactive" (clicks checkbox)
+#    but "managed" is a JS auto-challenge that needs NO interaction.
+# 2. _cloudflare_solver() recurses infinitely when challenge can't be solved.
+# See: https://github.com/D4Vinci/Scrapling/pull/330 (closed, not merged)
+
+_MAX_CF_SOLVER_DEPTH = 3
+_cf_solver_depths: dict = {}  # page -> current depth
+
+
+def _patch_cloudflare_solver():
+    """Patch AsyncStealthySession._cloudflare_solver to:
+    1. Treat 'managed' type like 'non-interactive' (wait, don't click)
+    2. Add max recursion depth to prevent infinite loops
+    """
+    try:
+        from scrapling.engines._browsers._stealth import AsyncStealthySession
+        from scrapling.engines._browsers._base import StealthySessionMixin
+    except ImportError:
+        logger.warning("Could not import AsyncStealthySession for Cloudflare solver patch")
+        return
+
+    original_solver = AsyncStealthySession._cloudflare_solver
+    detect_cloudflare = StealthySessionMixin._detect_cloudflare
+
+    async def _patched_solver(self, page):
+        """Patched solver: fix 'managed' type + depth limit."""
+        # Get current depth for this page
+        depth = _cf_solver_depths.get(page, 0)
+        
+        if depth >= _MAX_CF_SOLVER_DEPTH:
+            logger.warning(
+                f"Cloudflare solver reached max depth ({_MAX_CF_SOLVER_DEPTH}), giving up"
+            )
+            _cf_solver_depths.pop(page, None)
+            return None
+
+        # Increment depth
+        _cf_solver_depths[page] = depth + 1
+
+        try:
+            # Detect challenge type
+            from scrapling.engines.toolbelt.convertor import ResponseFactory
+            page_content = await ResponseFactory._get_async_page_content(page)
+            challenge_type = detect_cloudflare(page_content)
+
+            if not challenge_type:
+                logger.error("No Cloudflare challenge found.")
+                return None
+
+            logger.info(f'Cloudflare challenge type: "{challenge_type}"')
+
+            # FIX: Treat "managed" like "non-interactive" (wait, don't click)
+            # "managed" is a JS auto-challenge, no user interaction needed
+            if challenge_type in ("non-interactive", "managed"):
+                logger.info(f"Waiting for {challenge_type} challenge to resolve...")
+                max_wait = 30  # seconds
+                waited = 0
+                while "<title>Just a moment...</title>" in page_content and waited < max_wait:
+                    await page.wait_for_timeout(1000)
+                    waited += 1
+                    page_content = await ResponseFactory._get_async_page_content(page)
+                
+                if "<title>Just a moment...</title>" not in page_content:
+                    logger.info("Cloudflare challenge resolved")
+                    return None
+                else:
+                    logger.warning(f"Cloudflare {challenge_type} challenge did not resolve after {max_wait}s")
+                    return None
+
+            # For "interactive" and "embedded", use original solver (with depth limit)
+            return await original_solver(self, page)
+
+        finally:
+            # Decrement depth (or cleanup if done)
+            new_depth = _cf_solver_depths.get(page, 1) - 1
+            if new_depth <= 0:
+                _cf_solver_depths.pop(page, None)
+            else:
+                _cf_solver_depths[page] = new_depth
+
+    # Apply the patch
+    AsyncStealthySession._cloudflare_solver = _patched_solver
+    logger.info(f"Patched Cloudflare solver: 'managed' type fixed + max_depth={_MAX_CF_SOLVER_DEPTH}")
+
+
+# Apply patch on module import
+_patch_cloudflare_solver()
 
 
 # ── Configuration ──────────────────────────────────────────────────────
@@ -137,6 +228,7 @@ class NewsSpider(Spider):
             AsyncStealthySession(
                 solve_cloudflare=True,
                 humanize=True,
+                timeout=60000,  # 60 seconds in milliseconds — Cloudflare solver timeout
             ),
             lazy=True,
         )

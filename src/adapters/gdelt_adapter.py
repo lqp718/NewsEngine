@@ -2,19 +2,21 @@
 
 Data flow::
     fetch_lastupdate() → download_all_csvs() → parse_gkg() + parse_events + parse_mentions
-    → merge_event_data() → filter_relevant() → normalize() → dedup()
+    → [Events-first] merge_event_data() → EventsPipelineFilter.filter() → _normalize_event_record()
+    → [GKG fallback] parse_gkg() → filter_relevant() → normalize()
+    → dedup()
 
 Only the HTTP CSV data plane (http://data.gdeltproject.org/) is used.
 HTTPS is avoided because the HTTPS endpoints are blocked by the GFW.
 
 V2.2 → G5: Refactored for triple CSV source integration.
-V2.3 → GKG pipeline fix:
-- Fixed GKG V2 column mapping: col 3→domain, col 4→source_url, col 7→themes, col 9→locations, col 11→persons, col 13→organizations, col 15→tone
-- merge_event_data() changed to passthrough (GKG global_event_id format incompatible with Events event_id)
-- _build_episode_body() now uses themes-based natural language summary (no CAMEO/actor dependency)
-- Keywords deduplicated with set, capped at 20
-- Layer B CAMEO filtering marked as inactive (requires GKG-Events join)
-- New Layer C domain whitelist filtering (Phase 2)
+V2.3 → GKG pipeline fix: GKG passthrough merge, Events/Mentions preserved.
+V3.0 → Events-first architecture (V3.0):
+- Events CSV is the primary data source
+- Three-stage filter (CAMEO, Goldstein, NumMentions) with JSON config
+- GKG is the safety net fallback when Events produces zero results
+- Events-derived episodes use source_type="gdelt_events"
+- GKG-derived episodes retain source_type="gdelt_csv"
 """
 
 from __future__ import annotations
@@ -42,8 +44,8 @@ from tenacity import (
 
 from src.adapters.base import BaseAdapter
 from src.adapters.gdelt_codebook import translate_actor, translate_cameo, translate_theme
-from src.adapters.gdelt_events_parser import parse_events_file
-from src.adapters.gdelt_mentions_parser import parse_mentions, fetch_mentions_csv
+from src.adapters.gdelt_events_parser import EventRecord, parse_events_file
+from src.adapters.gdelt_mentions_parser import MentionRecord, parse_mentions, fetch_mentions_csv
 from src.adapters.models import (
     EntityItem,
     NormalizedEpisode,
@@ -51,6 +53,7 @@ from src.adapters.models import (
 )
 from src.adapters.macro_themes import MACRO_THEME_KEYWORDS
 from src.adapters.cameo_event_codes_whitelist import CAMEO_EVENT_CODES_WHITELIST
+from src.ingestion.events_pipeline_filter import EventsPipelineFilter
 from src.utils.content_fetcher import ContentResult
 from src.utils.logging_config import get_logger
 from src.utils.time_utils import now_hkt
@@ -101,6 +104,9 @@ class GdeltDownloadError(Exception):
     """Raised when downloading a CSV zip fails after all retries."""
 
 
+# ── tone-based severity (GKG path) ──────────────────────────────────
+
+
 def _map_tone_to_severity(tone_str: str | None) -> Severity:
     """Map GKG V2 tone (col 15) to severity.
 
@@ -131,6 +137,37 @@ def _map_tone_to_severity(tone_str: str | None) -> Severity:
         return "high"
     else:
         return "critical"
+
+
+# ── goldstein-based severity (Events path) ──────────────────────────
+
+
+def _map_goldstein_to_severity(goldstein: float | None) -> Severity:
+    """Map |Goldstein Scale| to severity for Events-derived episodes.
+
+    | |Goldstein| range | severity  |
+    |-------------------|-----------|
+    | ≥ 8               | critical  |
+    | ≥ 6               | high      |
+    | ≥ 4               | medium    |
+    | < 4               | low       |
+
+    Returns "medium" for None.
+    """
+    if goldstein is None:
+        return "medium"
+    val = abs(goldstein)
+    if val >= 8.0:
+        return "critical"
+    elif val >= 6.0:
+        return "high"
+    elif val >= 4.0:
+        return "medium"
+    else:
+        return "low"
+
+
+# ── GKG helpers ─────────────────────────────────────────────────────
 
 
 def _parse_persons_organizations(raw: str) -> str:
@@ -377,53 +414,103 @@ def _build_episode_body(record: dict) -> str:
 
 
 def _build_episode_body_with_full_text(record: dict, full_text: str) -> str:
-    """Build episode body with full article text replacing the GKG summary.
+    """Build episode body with ONLY full article text.
 
-    Same metadata structure as _build_episode_body(), but replaces the
-    themes-based summary with the actual article content fetched by
-    ContentFetcher. This ensures Graphiti receives consistent input:
-    either full text (on success) or GKG summary (on failure).
+    When full text is available, use it directly without any metadata prefix/suffix.
+    This avoids data pollution from redundant metadata (Date, Domain, Source)
+    that Graphiti doesn't need.
+
+    Args:
+        record: GKG record dict (unused, kept for API compatibility).
+        full_text: Full article text from ContentFetcher.
+
+    Returns:
+        Full article text as-is.
+    """
+    return full_text
+
+
+# ── Events-specific body (CAMEO-centric) ────────────────────────────
+
+
+def _build_event_episode_body(
+    event_record: EventRecord,
+    resolved_urls: list[str],
+) -> str:
+    """Build a CAMEO-centric Markdown episode body for Events-derived episodes.
+
+    Includes CAMEO code + human-readable translation, actor names, Goldstein
+    score, tone, event date, and resolved source URLs.
+
+    Args:
+        event_record: The EventRecord to build body for.
+        resolved_urls: Resolved URLs from mentions_first strategy.
+
+    Returns:
+        Markdown-formatted episode body string.
     """
     lines: list[str] = []
 
-    source_url = record.get("source_url", "") or ""
-    domain = record.get("domain", "") or ""
-    valid_at = record.get("valid_at", "") or ""
-
-    lines.append("## GDELT News Report")
+    lines.append("## GDELT Events Report")
     lines.append("")
 
     # Date
-    if valid_at:
-        lines.append(f"**Date**: {valid_at} UTC")
+    if event_record.event_date:
+        lines.append(f"**Date**: {event_record.event_date}")
 
-    # Domain
-    if domain:
-        lines.append(f"**Domain**: {domain}")
+    # CAMEO event description
+    cameo_translated = translate_cameo(event_record.cameo_code)
+    lines.append(
+        f"**Event**: {cameo_translated} (CAMEO {event_record.cameo_code})"
+    )
+
+    # Actors
+    actor1 = event_record.actor1_name or event_record.actor1_code
+    actor2 = event_record.actor2_name or event_record.actor2_code
+    if actor1 or actor2:
+        actor_line = f"**Actors**: {actor1}"
+        if actor2:
+            actor_line += f" → {actor2}"
+        lines.append(actor_line)
+
+    # Goldstein score
+    if event_record.goldstein_scale is not None:
+        severity = _map_goldstein_to_severity(event_record.goldstein_scale)
+        lines.append(
+            f"**Goldstein Score**: {event_record.goldstein_scale:+.1f} ({severity})"
+        )
+
+    # Tone
+    if event_record.avg_tone is not None:
+        lines.append(f"**Tone**: {event_record.avg_tone:+.1f}")
 
     lines.append("")
 
-    # Full article text (replaces the themes-based summary)
-    lines.append(full_text)
-    lines.append("")
-
-    # Source
-    if source_url:
-        lines.append(f"**Source**: {source_url}")
+    # Sources
+    if resolved_urls:
+        lines.append("**Sources**:")
+        for i, url in enumerate(resolved_urls, start=1):
+            lines.append(f"{i}. {url}")
+    elif event_record.source_url:
+        lines.append(f"**Source**: {event_record.source_url}")
 
     return "\n".join(lines)
 
 
+# ── Adapter class ────────────────────────────────────────────────────
+
 
 class GdeltAdapter(BaseAdapter):
-    """GDELT GKG V2 CSV adapter.
+    """GDELT GKG V2 CSV adapter (Events-first architecture).
 
-    Fetches the latest Events, Mentions, and GKG CSV files from
-    data.gdeltproject.org, downloads them concurrently, parses each
-    using dedicated parser modules, merges by GlobalEventID (LEFT JOIN),
-    and filters by Plan D (authoritative media OR macro theme).
-
-    G5: Triple CSV source integration with concurrent download and merge.
+    V3.0 — Events-first with GKG fallback:
+        1. Downloads Events, Mentions, and GKG CSVs concurrently.
+        2. Events-first path: merge_event_data() → EventsPipelineFilter.filter()
+           → _normalize_event_record().
+        3. GKG fallback (when Events produce 0 results): parse_gkg()
+           → filter_relevant() → normalize().
+        4. Events-derived episodes use ``source_type="gdelt_events"``.
+        5. GKG-derived episodes retain ``source_type="gdelt_csv"``.
     """
 
     def __init__(
@@ -435,6 +522,7 @@ class GdeltAdapter(BaseAdapter):
         backoff_base: float = 1.0,
         dedup_cache: set[str] | None = None,
         content_fetcher: Any | None = None,
+        events_filter_config_path: str = "data/gdelt_events_filter.json",
     ) -> None:
         super().__init__(dedup_cache=dedup_cache)
         self._macro_theme_keywords = macro_theme_keywords if macro_theme_keywords is not None else MACRO_THEME_KEYWORDS
@@ -444,6 +532,9 @@ class GdeltAdapter(BaseAdapter):
         self._last_records: list[dict] = []
         self._lastupdate_url = LASTUPDATE_URL
         self._content_fetcher = content_fetcher
+        self._events_filter = EventsPipelineFilter(
+            config_path=events_filter_config_path
+        )
 
     # ── fetch helpers ────────────────────────────────────────────────
 
@@ -567,7 +658,7 @@ class GdeltAdapter(BaseAdapter):
 
     async def download_all_csvs(
         self, events_url: str, mentions_url: str, gkg_url: str
-    ) -> tuple[list[dict], dict[str, list], list[dict]]:
+    ) -> tuple[list[EventRecord], dict[str, list[MentionRecord]], list[dict]]:
         """Download and parse all three CSV files concurrently using asyncio.gather().
 
         Each CSV download and parse runs in a thread executor to avoid blocking
@@ -614,8 +705,8 @@ class GdeltAdapter(BaseAdapter):
 
         # Parse GKG
         gkg_records: list[dict] = []
-        events_records: list[dict] = []
-        mentions_by_event: dict[str, list] = {}
+        events_records: list[EventRecord] = []
+        mentions_by_event: dict[str, list[MentionRecord]] = {}
 
         if gkg_path is not None:
             try:
@@ -733,27 +824,54 @@ class GdeltAdapter(BaseAdapter):
 
     def merge_event_data(
         self,
+        events_records: list[EventRecord] | None = None,
+        mentions_by_event: dict[str, list[MentionRecord]] | None = None,
+    ) -> list[tuple[EventRecord, list[MentionRecord]]]:
+        """Events LEFT JOIN Mentions — primary data path (Events-first).
+
+        Builds an Events index keyed by ``event_id`` and LEFT JOINs
+        Mentions lists on matching IDs.
+
+        Returns empty list when Events data is not available, triggering
+        the GKG fallback in ``fetch()``.
+
+        Args:
+            events_records: Parsed EventRecord list (may be None or empty).
+            mentions_by_event: Mentions grouped by event_id (may be None).
+
+        Returns:
+            List of ``(EventRecord, list[MentionRecord])`` tuples.
+            Tuples with no matching mentions get an empty mention list.
+        """
+        if not events_records:
+            logger.debug("merge_event_data: no Events data — returning empty list")
+            return []
+
+        mentions = mentions_by_event or {}
+        result: list[tuple[EventRecord, list[MentionRecord]]] = []
+
+        for ev in events_records:
+            ev_mentions = mentions.get(ev.event_id, [])
+            result.append((ev, ev_mentions))
+
+        logger.debug(
+            "merge_event_data (Events-first): %d events, %d with mentions",
+            len(result),
+            sum(1 for _, m in result if m),
+        )
+        return result
+
+    def _merge_gkg_data(
+        self,
         gkg_records: list[dict],
-        events_records: list[dict] | None = None,
-        mentions_by_event: dict[str, list] | None = None,
     ) -> list[dict]:
         """Passthrough merge — returns GKG records without Events/Mentions JOIN.
 
-        GKG ``global_event_id`` format (``20260718034500-0``) is incompatible with
-        Events CSV ``event_id`` format (``1314163330``).  These are different
-        ID namespaces and cannot be directly joined.
-
-        **GKG-Events decoupled (V2.3)**: Events and Mentions CSV data are still
-        downloaded (preserving infrastructure) but NOT joined to GKG records.
-        All Events/Mentions derived fields are set to ``None`` defaults.
-
-        If GDELT provides a cross-table lookup index in the future (e.g. via
-        Mentions DocumentIdentifier reverse lookup), the JOIN path can be restored.
+        Used by the GKG fallback path. Sets all Events/Mentions derived
+        fields to ``None`` (same as V2.3 behavior).
 
         Args:
             gkg_records: Parsed GKG records.
-            events_records: Ignored (preserved for future JOIN restoration).
-            mentions_by_event: Ignored (preserved for future JOIN restoration).
 
         Returns:
             List of GKG record dicts with Events/Mentions fields set to None.
@@ -773,10 +891,59 @@ class GdeltAdapter(BaseAdapter):
             merged.append(rec)
 
         logger.debug(
-            "merge_event_data passthrough: %d GKG records (Events/Mentions JOIN disabled)",
+            "_merge_gkg_data passthrough: %d GKG records",
             len(merged),
         )
         return merged
+
+    # ── Events pipeline helpers ──────────────────────────────────────
+
+    def _events_tuple_to_dict(
+        self,
+        event_record: EventRecord,
+        mentions: list[MentionRecord],
+        resolved_urls: list[str],
+    ) -> dict[str, Any]:
+        """Convert an (EventRecord, mentions) pair to a dict for ``normalize()``.
+
+        The returned dict carries the ``_event_record`` key so that
+        ``_normalize_event_record()`` can access the original EventRecord
+        for body generation.
+
+        Args:
+            event_record: The EventRecord.
+            mentions: List of MentionRecords for this event.
+            resolved_urls: Resolved URLs from mentions_first strategy.
+
+        Returns:
+            Dict with event fields for normalization.
+        """
+        # Build a valid_at string compatible with _parse_gkg_datetime
+        # Use event_date as basis: "2025-07-22" → "20250722000000"
+        event_date_raw = event_record.event_date.replace("-", "")
+        valid_at_str = f"{event_date_raw}000000"
+
+        return {
+            "cameo_code": event_record.cameo_code,
+            "actor1_code": event_record.actor1_code,
+            "actor1_name": event_record.actor1_name,
+            "actor2_code": event_record.actor2_code,
+            "actor2_name": event_record.actor2_name,
+            "goldstein_scale": event_record.goldstein_scale,
+            "avg_tone": event_record.avg_tone,
+            "event_date": event_record.event_date,
+            "source_url": resolved_urls[0] if resolved_urls else "",
+            "resolved_urls": resolved_urls,
+            "valid_at": valid_at_str,
+            "domain": "",
+            "themes": "",
+            "locations": "",
+            "persons": "",
+            "organizations": "",
+            "tone": "",
+            "_event_record": event_record,
+            "_mentions": mentions,
+        }
 
     # ── record-level methods ─────────────────────────────────────────
 
@@ -834,21 +1001,18 @@ class GdeltAdapter(BaseAdapter):
                 continue
 
             # Plan D check 2: non-authoritative -> macro theme match required
-            # GKG themes format: "THEME1;THEME2,123;THEME3,456"
-            # Use word boundary matching to avoid false positives like "WAR" matching "WARSAW"
             import re
             themes_text = (rec.get("themes") or "").upper()
-            
+
             # Check if any macro theme keyword appears as a whole word
             matched_theme = None
             for kw in self._macro_theme_keywords:
                 # Word boundary match: keyword must be surrounded by word boundaries
-                # This prevents "WAR" from matching "WARSAW" or "TRADE" from matching "TRADEMARK"
                 pattern = r'\b' + re.escape(kw) + r'\b'
                 if re.search(pattern, themes_text):
                     matched_theme = kw
                     break
-            
+
             if matched_theme:
                 matched.append(rec)
                 theme_passed += 1
@@ -866,12 +1030,17 @@ class GdeltAdapter(BaseAdapter):
             rejected,
         )
         return matched
+
     async def normalize(
         self,
         record: dict,
         fetch_results: dict[str, ContentResult] | None = None,
     ) -> NormalizedEpisode:
         """Convert a single merged record to NormalizedEpisode.
+
+        Routes to Events-specific normalization (``_normalize_event_record()``)
+        when the record is Events-derived (detected by presence of
+        ``_event_record`` key), otherwise falls through to GKG normalization.
 
         If ``fetch_results`` is provided, uses pre-fetched ContentResult
         from batch fetch to avoid per-URL fetch overhead.
@@ -884,6 +1053,11 @@ class GdeltAdapter(BaseAdapter):
         Returns:
             NormalizedEpisode with content_scope=MACRO in metadata.
         """
+        # Route to Events-specific normalization if applicable
+        if record.get("_event_record") is not None:
+            return await self._normalize_event_record(record, fetch_results)
+
+        # ── GKG normalization path (unchanged) ───────────────────────
         raw_dt = record.get("valid_at", "")
         valid_at = _parse_gkg_datetime(raw_dt)
 
@@ -978,13 +1152,144 @@ class GdeltAdapter(BaseAdapter):
             metadata={"content_scope": "MACRO"},
         )
 
+    async def _normalize_event_record(
+        self,
+        record: dict,
+        fetch_results: dict[str, ContentResult] | None = None,
+    ) -> NormalizedEpisode:
+        """Convert an Events-derived record dict to a NormalizedEpisode.
+
+        Uses the original ``EventRecord`` (stored in ``record["_event_record"]``)
+        and resolved URLs (stored in ``record["resolved_urls"]``) for
+        body generation and entity extraction.
+
+        Args:
+            record: Dict from ``_events_tuple_to_dict()``.
+            fetch_results: Optional pre-fetched content results.
+
+        Returns:
+            NormalizedEpisode with ``source_type="gdelt_events"``.
+        """
+        event_record: EventRecord = record["_event_record"]
+        resolved_urls: list[str] = record.get("resolved_urls", [])
+
+        # Parse valid_at from event_date
+        event_date_raw = event_record.event_date.replace("-", "")
+        valid_at_str = f"{event_date_raw}000000"
+        valid_at = _parse_gkg_datetime(valid_at_str)
+
+        # Severity from Goldstein scale
+        severity = _map_goldstein_to_severity(event_record.goldstein_scale)
+
+        # Source URL
+        source_url: str | None = resolved_urls[0] if resolved_urls else (
+            event_record.source_url if event_record.source_url else None
+        )
+
+        # Build episode body: prefer full_text, else CAMEO-centric summary
+        metadata: dict[str, Any] = {"content_scope": "MACRO", "content_fetched": False}
+        full_text: str | None = None
+
+        if self._content_fetcher and source_url:
+            if fetch_results and source_url in fetch_results:
+                result = fetch_results[source_url]
+                if result.success and result.text:
+                    full_text = result.text
+                    metadata["content_fetched"] = True
+                else:
+                    logger.debug(
+                        "Pre-fetched content failed for Events record %s: %s — using CAMEO summary",
+                        event_record.event_id,
+                        result.error,
+                    )
+            else:
+                try:
+                    result = self._content_fetcher.fetch(source_url)
+                    if result.success and result.text:
+                        full_text = result.text
+                        metadata["content_fetched"] = True
+                except Exception as exc:
+                    logger.debug(
+                        "ContentFetcher error for Events record %s: %s — using CAMEO summary",
+                        event_record.event_id,
+                        exc,
+                    )
+
+        if full_text:
+            # Full text available: use ONLY the article content (no CAMEO summary)
+            # This avoids data pollution from prepending redundant metadata
+            pure_text, yaml_meta = strip_yaml_front_matter(full_text)
+            body = pure_text
+            if yaml_meta:
+                metadata["extracted_metadata"] = yaml_meta
+        else:
+            # No full text: fall back to CAMEO summary (~300 chars)
+            body = _build_event_episode_body(event_record, resolved_urls)
+
+        content_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+        # Entities: actors as country entities
+        entities: list[EntityItem] = []
+        if event_record.actor1_name and event_record.actor1_name != event_record.actor1_code:
+            entities.append(EntityItem(
+                type="country",
+                name=event_record.actor1_name,
+            ))
+        if event_record.actor2_name and event_record.actor2_name != event_record.actor2_code:
+            entities.append(EntityItem(
+                type="country",
+                name=event_record.actor2_name,
+            ))
+
+        # Keywords: CAMEO code description
+        keywords: list[str] = []
+        cameo_desc = translate_cameo(event_record.cameo_code)
+        if cameo_desc:
+            keywords.append(cameo_desc)
+
+        name = NormalizedEpisode.make_name(
+            source_type="gdelt_events",
+            valid_at=valid_at,
+            content_hash=content_hash,
+            group_id=f"ev-{event_record.event_id}",
+        )
+
+        return NormalizedEpisode(
+            episode_body=body,
+            name=name,
+            source_description="GDELT Events V2",
+            source_type="gdelt_events",
+            source_url=source_url,
+            valid_at=valid_at,
+            content_hash=content_hash,
+            entities=entities,
+            severity=severity,
+            keywords=keywords,
+            metadata=metadata,
+        )
+
     # ── fetch orchestration ──────────────────────────────────────────
 
     async def fetch(self, **kwargs: Any) -> list[dict]:
-        """Full fetch pipeline: lastupdate → download_all → merge → filter.
+        """Full fetch pipeline: Events-first → GKG fallback.
 
-        Falls back to GKG-only mode when all three CSV sources fail.
-        Partial failure (e.g. only GKG available) doesn't trigger degraded.
+        Events-first (primary):
+            1. Download and parse Events + Mentions + GKG CSVs.
+            2. LEFT JOIN Events with Mentions.
+            3. Apply EventsPipelineFilter (CAMEO → Goldstein → NumMentions).
+            4. Resolve URLs from Mentions (mentions_first strategy).
+            5. If results exist → return events dicts.
+
+        GKG fallback (when Events produce 0 results):
+            1. Parse GKG records.
+            2. Passthrough merge (set Events/Mentions fields to None).
+            3. Plan D filter (authoritative domain OR macro theme match).
+            4. Return filtered GKG records.
+
+        If all CSV downloads fail, returns cached records from last successful run.
+
+        Returns:
+            List of merged record dicts (Events-derived or GKG-derived).
         """
         try:
             # Step 1: Get all three URLs
@@ -995,41 +1300,58 @@ class GdeltAdapter(BaseAdapter):
                 events_url, mentions_url, gkg_url
             )
 
-            # Check: did we get at least GKG data?
+            # Step 3: Events-first path
+            if events_records:
+                events_passed = await self._run_events_pipeline(
+                    events_records, mentions_by_event
+                )
+                if events_passed:
+                    logger.info(
+                        "Events-first pipeline: %d events passed all filters",
+                        len(events_passed),
+                    )
+                    self._pre_filter_count = len(events_records)
+                    self._last_records = events_passed
+                    return events_passed
+
+                logger.info(
+                    "Events pipeline returned 0 records — falling back to GKG "
+                    "(events=%d parsed, all filtered out)",
+                    len(events_records),
+                )
+
+            # Step 4: GKG fallback
             if not gkg_records:
                 logger.warning("GKG records are empty, falling back to cached records")
                 return self._last_records
 
-            # Step 3: Merge by GlobalEventID (LEFT JOIN)
-            merged_records = self.merge_event_data(
-                gkg_records=gkg_records,
-                events_records=events_records if events_records else None,
-                mentions_by_event=mentions_by_event if mentions_by_event else None,
-            )
-
-            # Step 4: Dual-layer filter
-            self._pre_filter_count = len(merged_records)
-            filtered = self.filter_relevant(merged_records)
+            merged_gkg = self._merge_gkg_data(gkg_records)
+            self._pre_filter_count = len(merged_gkg)
+            filtered = self.filter_relevant(merged_gkg)
+            # Mark as degraded (Events tried but failed)
+            for rec in filtered:
+                rec["_degraded"] = True
             self._last_records = filtered
             return filtered
 
         except GdeltFetchError as exc:
-            # All three URLs failed — fall back to GKG-only mode
+            # All URLs failed — fall back to cached records
             logger.warning(
-                "GDELT triple-source fetch failed: %s. "
-                "Falling back to GKG-only mode with %d cached records.",
+                "GDELT fetch failed: %s. Returning %d cached records.",
                 exc,
                 len(self._last_records),
             )
             if not self._last_records:
-                # No cached records — try GKG-only fallback
+                # Try GKG-only fallback
                 try:
                     gkg_url = self._fallback_fetch_gkg_only()
                     csv_path = self.download_gkg(gkg_url)
                     gkg_records = self.parse_gkg(csv_path)
-                    merged = self.merge_event_data(gkg_records)
+                    merged = self._merge_gkg_data(gkg_records)
                     self._pre_filter_count = len(merged)
                     filtered = self.filter_relevant(merged)
+                    for rec in filtered:
+                        rec["_degraded"] = True
                     self._last_records = filtered
                 except Exception as fallback_exc:
                     logger.warning(
@@ -1037,17 +1359,51 @@ class GdeltAdapter(BaseAdapter):
                         fallback_exc,
                     )
                     return self._last_records
-
-            # Mark degraded episodes
-            for rec in self._last_records:
-                rec["_degraded"] = True
             return self._last_records
+
+    async def _run_events_pipeline(
+        self,
+        events_records: list[EventRecord],
+        mentions_by_event: dict[str, list[MentionRecord]],
+    ) -> list[dict]:
+        """Run the Events-first pipeline: merge → filter → resolve URLs → to dicts.
+
+        Args:
+            events_records: Parsed EventRecord list.
+            mentions_by_event: Mentions grouped by event_id.
+
+        Returns:
+            List of dicts suitable for ``normalize()``, or empty list if
+            all events were filtered out.
+        """
+        # Step 1: Events LEFT JOIN Mentions
+        merged = self.merge_event_data(events_records, mentions_by_event)
+        if not merged:
+            return []
+
+        # Step 2: Three-stage filter
+        config = self._events_filter._load_config()
+        filtered = self._events_filter.filter(events_records, mentions_by_event)
+        if not filtered:
+            return []
+
+        # Step 3: Resolve URLs and convert to dicts
+        result: list[dict] = []
+        for event_rec, mentions in filtered:
+            resolved_urls = self._events_filter.resolve_urls(
+                event_rec, mentions, config
+            )
+            record_dict = self._events_tuple_to_dict(
+                event_rec, mentions, resolved_urls
+            )
+            result.append(record_dict)
+
+        return result
 
     def _fallback_fetch_gkg_only(self) -> str:
         """Fallback: fetch only the GKG URL from lastupdate.txt.
 
-        Used when triple-source fetch fails completely. Returns only
-        the GKG CSV URL by re-fetching lastupdate.txt.
+        Used when Events-first and triple-source fetch both fail.
 
         Returns:
             GKG CSV URL string.
@@ -1055,7 +1411,6 @@ class GdeltAdapter(BaseAdapter):
         Raises:
             GdeltFetchError: If fetching GKG URL fails.
         """
-        # Re-fetch just the GKG URL using the original single-URL logic
         retry_dec = self._make_retry_decorator()
 
         @retry_dec
@@ -1085,10 +1440,12 @@ class GdeltAdapter(BaseAdapter):
     async def run(self, **kwargs: Any) -> list[NormalizedEpisode]:
         """Full pipeline with batch content fetch + degraded metadata.
 
-        Phase 1: Fetch raw GDELT records.
-        Phase 2: Batch-fetch all article source URLs using NewsSpider.
-        Phase 3: Normalize each record (passing pre-fetched content).
-        Phase 4: Dedup + degraded metadata tagging.
+        V3.0 Events-first pipeline flow:
+            1. Fetch raw records (Events-first → GKG fallback).
+            2. Batch-fetch all article source URLs using ContentFetcher.
+            3. Normalize each record (Events path → _normalize_event_record,
+               GKG path → normalize).
+            4. Dedup + degraded metadata tagging.
         """
         records = await self.fetch(**kwargs)
 
@@ -1099,9 +1456,12 @@ class GdeltAdapter(BaseAdapter):
         fetch_results: dict[str, ContentResult] = {}
         if self._content_fetcher and source_urls:
             try:
-                results = await self._content_fetcher.fetch_batch(source_urls)
+                # 30s timeout per batch to avoid hanging on slow/Cloudflare sites
+                results = await self._content_fetcher.fetch_batch(
+                    source_urls, batch_timeout=30.0
+                )
                 fetch_results = {r.url: r for r in results}
-                logger.debug(
+                logger.info(
                     "Batch-fetched %d/%d GDELT article contents",
                     sum(1 for r in results if r.success),
                     len(results),

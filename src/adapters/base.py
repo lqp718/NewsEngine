@@ -85,12 +85,8 @@ class BaseAdapter(ABC):
         return result
 
     async def run(self, **kwargs: Any) -> list[NormalizedEpisode]:
-        """Full pipeline: fetch → normalize → dedup.
-
-        Convenience method that chains the three stages.
-        """
-        records = await self.fetch(**kwargs)
-        # Normalize all records concurrently since normalize() is now async
+        """Full pipeline: fetch → normalize → dedup."""
         import asyncio
+        records = await self.fetch(**kwargs)
         episodes = await asyncio.gather(*[self.normalize(r) for r in records])
         return self.dedup(episodes)

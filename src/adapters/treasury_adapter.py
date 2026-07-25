@@ -107,7 +107,7 @@ class TreasuryAdapter(BaseAdapter):
         """Build yield curve body text. Delegates to module-level function."""
         return _build_yield_curve_body(term_rates, date_str)
 
-    def normalize(self, record: dict) -> NormalizedEpisode:
+    async def normalize(self, record: dict) -> NormalizedEpisode:
         """Convert a Treasury yield curve record to NormalizedEpisode.
 
         Args:
