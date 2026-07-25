@@ -288,13 +288,20 @@ class NewsSpider(Spider):
     name = "news_spider"
     concurrent_requests = DEFAULT_CONCURRENT_REQUESTS
     concurrent_requests_per_domain = DEFAULT_CONCURRENT_PER_DOMAIN
-    logging_level = logging.WARNING  # Suppress INFO logs; respect user's LOG_LEVEL setting
+    # logging_level is set in __init__ from Settings.log_level
 
     def __init__(
         self,
         urls: list[str],
         timeout_ms: int = DEFAULT_TIMEOUT_MS,
     ) -> None:
+        # Set logging_level BEFORE super().__init__() because Scrapling
+        # uses it to configure the logger during initialization
+        from src.core.config import get_settings
+        settings = get_settings()
+        level_name = settings.log_level.upper()
+        self.logging_level = getattr(logging, level_name, logging.WARNING)
+
         super().__init__(crawldir=None)
 
         self._urls = urls
@@ -485,7 +492,13 @@ async def fetch_urls_with_spider(
         async for item in spider.stream():
             stream_items.append(item)
     finally:
-        pass  # stream()'s finally block handles engine cleanup
+        # Explicitly close session manager to prevent "Event loop is closed"
+        # errors on exit. Scrapling's stream() doesn't do this automatically.
+        # Ignore errors from lazy sessions that were never started.
+        try:
+            await spider._session_manager.close()
+        except (RuntimeError, Exception):
+            pass
 
     return spider._collect_results(stream_items)
 
