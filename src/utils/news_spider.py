@@ -122,10 +122,6 @@ def _patch_cloudflare_solver():
 # Apply patch on module import
 _patch_cloudflare_solver()
 
-# Set Scrapling spider engine log level to INFO to prevent DEBUG from
-# printing full HTML (multi-MB pages → OOM).  See newsengine-spider-oom-fix.
-logging.getLogger("scrapling.spiders.engine").setLevel(logging.INFO)
-
 
 # ── Configuration ──────────────────────────────────────────────────────
 
@@ -209,6 +205,7 @@ class NewsSpider(Spider):
     name = "news_spider"
     concurrent_requests = DEFAULT_CONCURRENT_REQUESTS
     concurrent_requests_per_domain = DEFAULT_CONCURRENT_PER_DOMAIN
+    logging_level = logging.INFO  # Override Scrapling's default DEBUG to prevent OOM
 
     def __init__(
         self,
