@@ -494,11 +494,22 @@ async def fetch_urls_with_spider(
     finally:
         # Explicitly close session manager to prevent "Event loop is closed"
         # errors on exit. Scrapling's stream() doesn't do this automatically.
-        # Ignore errors from lazy sessions that were never started.
+        # Also force-close lazy sessions that were never started — their
+        # underlying patchright subprocess would otherwise trigger
+        # "Event loop is closed" when __del__ runs after the loop is gone.
         try:
             await spider._session_manager.close()
         except (RuntimeError, Exception):
             pass
+        # Force-close any remaining lazy sessions
+        for sid in list(spider._session_manager._lazy_sessions):
+            session = spider._session_manager._sessions.get(sid)
+            if session is not None:
+                try:
+                    await session.__aexit__(None, None, None)
+                except (RuntimeError, Exception):
+                    pass
+        spider._session_manager._lazy_sessions.clear()
 
     return spider._collect_results(stream_items)
 

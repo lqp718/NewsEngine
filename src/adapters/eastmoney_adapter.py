@@ -403,7 +403,7 @@ class EastMoneyAdapter(BaseAdapter):
             entities.append(EntityItem(**kwargs))
 
         name = NormalizedEpisode.make_name(
-            source_type="akshare",
+            source_type="eastmoney",
             valid_at=valid_at,
             content_hash=content_hash,
             group_id=symbol,
@@ -413,7 +413,7 @@ class EastMoneyAdapter(BaseAdapter):
             episode_body=episode_body,
             name=name,
             source_description=f"EastMoney Stock News: {symbol} ({ticker_name})",
-            source_type="akshare",
+            source_type="eastmoney",
             source_url=record.get("link") or None,
             valid_at=valid_at,
             content_hash=content_hash,
