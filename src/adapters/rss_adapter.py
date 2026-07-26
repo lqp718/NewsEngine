@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import socket
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import feedparser
@@ -23,6 +23,8 @@ _RSS_SOCKET_TIMEOUT: int = 15
 
 from src.adapters.base import BaseAdapter
 from src.adapters.models import NormalizedEpisode
+from src.core.config import get_settings
+from src.ingestion.severity_enricher import rule_based_severity
 from src.utils.content_fetcher import ContentResult
 from src.utils.logging_config import get_logger
 from src.utils.time_utils import now_hkt
@@ -227,6 +229,7 @@ class RssAdapter(BaseAdapter):
         episodes = await asyncio.gather(
             *[self.normalize(r, fetch_results=fetch_results) for r in records],
         )
+        episodes = [e for e in episodes if e is not None]
         return self.dedup(list(episodes))
 
     # ── normalization ────────────────────────────────────────────────
@@ -251,6 +254,18 @@ class RssAdapter(BaseAdapter):
         link = record.get("link", "") or None
         summary = record.get("summary", "") or None
         feed_url = record.get("feed_url", "unknown")
+
+        # Date window cutoff — drop entries older than news_max_age_days
+        settings = get_settings()
+        valid_at_candidate = _extract_published(record)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=settings.news_max_age_days)
+        if valid_at_candidate < cutoff:
+            logger.debug(
+                "RSS entry '%s' older than %d days — dropping",
+                title[:50],
+                settings.news_max_age_days,
+            )
+            return None
 
         # Feed name from URL
         feed_name = feed_url.split("/")[2] if "//" in feed_url else "feed"
@@ -306,8 +321,11 @@ class RssAdapter(BaseAdapter):
             episode_body = _build_episode_body(title, summary)
 
         content_hash = hashlib.sha256(episode_body.encode("utf-8")).hexdigest()
-        valid_at = _extract_published(record)
+        valid_at = valid_at_candidate
         keywords = _extract_keywords(title)
+
+        # Severity via rule-based enricher
+        severity = rule_based_severity(episode_body)
 
         name = NormalizedEpisode.make_name(
             source_type="rss",
@@ -324,7 +342,7 @@ class RssAdapter(BaseAdapter):
             source_url=link,
             valid_at=valid_at,
             content_hash=content_hash,
-            severity="medium",
+            severity=severity,
             keywords=keywords,
             entities=[],
             metadata=metadata,
