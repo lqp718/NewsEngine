@@ -25,6 +25,7 @@ from src.adapters.models import EntityItem, NormalizedEpisode
 from src.utils.content_fetcher import ContentResult
 from src.utils.logging_config import get_logger
 from src.utils.time_utils import now_hkt
+from src.utils.yaml_parser import strip_yaml_front_matter
 
 logger = get_logger(__name__)
 
@@ -353,7 +354,9 @@ class EastMoneyAdapter(BaseAdapter):
         if fetch_results and link and link in fetch_results:
             result = fetch_results[link]
             if result.success and result.text:
-                full_text = result.text
+                # Strip YAML front matter from Trafilatura extract_with_metadata
+                pure_text, _yaml_meta = strip_yaml_front_matter(result.text)
+                full_text = pure_text
             else:
                 logger.debug(
                     "Pre-fetched content failed for %s: %s — using API summary",

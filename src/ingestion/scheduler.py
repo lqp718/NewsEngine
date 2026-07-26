@@ -765,10 +765,12 @@ class IngestionScheduler:
         if self._rss_adapter is not None:
             adapters_to_run.append((self._rss_adapter, "rss"))
 
-        # Stock pipeline: EastMoney (primary) + AkShare (fallback)
+        # Stock pipeline: EastMoney (primary) → AkShare (fallback)
+        # Same logic as _run_cycle: only run AkShare if EastMoney returns 0 episodes
         if self._eastmoney_adapter is not None:
             adapters_to_run.append((self._eastmoney_adapter, "eastmoney"))
-        if self._akshare_adapter is not None:
+        elif self._akshare_adapter is not None:
+            # EastMoney not configured, use AkShare directly
             adapters_to_run.append((self._akshare_adapter, "akshare"))
 
         if not adapters_to_run:
@@ -780,7 +782,11 @@ class IngestionScheduler:
             len(adapters_to_run),
         )
 
-        for adapter, source_name in adapters_to_run:
+        # Use index-based loop to support dynamic fallback (appending AkShare if EastMoney fails)
+        idx = 0
+        while idx < len(adapters_to_run):
+            adapter, source_name = adapters_to_run[idx]
+            idx += 1
             source_type = getattr(adapter, "SOURCE_TYPE", source_name)
             logger.info("Dry-run: running %s...", source_type)
             try:
@@ -798,6 +804,10 @@ class IngestionScheduler:
                         result.episode_count,
                         result.elapsed_seconds,
                     )
+                    # Stock pipeline: if EastMoney returned episodes, skip AkShare fallback
+                    if source_name == "eastmoney" and result.episode_count > 0:
+                        logger.info("EastMoney returned %d episodes, skipping AkShare fallback", result.episode_count)
+                        break
                 else:
                     logger.error(
                         "Dry-run [%s]: FAILED after %.1fs: %s",
@@ -805,6 +815,10 @@ class IngestionScheduler:
                         result.elapsed_seconds,
                         result.error,
                     )
+                    # EastMoney failed, try AkShare fallback
+                    if source_name == "eastmoney" and self._akshare_adapter is not None:
+                        logger.info("EastMoney failed, falling back to AkShare")
+                        adapters_to_run.append((self._akshare_adapter, "akshare"))
             except Exception as exc:
                 logger.error(
                     "Dry-run [%s] threw unhandled exception: %s",
@@ -819,6 +833,10 @@ class IngestionScheduler:
                         error=exc,
                     )
                 )
+                # EastMoney threw exception, try AkShare fallback
+                if source_name == "eastmoney" and self._akshare_adapter is not None:
+                    logger.info("EastMoney threw exception, falling back to AkShare")
+                    adapters_to_run.append((self._akshare_adapter, "akshare"))
 
         logger.info(
             "=== Dry-run cycle complete: %d/%d adapters successful ===",
