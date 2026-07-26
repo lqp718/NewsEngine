@@ -117,6 +117,7 @@ def _build_unclassified_query() -> str:
         MATCH (e:Episodic)
         WHERE e.severity IS NULL
            OR e.severity = ''
+           OR e.severity = 'medium'
         RETURN e.uuid AS uuid, e.content AS body,
                0 AS source_count
         LIMIT 50

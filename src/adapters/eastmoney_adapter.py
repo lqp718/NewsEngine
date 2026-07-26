@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import html as html_lib
 import json
 import re
 import time
@@ -22,6 +23,8 @@ from urllib.parse import quote
 
 from src.adapters.base import BaseAdapter
 from src.adapters.models import EntityItem, NormalizedEpisode
+from src.core.config import get_settings
+from src.ingestion.severity_enricher import rule_based_severity
 from src.utils.content_fetcher import ContentResult
 from src.utils.logging_config import get_logger
 from src.utils.time_utils import now_hkt
@@ -55,9 +58,14 @@ _HEADERS_TEMPLATE = {
 }
 
 
-def _strip_em_tags(text: str) -> str:
-    """Remove ``<em>`` / ``</em>`` highlight tags from API response text."""
-    return text.replace("<em>", "").replace("</em>", "")
+def _strip_html(text: str) -> str:
+    """Remove all HTML tags and decode entities."""
+    if not text:
+        return ""
+    text = re.sub(r'<[^>]+>', '', text)
+    text = html_lib.unescape(text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
 
 
 def _build_jsonp_callback() -> tuple[str, str, str]:
@@ -254,8 +262,8 @@ class EastMoneyAdapter(BaseAdapter):
             articles = self._fetch_single(name)
             for article in articles:
                 # Parse fields from raw API response
-                title = _strip_em_tags(article.get("title", ""))
-                content = _strip_em_tags(article.get("content", ""))
+                title = _strip_html(article.get("title", ""))
+                content = _strip_html(article.get("content", ""))
                 date_str = article.get("date", "")
                 media_name = article.get("mediaName", "")
                 code = article.get("code", "")
@@ -325,6 +333,7 @@ class EastMoneyAdapter(BaseAdapter):
         episodes = await asyncio.gather(
             *[self.normalize(r, fetch_results=fetch_results) for r in records],
         )
+        episodes = [e for e in episodes if e is not None]
         return self.dedup(list(episodes))
 
     # ── normalization ────────────────────────────────────────────────
@@ -339,9 +348,9 @@ class EastMoneyAdapter(BaseAdapter):
         If ``fetch_results`` is provided, uses the pre-fetched ContentResult
         to get full article text. Falls back to API summary on failure.
         """
-        title = _strip_em_tags(record.get("title", ""))
+        title = _strip_html(record.get("title", ""))
         content_raw = record.get("content", "")
-        api_summary = _strip_em_tags(content_raw) if content_raw else None
+        api_summary = _strip_html(content_raw) if content_raw else None
         link = record.get("link", "") or None
         symbol = record.get("symbol", "")
         ticker_name = record.get("_ticker_name", "")
@@ -367,9 +376,17 @@ class EastMoneyAdapter(BaseAdapter):
         # Build episode body: prefer full_text, fall back to API summary
         content = full_text or api_summary
         episode_body = _build_episode_body(title, content)
+        severity = rule_based_severity(episode_body)
         content_hash = hashlib.sha256(episode_body.encode("utf-8")).hexdigest()
         valid_at = _parse_eastmoney_time(record.get("time"))
         keywords = _extract_keywords(title)
+
+        # Date window cutoff — discard articles older than news_max_age_days
+        settings = get_settings()
+        max_age_days = settings.news_max_age_days
+        cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+        if valid_at < cutoff:
+            return None  # type: ignore[return-value]
 
         # Build entity from whitelist metadata
         entities: list[EntityItem] = []
@@ -400,7 +417,7 @@ class EastMoneyAdapter(BaseAdapter):
             source_url=record.get("link") or None,
             valid_at=valid_at,
             content_hash=content_hash,
-            severity="medium",
+            severity=severity,
             keywords=keywords,
             entities=entities,
             metadata={

@@ -181,6 +181,12 @@ class Settings(BaseSettings):
         description="GDELT 宏观主题白名单常量文件路径，V2.2",
     )
     
+    # === News Age Filter ===
+    news_max_age_days: int = Field(
+        14,
+        description="Maximum age of news articles in days (older articles are discarded)",
+    )
+
     # === Scheduler Cycle Guard (V2.3) ===
     min_cycle_gap_sec: int = Field(
         60,

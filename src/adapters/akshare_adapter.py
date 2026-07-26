@@ -8,11 +8,15 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import html as html_lib
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from src.adapters.base import BaseAdapter
 from src.adapters.models import EntityItem, NormalizedEpisode
+from src.core.config import get_settings
+from src.ingestion.severity_enricher import rule_based_severity
 from src.utils.content_fetcher import ContentResult
 from src.utils.logging_config import get_logger
 from src.utils.time_utils import now_hkt
@@ -74,9 +78,18 @@ def _build_episode_body(title: str, content: str | None) -> str:
     return body
 
 
+def _strip_html(text: str) -> str:
+    """Remove all HTML tags and decode entities."""
+    if not text:
+        return ""
+    text = re.sub(r'<[^>]+>', '', text)
+    text = html_lib.unescape(text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
 def _extract_keywords(title: str) -> list[str]:
     """Simple keyword extraction from title."""
-    import re
     words = re.findall(r"[A-Za-z\u4e00-\u9fff]+", title)
     return words[:8]
 
@@ -209,6 +222,7 @@ class AkShareAdapter(BaseAdapter):
         episodes = await asyncio.gather(
             *[self.normalize(r, fetch_results=fetch_results) for r in records],
         )
+        episodes = [e for e in episodes if e is not None]
         return self.dedup(list(episodes))
 
     # ── normalization ────────────────────────────────────────────────
@@ -223,8 +237,8 @@ class AkShareAdapter(BaseAdapter):
         If ``fetch_results`` is provided, uses the pre-fetched ContentResult
         to get full article text. Falls back to API summary on failure.
         """
-        title = record.get("title", "")
-        api_summary = record.get("content", "") or None
+        title = _strip_html(record.get("title", ""))
+        api_summary = _strip_html(record.get("content", "")) or None
         link = record.get("link", "") or None
         symbol = record.get("symbol", "")
         ticker_name = record.get("_ticker_name", "")
@@ -248,9 +262,17 @@ class AkShareAdapter(BaseAdapter):
         # Build episode body: prefer full_text, fall back to API summary
         content = full_text or api_summary
         episode_body = _build_episode_body(title, content)
+        severity = rule_based_severity(episode_body)
         content_hash = hashlib.sha256(episode_body.encode("utf-8")).hexdigest()
         valid_at = _parse_akshare_time(record.get("time"))
         keywords = _extract_keywords(title)
+
+        # Date window cutoff — discard articles older than news_max_age_days
+        settings = get_settings()
+        max_age_days = settings.news_max_age_days
+        cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+        if valid_at < cutoff:
+            return None  # type: ignore[return-value]
 
         # Build entity from whitelist metadata (includes sector/exchange hints)
         entities: list[EntityItem] = []
@@ -282,7 +304,7 @@ class AkShareAdapter(BaseAdapter):
             source_url=record.get("link") or None,
             valid_at=valid_at,
             content_hash=content_hash,
-            severity="medium",
+            severity=severity,
             keywords=keywords,
             entities=entities,
             metadata={"content_scope": "SYMBOL", "symbol": symbol},
