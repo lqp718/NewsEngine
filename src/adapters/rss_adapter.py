@@ -3,8 +3,8 @@
 Supports multiple feed URLs, RSS 2.0 and Atom formats, and dedup by
 link/guid.
 
-V2.2: Removed ticker whitelist filtering. RSS now applies zero
-pre-ingestion filtering — all entries are preserved.
+V2.3: Added content relevance filtering (keyword whitelist + domain blacklist)
+to filter out non-trading-related news (e.g., BBC general news).
 """
 
 from __future__ import annotations
@@ -66,6 +66,74 @@ def _extract_keywords(title: str) -> list[str]:
     words = re.findall(r"[A-Za-z\u4e00-\u9fff]+", title)
     # Return shorter words list as keywords
     return words[:8]
+
+
+# ── Content Relevance Filter ─────────────────────────────────────────
+
+# Keywords that indicate trading/market relevance (case-insensitive)
+RSS_RELEVANCE_KEYWORDS = [
+    # English
+    "fed", "ecb", "rate", "inflation", "gdp", "oil", "gold", "copper",
+    "tariff", "trade", "market", "stock", "bond", "forex", "currency",
+    "central bank", "monetary policy", "interest rate", "treasury",
+    "commodity", "crude", "natural gas", "silver", "platinum",
+    "geopolitical", "sanction", "embargo", "war", "conflict",
+    "earnings", "revenue", "profit", "loss", "ipo", "merger", "acquisition",
+    "recession", "growth", "employment", "unemployment", "cpi", "ppi",
+    # Chinese
+    "央行", "利率", "通胀", "关税", "贸易", "股市", "债券", "汇率",
+    "原油", "黄金", "白银", "铜", "天然气", "大宗商品",
+    "地缘政治", "制裁", "禁运", "战争", "冲突",
+    "财报", "营收", "利润", "亏损", "ipo", "并购", "收购",
+    "衰退", "增长", "就业", "失业", "cpi", "ppi",
+]
+
+# Domains to exclude (too general, not trading-focused)
+RSS_BLACKLIST_DOMAINS = [
+    "bbc.com",
+    "bbc.co.uk",
+    "bbci.co.uk",  # BBC RSS feeds subdomain
+]
+
+
+def _is_trading_relevant(title: str, summary: str | None, feed_url: str) -> bool:
+    """Check if an RSS entry is relevant to trading/markets.
+
+    Args:
+        title: Article title
+        summary: Article summary/description (optional)
+        feed_url: Source feed URL
+
+    Returns:
+        True if relevant, False if should be filtered out
+    """
+    import re
+
+    # Domain blacklist check
+    for domain in RSS_BLACKLIST_DOMAINS:
+        if domain in feed_url.lower():
+            logger.debug(
+                "RSS entry filtered by domain blacklist: %s (feed: %s)",
+                title[:50],
+                feed_url,
+            )
+            return False
+
+    # Keyword whitelist check (title + summary)
+    # Use word boundary matching to avoid false positives (e.g., "market" in "supermarket")
+    text = (title + " " + (summary or "")).lower()
+    for keyword in RSS_RELEVANCE_KEYWORDS:
+        # Use word boundary \b for precise matching
+        pattern = r'\b' + re.escape(keyword.lower()) + r'\b'
+        if re.search(pattern, text):
+            return True
+
+    # No keyword match — filter out
+    logger.debug(
+        "RSS entry filtered by keyword whitelist: %s",
+        title[:50],
+    )
+    return False
 
 
 class RssAdapter(BaseAdapter):
@@ -174,7 +242,7 @@ class RssAdapter(BaseAdapter):
     async def fetch(self, **kwargs: Any) -> list[dict]:
         """Fetch entries from all configured RSS feeds.
 
-        V2.2: Zero pre-ingestion filtering. Every entry is preserved.
+        V2.3: Apply content relevance filtering (keyword whitelist + domain blacklist).
         """
         all_entries: list[dict] = []
         if not self.feed_urls:
@@ -185,12 +253,23 @@ class RssAdapter(BaseAdapter):
             entries = self._fetch_single(feed_url)
             all_entries.extend(entries)
 
+        # V2.3: Apply relevance filtering
+        filtered_entries = [
+            e for e in all_entries
+            if _is_trading_relevant(
+                e.get("title", ""),
+                e.get("summary", ""),
+                e.get("feed_url", ""),
+            )
+        ]
+
         logger.info(
-            "RSS fetch: %d entries from %d feeds (no filtering)",
+            "RSS fetch: %d entries → %d after filtering (%.1f%% filtered)",
             len(all_entries),
-            len(self.feed_urls),
+            len(filtered_entries),
+            (1 - len(filtered_entries) / len(all_entries)) * 100 if all_entries else 0,
         )
-        return all_entries
+        return filtered_entries
 
     # ── run override — batch fetch + normalize ──────────────────────
 
