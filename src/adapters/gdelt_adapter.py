@@ -1458,7 +1458,7 @@ class GdeltAdapter(BaseAdapter):
             try:
                 # 30s timeout per batch to avoid hanging on slow/Cloudflare sites
                 results = await self._content_fetcher.fetch_batch(
-                    source_urls, batch_timeout=30.0
+                    source_urls, batch_timeout=60.0
                 )
                 fetch_results = {r.url: r for r in results}
                 logger.info(

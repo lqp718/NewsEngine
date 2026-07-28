@@ -58,6 +58,9 @@ BATCH_SIZE: int = 50
 BATCH_COOLDOWN_SEC: float = 1.0
 """Cooldown seconds between batches."""
 
+BATCH_TIMEOUT_SEC: float = 60.0
+"""Default timeout in seconds for each batch of URLs."""
+
 SPIDER_MAX_PAGES: int = 5
 """Max pages per AsyncStealthySession instance."""
 
@@ -168,7 +171,7 @@ class ContentFetcher:
         return await self._fetch_single(url)
 
     async def fetch_batch(
-        self, urls: list[str], batch_timeout: float | None = None
+        self, urls: list[str], batch_timeout: float | None = BATCH_TIMEOUT_SEC
     ) -> list[ContentResult]:
         """Fetch multiple URLs using NewsSpider.
 

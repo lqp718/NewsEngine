@@ -1,13 +1,22 @@
 """NewsSpider — concurrent URL fetcher with anti-bot bypass and domain rate-limiting.
 
+V5.0: Camoufox integration for Tier 2 stealth.
+
 Uses Scrapling's official ``scrapling.spiders.Spider`` base class with:
 
-- ``FetcherSession(impersonate="chrome")`` for fast requests (sid="fast")
-- ``AsyncStealthySession(solve_cloudflare=True, humanize=True)`` for blocked requests
-  (sid="stealth", lazy=True)
-- Automatic fallback via ``retry_blocked_request()`` — when the fast session gets
-  blocked (HTTP 403/429/503), the request is automatically retried via the stealth
-  session.
+- ``FetcherSession(impersonate="chrome")`` for fast requests (Tier 1)
+  - Uses curl_cffi with chrome146 TLS fingerprint
+- ``Camoufox`` (patched Firefox) for blocked requests (Tier 2)
+  - C++ level fingerprint spoofing, Juggler protocol (no CDP detection)
+  - Shared browser instance with concurrent page pool (max 2)
+  - 20s timeout for fast failure
+
+Architecture:
+    Tier 1: FetcherSession (curl_cffi, chrome146) → fast, ~1s/page
+        ↓ blocked (403/429/503 + CF challenge)
+    Tier 2: Camoufox (Firefox, C++ stealth) → stealth, ~5-15s/page
+        ↓ failed
+    Mark as failed, return to caller
 
 Usage::
 
@@ -15,8 +24,8 @@ Usage::
         urls=["https://example.com/a", "https://example.com/b"],
         timeout_ms=30000,
     )
-    for url, response in results:
-        print(url, response.status, len(response.html_content or ""))
+    for result in results:
+        print(result.url, result.status, len(result.html_content or ""))
 """
 
 from __future__ import annotations
@@ -25,102 +34,12 @@ import asyncio
 import logging
 from typing import Any
 
-from scrapling.fetchers import AsyncStealthySession, FetcherSession
+from scrapling.fetchers import FetcherSession
 from scrapling.spiders import Request, Response, Spider
 
 from src.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
-
-
-# ── Monkey-patch: fix scrapling's Cloudflare solver bugs ──────
-# 1. "managed" type is incorrectly handled like "interactive" (clicks checkbox)
-#    but "managed" is a JS auto-challenge that needs NO interaction.
-# 2. _cloudflare_solver() recurses infinitely when challenge can't be solved.
-# See: https://github.com/D4Vinci/Scrapling/pull/330 (closed, not merged)
-
-_MAX_CF_SOLVER_DEPTH = 3
-_cf_solver_depths: dict = {}  # page -> current depth
-
-
-def _patch_cloudflare_solver():
-    """Patch AsyncStealthySession._cloudflare_solver to:
-    1. Treat 'managed' type like 'non-interactive' (wait, don't click)
-    2. Add max recursion depth to prevent infinite loops
-    """
-    try:
-        from scrapling.engines._browsers._stealth import AsyncStealthySession
-        from scrapling.engines._browsers._base import StealthySessionMixin
-    except ImportError:
-        logger.warning("Could not import AsyncStealthySession for Cloudflare solver patch")
-        return
-
-    original_solver = AsyncStealthySession._cloudflare_solver
-    detect_cloudflare = StealthySessionMixin._detect_cloudflare
-
-    async def _patched_solver(self, page):
-        """Patched solver: fix 'managed' type + depth limit."""
-        # Get current depth for this page
-        depth = _cf_solver_depths.get(page, 0)
-        
-        if depth >= _MAX_CF_SOLVER_DEPTH:
-            logger.warning(
-                f"Cloudflare solver reached max depth ({_MAX_CF_SOLVER_DEPTH}), giving up"
-            )
-            _cf_solver_depths.pop(page, None)
-            return None
-
-        # Increment depth
-        _cf_solver_depths[page] = depth + 1
-
-        try:
-            # Detect challenge type
-            from scrapling.engines.toolbelt.convertor import ResponseFactory
-            page_content = await ResponseFactory._get_async_page_content(page)
-            challenge_type = detect_cloudflare(page_content)
-
-            if not challenge_type:
-                logger.error("No Cloudflare challenge found.")
-                return None
-
-            logger.info(f'Cloudflare challenge type: "{challenge_type}"')
-
-            # FIX: Treat "managed" like "non-interactive" (wait, don't click)
-            # "managed" is a JS auto-challenge, no user interaction needed
-            if challenge_type in ("non-interactive", "managed"):
-                logger.info(f"Waiting for {challenge_type} challenge to resolve...")
-                max_wait = 30  # seconds
-                waited = 0
-                while "<title>Just a moment...</title>" in page_content and waited < max_wait:
-                    await page.wait_for_timeout(1000)
-                    waited += 1
-                    page_content = await ResponseFactory._get_async_page_content(page)
-                
-                if "<title>Just a moment...</title>" not in page_content:
-                    logger.info("Cloudflare challenge resolved")
-                    return None
-                else:
-                    logger.warning(f"Cloudflare {challenge_type} challenge did not resolve after {max_wait}s")
-                    return None
-
-            # For "interactive" and "embedded", use original solver (with depth limit)
-            return await original_solver(self, page)
-
-        finally:
-            # Decrement depth (or cleanup if done)
-            new_depth = _cf_solver_depths.get(page, 1) - 1
-            if new_depth <= 0:
-                _cf_solver_depths.pop(page, None)
-            else:
-                _cf_solver_depths[page] = new_depth
-
-    # Apply the patch
-    AsyncStealthySession._cloudflare_solver = _patched_solver
-    logger.info(f"Patched Cloudflare solver: 'managed' type fixed + max_depth={_MAX_CF_SOLVER_DEPTH}")
-
-
-# Apply patch on module import
-_patch_cloudflare_solver()
 
 
 # ── Monkey-patch: fix scrapling's engine log bugs ──────────────────
@@ -208,24 +127,26 @@ _patch_engine_logging()
 
 # ── Configuration ──────────────────────────────────────────────────────
 
-DEFAULT_CONCURRENT_REQUESTS: int = 10
-"""Global maximum concurrent fetches."""
+DEFAULT_CONCURRENT_REQUESTS: int = 5
+"""Global maximum concurrent fetches (reduced from 10 for stability)."""
 
-DEFAULT_CONCURRENT_PER_DOMAIN: int = 2
-"""Maximum concurrent fetches per domain."""
+DEFAULT_CONCURRENT_PER_DOMAIN: int = 1
+"""Maximum concurrent fetches per domain (reduced from 2 for cookie reuse)."""
 
 DEFAULT_TIMEOUT_MS: int = 30000
 """Default request timeout in milliseconds."""
 
-STEALTH_SESSION_TIMEOUT_MS: int = 45000
-"""Timeout for stealth (browser) sessions — longer because of browser startup."""
+CAMOUFOX_TIMEOUT_MS: int = 25000
+"""Timeout for Camoufox page loads — fast failure to avoid queue backup."""
+
+CAMOUFOX_MAX_CONCURRENT: int = 4
+"""Maximum concurrent Camoufox pages (browser instance is shared)."""
 
 BLOCKED_STATUS_CODES: frozenset[int] = frozenset({403, 429, 503})
-"""HTTP status codes that trigger an automatic stealth retry."""
+"""HTTP status codes that trigger Tier 2 (Camoufox) fallback."""
 
 BATCH_SIZE: int = 50
-"""Number of URLs to process in one batch (not used directly by Spider —
-   spider handles concurrency natively, but kept for interface compatibility)."""
+"""Number of URLs to process in one batch (for interface compatibility)."""
 
 
 # ── Data classes ──────────────────────────────────────────────────────
@@ -239,7 +160,7 @@ class SpiderResult:
         status: HTTP status code (0 if fetch failed entirely).
         html_content: Raw HTML string from the page (or empty).
         error: Human-readable error message if the request failed.
-        used_stealth: Whether the request was retried via stealth session.
+        used_stealth: Whether the request was fetched via Camoufox (Tier 2).
     """
 
     __slots__ = ("url", "status", "html_content", "error", "used_stealth")
@@ -271,24 +192,27 @@ class SpiderResult:
 
 
 class NewsSpider(Spider):
-    """Concurrent URL spider with domain rate limiting and stealth fallback.
+    """Concurrent URL spider with Camoufox stealth fallback.
 
-    Built on Scrapling's official ``Spider`` class.  Provides two session tiers:
+    V5.0 architecture:
+    * **Tier 1** (``FetcherSession`` — curl_cffi with chrome146 TLS fingerprint)
+    * **Tier 2** (``Camoufox`` — patched Firefox with C++ level stealth)
 
-    * **fast** (``FetcherSession`` — lightweight HTTP with browser fingerprint)
-    * **stealth** (``AsyncStealthySession`` — headless browser with Cloudflare bypass)
+    When Tier 1 returns a blocked status code (403/429/503) with Cloudflare
+    challenge markers, the spider falls back to Camoufox for that URL.
 
-    When a request returns a blocked status code (403/429/503), the spider
-    automatically retries it via the stealth session.
-
-    Override ``concurrent_requests`` / ``concurrent_requests_per_domain``
-    via class-level attributes or by setting them in ``__init__``.
+    Camoufox uses a shared browser instance with concurrent page pool (max 2)
+    to avoid memory explosion. The browser is lazily initialized on first
+    blocked request and cleaned up when the spider closes.
     """
 
     name = "news_spider"
     concurrent_requests = DEFAULT_CONCURRENT_REQUESTS
     concurrent_requests_per_domain = DEFAULT_CONCURRENT_PER_DOMAIN
-    # logging_level is set in __init__ from Settings.log_level
+    # V5.2: Disable Scrapling's retry for TLS errors — they won't succeed on retry
+    # because the same engine is used. Failed URLs go directly to Camoufox fallback
+    # in fetch_urls_with_spider(), which is more effective.
+    max_blocked_retries = 0
 
     def __init__(
         self,
@@ -305,62 +229,217 @@ class NewsSpider(Spider):
         super().__init__(crawldir=None)
 
         self._urls = urls
+        self._timeout_ms = timeout_ms
         # Internal error tracker — populated by on_error()
         self._errors: dict[str, str] = {}
         # Internal tracking for gap-fill detection
         self._completed_urls: set[str] = set()
 
+        # ── Camoufox browser pool ─────────────────────────────────────
+        # Shared browser instance with concurrent page pool
+        self._camoufox_manager: Any = None  # AsyncCamoufox context manager
+        self._camoufox_browser: Any = None  # BrowserContext (from __aenter__)
+        self._camoufox_lock = asyncio.Lock()  # Protects browser initialization
+        self._camoufox_semaphore = asyncio.Semaphore(CAMOUFOX_MAX_CONCURRENT)
+
     # ── Session configuration ─────────────────────────────────────────
 
     def configure_sessions(self, manager):
-        """Configure two session tiers: fast (default) and stealth (lazy)."""
+        """Configure Tier 1 session only (Camoufox is handled in parse callback).
+        
+        V5.2: retries=0 disables FetcherSession's internal retry for TLS errors.
+        TLS errors won't succeed on retry (same engine), so we skip directly to
+        Camoufox fallback in fetch_urls_with_spider().
+        """
         # follow_redirects=True bypasses SSRF protection for sites like EastMoney
         # that may have redirect chains through internal IPs (anti-bot mechanisms)
-        manager.add("fast", FetcherSession(impersonate="chrome", follow_redirects=True))
-        manager.add(
-            "stealth",
-            AsyncStealthySession(
-                solve_cloudflare=True,
-                humanize=True,
-                timeout=60000,  # 60 seconds in milliseconds — Cloudflare solver timeout
-            ),
-            lazy=True,
-        )
+        # impersonate="chrome" maps to chrome146 (latest) in curl_cffi
+        manager.add("fast", FetcherSession(
+            impersonate="chrome",
+            follow_redirects=True,
+            retries=0,  # V5.2: Disable TLS error retry — Camoufox fallback handles it
+        ))
 
     # ── Request generation ────────────────────────────────────────────
 
     async def start_requests(self):
-        """Yield one Request per URL, starting with the fast session."""
+        """Yield one Request per URL, starting with Tier 1 (fast session)."""
         for url in self._urls:
             yield Request(url, sid="fast")
 
     # ── Response parsing ──────────────────────────────────────────────
 
     async def parse(self, response: Response):
-        """Process a successfully fetched response.
+        """Process response, falling back to Camoufox if blocked.
 
-        Yields a dict matching SpiderResult fields.
+        V5.0: When Tier 1 is blocked (403/429/503 + CF challenge),
+        fetch via Camoufox directly in the parse callback.
         """
         # Use the original request URL (handles redirects correctly)
         url = getattr(response.request, "url", response.url)
         self._completed_urls.add(url)
 
-        # Detect which session was used
-        sid = getattr(response.request, "sid", "fast") if response.request else "fast"
-        used_stealth = sid == "stealth"
+        # Check if blocked → fall back to Camoufox
+        if self._is_blocked_response(response):
+            logger.warning(
+                "Tier 1 (chrome146) blocked for %s (status=%d) — falling back to Camoufox",
+                url,
+                response.status,
+            )
+            # Fetch via Camoufox (shared browser, concurrent page pool)
+            html_content, error = await self._fetch_with_camoufox(url)
+            if html_content:
+                yield {
+                    "url": url,
+                    "status": 200,
+                    "html_content": html_content,
+                    "error": None,
+                    "used_stealth": True,
+                }
+            else:
+                yield {
+                    "url": url,
+                    "status": 0,
+                    "html_content": "",
+                    "error": error or "Camoufox fetch failed",
+                    "used_stealth": True,
+                }
+        else:
+            # Tier 1 succeeded
+            yield {
+                "url": url,
+                "status": response.status,
+                "html_content": str(response.html_content),
+                "error": None,
+                "used_stealth": False,
+            }
 
-        yield {
-            "url": url,
-            "status": response.status,
-            "html_content": str(response.html_content),
-            "error": None,
-            "used_stealth": used_stealth,
-        }
+    # ── Camoufox browser pool ─────────────────────────────────────────
 
-    # ── Blocked detection & retry ─────────────────────────────────────
+    async def _get_camoufox_browser(self) -> Any:
+        """Get or create the shared Camoufox browser context.
+        
+        Thread-safe: uses asyncio.Lock to prevent race conditions
+        during lazy initialization.
+        
+        Returns the BrowserContext (from __aenter__), not the AsyncCamoufox
+        context manager itself.
+        
+        V5.1: Optimized parameters for Cloudflare bypass:
+        - geoip=True: Auto-set timezone/language/coords based on IP
+        - os="windows": Match fingerprint to Windows OS
+        - block_webrtc=True: Prevent WebRTC IP leak
+        - disable_coop=True: Allow clicking CF Turnstile in cross-origin iframes
+        - enable_cache=True: Reuse CF cookies for same domain
+        """
+        async with self._camoufox_lock:
+            if self._camoufox_browser is None:
+                logger.info("Initializing Camoufox browser (shared instance)...")
+                try:
+                    from camoufox.async_api import AsyncCamoufox
+                    # AsyncCamoufox is a context manager that returns BrowserContext
+                    self._camoufox_manager = AsyncCamoufox(
+                        headless=True,
+                        humanize=True,
+                        # V5.1: Optimized for Cloudflare bypass
+                        geoip=True,           # Auto-set timezone/language based on IP
+                        os="windows",         # Match fingerprint to Windows
+                        block_webrtc=True,    # Prevent WebRTC IP leak
+                        disable_coop=True,    # Allow clicking CF Turnstile
+                        enable_cache=True,    # Reuse CF cookies
+                        i_know_what_im_doing=True,  # Suppress LeakWarning for disable_coop
+                    )
+                    # __aenter__ returns the Browser/BrowserContext
+                    self._camoufox_browser = await self._camoufox_manager.__aenter__()
+                    logger.info("Camoufox browser initialized successfully")
+                except ImportError:
+                    logger.error(
+                        "Camoufox not installed. Run: pip install 'camoufox[geoip]' && camoufox fetch"
+                    )
+                    raise
+                except Exception as e:
+                    logger.error("Failed to initialize Camoufox browser: %s", e)
+                    raise
+        return self._camoufox_browser
+
+    async def _fetch_with_camoufox(self, url: str) -> tuple[str, str | None]:
+        """Fetch a URL using the shared Camoufox browser.
+
+        Uses semaphore to limit concurrent pages.
+        Timeout: 25s for fast failure.
+
+        V5.2: page.close() wrapped in try/except to prevent TargetClosedError
+        when the page is still navigating at timeout.
+
+        Args:
+            url: URL to fetch.
+
+        Returns:
+            Tuple of (html_content, error_message).
+            On success: (html, None)
+            On failure: ("", error_string)
+        """
+        # Acquire semaphore to limit concurrent Camoufox pages
+        await self._camoufox_semaphore.acquire()
+        try:
+            browser = await self._get_camoufox_browser()
+            page = await browser.new_page()
+            try:
+                await page.goto(url, timeout=CAMOUFOX_TIMEOUT_MS)
+                html = await page.content()
+                logger.debug(
+                    "Camoufox fetched %d chars from %s",
+                    len(html or ""),
+                    url,
+                )
+                return html or "", None
+            except asyncio.TimeoutError:
+                error = f"Camoufox timeout after {CAMOUFOX_TIMEOUT_MS}ms"
+                logger.warning("%s: %s", url, error)
+                return "", error
+            except Exception as e:
+                error = f"Camoufox error: {e}"
+                logger.warning("%s: %s", url, error)
+                return "", error
+            finally:
+                # V5.2: Safe close — suppress TargetClosedError
+                # (page may still be navigating when timeout fires)
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+        finally:
+            self._camoufox_semaphore.release()
+
+    async def _close_camoufox_browser(self):
+        """Close the shared Camoufox browser instance.
+        
+        Called when the spider closes to prevent zombie processes.
+        """
+        async with self._camoufox_lock:
+            if self._camoufox_manager is not None:
+                try:
+                    logger.info("Closing Camoufox browser...")
+                    await self._camoufox_manager.__aexit__(None, None, None)
+                    self._camoufox_browser = None
+                    self._camoufox_manager = None
+                    logger.info("Camoufox browser closed")
+                except Exception as e:
+                    logger.warning("Error closing Camoufox browser: %s", e)
+
+    # ── Blocked detection ─────────────────────────────────────────────
 
     async def is_blocked(self, response: Response) -> bool:
-        """Return True only for blocked status codes WITH Cloudflare challenge."""
+        """Always return False — blocked detection is handled in parse() callback.
+        
+        V5.0: We don't use Scrapling's retry mechanism because we handle
+        Camoufox fallback directly in parse(). This avoids conflicts with
+        the removed AsyncStealthySession.
+        """
+        return False
+
+    def _is_blocked_response(self, response: Response) -> bool:
+        """Check if response is blocked (used internally in parse callback)."""
         if response.status not in BLOCKED_STATUS_CODES:
             return False
 
@@ -388,18 +467,6 @@ class NewsSpider(Spider):
         ]
         html_lower = html.lower()
         return any(marker in html_lower for marker in cf_markers)
-
-    async def retry_blocked_request(
-        self, request: Request, response: Response
-    ) -> Request:
-        """Retry blocked requests using the stealth session."""
-        logger.debug(
-            "Fast session blocked for %s (status=%s) — retrying with stealth",
-            request.url,
-            response.status,
-        )
-        request.sid = "stealth"
-        return request
 
     # ── Error handling ────────────────────────────────────────────────
 
@@ -473,6 +540,10 @@ async def fetch_urls_with_spider(
 ) -> list[SpiderResult]:
     """Convenience: create a NewsSpider, fetch URLs, return results.
 
+    V5.1: For URLs that failed at Tier 1 (TLS errors, connection refused, etc.),
+    retry with Camoufox as a final fallback. This handles cases where curl_cffi
+    fails before getting any HTTP response.
+
     Args:
         urls: URLs to fetch.
         timeout_ms: Request timeout in milliseconds.
@@ -492,26 +563,68 @@ async def fetch_urls_with_spider(
         async for item in spider.stream():
             stream_items.append(item)
     finally:
+        # ── Cleanup: Close Camoufox browser to prevent zombie processes ──
+        await spider._close_camoufox_browser()
+
         # Explicitly close session manager to prevent "Event loop is closed"
         # errors on exit. Scrapling's stream() doesn't do this automatically.
-        # Also force-close lazy sessions that were never started — their
-        # underlying patchright subprocess would otherwise trigger
-        # "Event loop is closed" when __del__ runs after the loop is gone.
         try:
             await spider._session_manager.close()
         except (RuntimeError, Exception):
             pass
-        # Force-close any remaining lazy sessions
-        for sid in list(spider._session_manager._lazy_sessions):
-            session = spider._session_manager._sessions.get(sid)
-            if session is not None:
-                try:
-                    await session.__aexit__(None, None, None)
-                except (RuntimeError, Exception):
-                    pass
-        spider._session_manager._lazy_sessions.clear()
 
-    return spider._collect_results(stream_items)
+    results = spider._collect_results(stream_items)
+
+    # V5.1: Retry failed URLs with Camoufox (handles TLS errors, connection refused, etc.)
+    failed_urls = [r for r in results if r.error and not r.html_content]
+    if failed_urls:
+        logger.info(
+            "Retrying %d failed URLs with Camoufox fallback (TLS errors, connection refused, etc.)",
+            len(failed_urls),
+        )
+        # Create a temporary spider just for Camoufox access
+        retry_spider = NewsSpider(urls=[])
+        try:
+            # Initialize Camoufox browser
+            await retry_spider._get_camoufox_browser()
+            
+            # Retry each failed URL with Camoufox
+            retry_tasks = [
+                retry_spider._fetch_with_camoufox(r.url)
+                for r in failed_urls
+            ]
+            retry_results = await asyncio.gather(*retry_tasks, return_exceptions=True)
+            
+            # Update results with Camoufox responses
+            for i, (result, retry_result) in enumerate(zip(failed_urls, retry_results)):
+                if isinstance(retry_result, Exception):
+                    logger.warning(
+                        "Camoufox retry failed for %s: %s",
+                        result.url,
+                        retry_result,
+                    )
+                    continue
+                    
+                html_content, error = retry_result
+                if html_content:
+                    # Find the index in the original results list
+                    idx = results.index(result)
+                    results[idx] = SpiderResult(
+                        url=result.url,
+                        status=200,
+                        html_content=html_content,
+                        error=None,
+                        used_stealth=True,
+                    )
+                    logger.info(
+                        "Camoufox retry succeeded for %s (%d chars)",
+                        result.url,
+                        len(html_content),
+                    )
+        finally:
+            await retry_spider._close_camoufox_browser()
+
+    return results
 
 
 __all__ = [
@@ -521,6 +634,8 @@ __all__ = [
     "DEFAULT_CONCURRENT_REQUESTS",
     "DEFAULT_CONCURRENT_PER_DOMAIN",
     "DEFAULT_TIMEOUT_MS",
+    "CAMOUFOX_TIMEOUT_MS",
+    "CAMOUFOX_MAX_CONCURRENT",
     "BLOCKED_STATUS_CODES",
     "BATCH_SIZE",
 ]
