@@ -370,6 +370,10 @@ class NewsSpider(Spider):
 
         V5.2: page.close() wrapped in try/except to prevent TargetClosedError
         when the page is still navigating at timeout.
+        
+        V5.3: Detect anti-bot challenge pages in returned HTML. If Camoufox
+        successfully fetched HTML but it contains challenge markers, treat as
+        failure to avoid saving garbage content.
 
         Args:
             url: URL to fetch.
@@ -387,6 +391,13 @@ class NewsSpider(Spider):
             try:
                 await page.goto(url, timeout=CAMOUFOX_TIMEOUT_MS)
                 html = await page.content()
+                
+                # V5.3: Check if the returned HTML is an anti-bot challenge page
+                if html and self._has_cloudflare_challenge(html):
+                    error = "Camoufox returned anti-bot challenge page"
+                    logger.warning("%s: %s", url, error)
+                    return "", error
+                
                 logger.debug(
                     "Camoufox fetched %d chars from %s",
                     len(html or ""),
@@ -457,7 +468,13 @@ class NewsSpider(Spider):
         return False
 
     def _has_cloudflare_challenge(self, html: str) -> bool:
-        """Detect whether HTML contains Cloudflare challenge markers."""
+        """Detect whether HTML contains Cloudflare or other anti-bot challenge markers.
+        
+        V5.3: Extended to detect multiple anti-bot services, not just Cloudflare.
+        This prevents saving garbage content when Camoufox successfully bypasses
+        the initial check but still gets a challenge page.
+        """
+        # Cloudflare markers
         cf_markers = [
             "just a moment",       # CF challenge page title "Just a moment..."
             "cloudflare",          # generic keyword
@@ -465,8 +482,28 @@ class NewsSpider(Spider):
             "challenge-platform",  # CF challenge platform div
             "turnstile",           # Cloudflare Turnstile
         ]
+        
+        # Generic anti-bot markers (multiple services)
+        anti_bot_markers = [
+            "正在執行安全驗證",     # CF challenge (Traditional Chinese)
+            "正在进行安全验证",     # CF challenge (Simplified Chinese)
+            "security check",      # Generic security check
+            "verifying you are human",  # Generic human verification
+            "enable javascript",   # JS challenge
+            "checking your browser",  # Browser check
+        ]
+        
         html_lower = html.lower()
-        return any(marker in html_lower for marker in cf_markers)
+        
+        # Check Cloudflare markers
+        if any(marker in html_lower for marker in cf_markers):
+            return True
+        
+        # Check generic anti-bot markers
+        if any(marker in html_lower for marker in anti_bot_markers):
+            return True
+        
+        return False
 
     # ── Error handling ────────────────────────────────────────────────
 
