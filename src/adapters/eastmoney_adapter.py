@@ -360,12 +360,14 @@ class EastMoneyAdapter(BaseAdapter):
 
         # Prefer pre-fetched full text over API summary
         full_text: str | None = None
+        content_fetched = False
         if fetch_results and link and link in fetch_results:
             result = fetch_results[link]
             if result.success and result.text:
                 # Strip YAML front matter from Trafilatura extract_with_metadata
                 pure_text, _yaml_meta = strip_yaml_front_matter(result.text)
                 full_text = pure_text
+                content_fetched = True
             else:
                 logger.debug(
                     "Pre-fetched content failed for %s: %s — using API summary",
@@ -424,5 +426,6 @@ class EastMoneyAdapter(BaseAdapter):
                 "content_scope": "SYMBOL",
                 "symbol": symbol,
                 "adapter": "eastmoney",
+                "content_fetched": content_fetched,
             },
         )

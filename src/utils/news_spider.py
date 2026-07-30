@@ -145,7 +145,7 @@ CAMOUFOX_MAX_CONCURRENT: int = 4
 BLOCKED_STATUS_CODES: frozenset[int] = frozenset({403, 429, 503})
 """HTTP status codes that trigger Tier 2 (Camoufox) fallback."""
 
-BATCH_SIZE: int = 50
+BATCH_SIZE: int = 15  # V5.5: 50→15, 配合 180s batch timeout
 """Number of URLs to process in one batch (for interface compatibility)."""
 
 
@@ -163,7 +163,7 @@ class SpiderResult:
         used_stealth: Whether the request was fetched via Camoufox (Tier 2).
     """
 
-    __slots__ = ("url", "status", "html_content", "error", "used_stealth")
+    __slots__ = ("url", "status", "html_content", "error", "used_stealth", "was_blocked")
 
     def __init__(
         self,
@@ -172,12 +172,14 @@ class SpiderResult:
         html_content: str = "",
         error: str | None = None,
         used_stealth: bool = False,
+        was_blocked: bool = False,
     ) -> None:
         self.url = url
         self.status = status
         self.html_content = html_content
         self.error = error
         self.used_stealth = used_stealth
+        self.was_blocked = was_blocked
 
     def __repr__(self) -> str:
         parts = [f"url={self.url!r}", f"status={self.status}"]
@@ -393,10 +395,14 @@ class NewsSpider(Spider):
                 html = await page.content()
                 
                 # V5.3: Check if the returned HTML is an anti-bot challenge page
+                # V5.4: Only flag as challenge if it's small (< 50KB) or has specific markers
+                # (large pages that mention "cloudflare" are usually real pages using CF CDN)
                 if html and self._has_cloudflare_challenge(html):
-                    error = "Camoufox returned anti-bot challenge page"
-                    logger.warning("%s: %s", url, error)
-                    return "", error
+                    # Verify it's actually a challenge page, not just a normal page mentioning CF
+                    if len(html) < 50000 or "challenge-platform" in html.lower() or "just a moment" in html.lower():
+                        error = "Camoufox returned anti-bot challenge page"
+                        logger.warning("%s: %s", url, error)
+                        return "", error
                 
                 logger.debug(
                     "Camoufox fetched %d chars from %s",
@@ -450,16 +456,35 @@ class NewsSpider(Spider):
         return False
 
     def _is_blocked_response(self, response: Response) -> bool:
-        """Check if response is blocked (used internally in parse callback)."""
+        """Check if response is blocked (used internally in parse callback).
+        
+        V5.0: Returns True when status is blocked (403/429/503) AND HTML
+        contains Cloudflare challenge markers. This avoids false positives
+        from pages that happen to mention 'cloudflare' in their content.
+        """
         if response.status not in BLOCKED_STATUS_CODES:
             return False
 
-        # Check response body for Cloudflare challenge markers
         html = str(response.html_content or "")
-        if self._has_cloudflare_challenge(html):
+        if not html:
+            # Blocked status with no HTML — treat as blocked
+            logger.warning(
+                "Tier 1 blocked for %s (status=%d, no HTML) — falling back to Camoufox",
+                response.url,
+                response.status,
+            )
             return True
 
-        # 403/429/503 but no Cloudflare challenge (other anti-bot) → don't retry
+        if self._has_cloudflare_challenge(html):
+            logger.warning(
+                "Tier 1 blocked for %s (status=%d, CF challenge detected, html_len=%d) — falling back to Camoufox",
+                response.url,
+                response.status,
+                len(html),
+            )
+            return True
+
+        # Blocked status but no CF challenge detected — might be other anti-bot
         logger.debug(
             "Status %d but no Cloudflare challenge detected — not retrying for %s",
             response.status,
@@ -471,37 +496,59 @@ class NewsSpider(Spider):
         """Detect whether HTML contains Cloudflare or other anti-bot challenge markers.
         
         V5.3: Extended to detect multiple anti-bot services, not just Cloudflare.
-        This prevents saving garbage content when Camoufox successfully bypasses
-        the initial check but still gets a challenge page.
-        """
-        # Cloudflare markers
-        cf_markers = [
-            "just a moment",       # CF challenge page title "Just a moment..."
-            "cloudflare",          # generic keyword
-            "cf-challenge",        # CF challenge CSS class
-            "challenge-platform",  # CF challenge platform div
-            "turnstile",           # Cloudflare Turnstile
-        ]
+        V5.6: Fixed false positives - only detect actual challenge pages, not
+        normal pages that mention these keywords in content.
         
-        # Generic anti-bot markers (multiple services)
-        anti_bot_markers = [
-            "正在執行安全驗證",     # CF challenge (Traditional Chinese)
-            "正在进行安全验证",     # CF challenge (Simplified Chinese)
-            "security check",      # Generic security check
-            "verifying you are human",  # Generic human verification
-            "enable javascript",   # JS challenge
-            "checking your browser",  # Browser check
-        ]
+        Challenge pages have specific characteristics:
+        - Very small HTML size (< 10KB)
+        - Contain specific challenge markers in title or meta
+        - Have challenge-platform div or turnstile iframe
+        """
+        # Skip large pages - challenge pages are always small
+        if len(html) > 15000:
+            return False
         
         html_lower = html.lower()
         
-        # Check Cloudflare markers
-        if any(marker in html_lower for marker in cf_markers):
-            return True
+        # Check for actual challenge page characteristics
+        # These are specific to challenge pages, not normal content
+        challenge_indicators = [
+            # Cloudflare challenge page title
+            ("<title>just a moment", 5000),  # Must be in first 5KB
+            # Cloudflare challenge platform div
+            ("challenge-platform", None),
+            # Cloudflare Turnstile iframe
+            ("turnstile", None),
+            # CF challenge script
+            ("cdn-cgi/challenge-platform", None),
+            # Generic challenge page title patterns
+            ("<title>attention required", 5000),
+            ("<title>security check", 5000),
+        ]
         
-        # Check generic anti-bot markers
-        if any(marker in html_lower for marker in anti_bot_markers):
-            return True
+        for indicator, max_pos in challenge_indicators:
+            if max_pos:
+                # Check if indicator appears early in the page (challenge pages have it at top)
+                pos = html_lower.find(indicator)
+                if pos != -1 and pos < max_pos:
+                    return True
+            else:
+                if indicator in html_lower:
+                    return True
+        
+        # Check for very small pages with challenge-like content
+        # Challenge pages are typically < 5KB and have specific patterns
+        if len(html) < 5000:
+            # Small page with challenge keywords
+            small_page_indicators = [
+                "verifying you are human",
+                "checking your browser",
+                "enable javascript and reload",
+                "ray id",  # Cloudflare Ray ID (specific to challenge pages)
+                "performance security check",
+            ]
+            if any(ind in html_lower for ind in small_page_indicators):
+                return True
         
         return False
 
@@ -544,6 +591,7 @@ class NewsSpider(Spider):
                         html_content=item.get("html_content", ""),
                         error=item.get("error"),
                         used_stealth=item.get("used_stealth", False),
+                        was_blocked=item.get("_blocked", False),
                     )
                 )
             elif url in self._errors:
@@ -644,7 +692,6 @@ async def fetch_urls_with_spider(
                     
                 html_content, error = retry_result
                 if html_content:
-                    # Find the index in the original results list
                     idx = results.index(result)
                     results[idx] = SpiderResult(
                         url=result.url,

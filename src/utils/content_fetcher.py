@@ -58,7 +58,7 @@ BATCH_SIZE: int = 50
 BATCH_COOLDOWN_SEC: float = 1.0
 """Cooldown seconds between batches."""
 
-BATCH_TIMEOUT_SEC: float = 60.0
+BATCH_TIMEOUT_SEC: float = 180.0
 """Default timeout in seconds for each batch of URLs."""
 
 SPIDER_MAX_PAGES: int = 5
