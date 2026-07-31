@@ -179,7 +179,8 @@ class IngestionScheduler:
         # ── Adapter instances (lazy init) ─────────────────────────
         self._gdelt_adapter: Any = None
         self._rss_adapter: Any = None
-        self._eastmoney_adapter: Any = None
+        self._cls_adapter: Any = None  # V6.1: CLS telegraph (primary stock news)
+        self._eastmoney_adapter: Any = None  # V6.1: demoted to fallback
         self._akshare_adapter: Any = None
 
         # ── Briefing Aggregator ───────────────────────────────────
@@ -410,11 +411,21 @@ class IngestionScheduler:
         else:
             logger.info("Dry-run: RSS adapter skipped (source_filter=%s)", self._source_filter)
 
-        # ── Stock pipeline: EastMoney (primary) + AkShare (fallback) ──
+        # ── Stock pipeline: CLS (primary) → EastMoney (fallback) → AkShare (fallback) ──
+        # V6.1: CLS telegraph replaces EastMoney as primary stock news source
         if "akshare" in sources:
+            from src.adapters.cls_adapter import CLSAdapter
             from src.adapters.eastmoney_adapter import EastMoneyAdapter
 
             settings = get_settings()
+            
+            # V6.1: CLS telegraph as primary stock news source
+            self._cls_adapter = CLSAdapter(
+                page_size=getattr(settings, 'cls_page_size', 50),
+                dedup_cache=self._dedup_cache,
+            )
+            
+            # V6.1: EastMoney demoted to fallback
             self._eastmoney_adapter = EastMoneyAdapter(
                 page_size=settings.eastmoney_page_size,
                 dedup_cache=self._dedup_cache,
@@ -426,14 +437,15 @@ class IngestionScheduler:
                 content_fetcher=content_fetcher,
             )
         else:
-            logger.info("Dry-run: EastMoney/AkShare adapters skipped (source_filter=%s)", self._source_filter)
+            logger.info("Dry-run: CLS/EastMoney/AkShare adapters skipped (source_filter=%s)", self._source_filter)
 
         logger.info(
             "Scheduler components initialized: "
-            "GDELT=%s, RSS=%s feeds, EastMoney=%s, AkShare=%s"
+            "GDELT=%s, RSS=%s feeds, CLS=%s, EastMoney=%s, AkShare=%s"
             "%s",
             "yes" if self._gdelt_adapter else "no",
             len(self._rss_adapter.feed_urls) if self._rss_adapter else "no",
+            "yes" if self._cls_adapter else "no",
             "yes" if self._eastmoney_adapter else "no",
             "yes" if self._akshare_adapter else "no",
             " [dry-run mode]" if self._dry_run else ""
@@ -505,7 +517,25 @@ class IngestionScheduler:
 
         # ── Step 2a: Macro pipelines run concurrently ──────────────
         async def _stock_pipeline() -> PipelineResult:
-            """Stock pipeline: EastMoney (primary) → AkShare (fallback)."""
+            """Stock pipeline: CLS (primary) → EastMoney (fallback) → AkShare (fallback).
+            
+            V6.1: CLS telegraph replaces EastMoney as primary stock news source.
+            """
+            # V6.1: CLS telegraph as primary
+            cls_result = await self._run_adapter_pipeline(
+                self._cls_adapter, self._symbol_writer, tickers
+            )
+            if cls_result.success and cls_result.episode_count > 0:
+                logger.info(
+                    "Stock pipeline: CLS returned %d episodes",
+                    cls_result.episode_count,
+                )
+                return cls_result
+
+            # V6.1: EastMoney as fallback
+            logger.info(
+                "CLS returned 0 episodes, falling back to EastMoney"
+            )
             em_result = await self._run_adapter_pipeline(
                 self._eastmoney_adapter, self._symbol_writer, tickers
             )
@@ -618,8 +648,10 @@ class IngestionScheduler:
     def _update_adapter_tickers(
         self, tickers: list[dict[str, str]]
     ) -> None:
-        """Update ticker whitelists for EastMoney and AkShare stock pipelines.
+        """Update ticker whitelists for CLS, EastMoney and AkShare stock pipelines.
 
+        V6.1: CLS adapter now primary, EastMoney demoted to fallback.
+        - CLSAdapter: name-based entity extraction (uses stock Chinese name)
         - EastMoneyAdapter: name-based search (uses stock Chinese name)
         - AkShareAdapter: symbol-based search (uses biz_code)
 
@@ -628,7 +660,16 @@ class IngestionScheduler:
         # GDELT: no longer receives ticker whitelist (uses macro theme filter)
         # RSS: no longer receives ticker whitelist (zero filter)
 
-        # EastMoneyAdapter: index by stock name
+        # V6.1: CLSAdapter: index by stock name for entity extraction
+        if self._cls_adapter is not None:
+            self._cls_adapter.ticker_whitelist = tickers
+            self._cls_adapter._name_map = {}
+            for entry in tickers:
+                name = entry.get("name", "")
+                if name:
+                    self._cls_adapter._name_map[name] = entry
+
+        # EastMoneyAdapter: index by stock name (fallback)
         if self._eastmoney_adapter is not None:
             self._eastmoney_adapter.ticker_whitelist = tickers
             self._eastmoney_adapter._name_map = {}
@@ -765,12 +806,15 @@ class IngestionScheduler:
         if self._rss_adapter is not None:
             adapters_to_run.append((self._rss_adapter, "rss"))
 
-        # Stock pipeline: EastMoney (primary) → AkShare (fallback)
-        # Same logic as _run_cycle: only run AkShare if EastMoney returns 0 episodes
-        if self._eastmoney_adapter is not None:
+        # Stock pipeline: CLS (primary) → EastMoney (fallback) → AkShare (fallback)
+        # V6.1: CLS telegraph replaces EastMoney as primary stock news source
+        if self._cls_adapter is not None:
+            adapters_to_run.append((self._cls_adapter, "cls"))
+        elif self._eastmoney_adapter is not None:
+            # CLS not configured, use EastMoney
             adapters_to_run.append((self._eastmoney_adapter, "eastmoney"))
         elif self._akshare_adapter is not None:
-            # EastMoney not configured, use AkShare directly
+            # Neither CLS nor EastMoney configured, use AkShare
             adapters_to_run.append((self._akshare_adapter, "akshare"))
 
         if not adapters_to_run:
@@ -793,7 +837,7 @@ class IngestionScheduler:
                 result = await run_pipeline(
                     adapter=adapter,
                     writer=None,
-                    tickers=tickers if source_name in ("akshare", "eastmoney") else None,
+                    tickers=tickers if source_name in ("akshare", "eastmoney", "cls") else None,
                     dry_run=True,
                 )
                 results.append(result)
@@ -804,7 +848,10 @@ class IngestionScheduler:
                         result.episode_count,
                         result.elapsed_seconds,
                     )
-                    # Stock pipeline: if EastMoney returned episodes, skip AkShare fallback
+                    # Stock pipeline: if CLS/EastMoney returned episodes, skip fallback
+                    if source_name == "cls" and result.episode_count > 0:
+                        logger.info("CLS returned %d episodes, skipping EastMoney/AkShare fallback", result.episode_count)
+                        break
                     if source_name == "eastmoney" and result.episode_count > 0:
                         logger.info("EastMoney returned %d episodes, skipping AkShare fallback", result.episode_count)
                         break
@@ -815,8 +862,12 @@ class IngestionScheduler:
                         result.elapsed_seconds,
                         result.error,
                     )
+                    # CLS failed, try EastMoney fallback
+                    if source_name == "cls" and self._eastmoney_adapter is not None:
+                        logger.info("CLS failed, falling back to EastMoney")
+                        adapters_to_run.append((self._eastmoney_adapter, "eastmoney"))
                     # EastMoney failed, try AkShare fallback
-                    if source_name == "eastmoney" and self._akshare_adapter is not None:
+                    elif source_name == "eastmoney" and self._akshare_adapter is not None:
                         logger.info("EastMoney failed, falling back to AkShare")
                         adapters_to_run.append((self._akshare_adapter, "akshare"))
             except Exception as exc:
@@ -833,8 +884,12 @@ class IngestionScheduler:
                         error=exc,
                     )
                 )
+                # CLS threw exception, try EastMoney fallback
+                if source_name == "cls" and self._eastmoney_adapter is not None:
+                    logger.info("CLS threw exception, falling back to EastMoney")
+                    adapters_to_run.append((self._eastmoney_adapter, "eastmoney"))
                 # EastMoney threw exception, try AkShare fallback
-                if source_name == "eastmoney" and self._akshare_adapter is not None:
+                elif source_name == "eastmoney" and self._akshare_adapter is not None:
                     logger.info("EastMoney threw exception, falling back to AkShare")
                     adapters_to_run.append((self._akshare_adapter, "akshare"))
 
