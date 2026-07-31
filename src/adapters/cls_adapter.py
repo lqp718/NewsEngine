@@ -65,6 +65,12 @@ class CLSAdapter(BaseAdapter):
     Full text is returned directly in the API response — no need
     to fetch article pages separately.
 
+    V6.1.1 (Phase 1.5): Enhanced entity extraction and metadata.
+    - Uses API-returned stock_list for precise stock entity extraction
+    - Extracts subjects (topic tags) into metadata
+    - Uses CLS article ID for precise deduplication
+    - Preserves level (A/B/C importance) in metadata for downstream reference
+
     Args:
         page_size: Number of articles to fetch per request (default: 50).
         dedup_cache: Shared dedup cache across adapters.
@@ -79,6 +85,8 @@ class CLSAdapter(BaseAdapter):
     ) -> None:
         super().__init__(dedup_cache=dedup_cache)
         self.page_size = page_size
+        # V6.1.1: ticker_whitelist kept for backward compatibility but not used
+        # Entity extraction now uses API-returned stock_list
         self.ticker_whitelist: list[dict[str, str]] = []
         self._name_map: dict[str, dict[str, str]] = {}
 
@@ -138,18 +146,31 @@ class CLSAdapter(BaseAdapter):
     async def normalize(self, record: dict) -> NormalizedEpisode:
         """Convert a single CLS telegraph record to NormalizedEpisode.
 
-        CLS API returns full text in the response — no need to fetch
-        article pages.
+        V6.1.1 (Phase 1.5):
+        - Uses API-returned stock_list for precise entity extraction
+        - Extracts subjects (topic tags) into metadata
+        - Uses CLS article ID for precise deduplication
+        - Preserves level (A/B/C importance) in metadata
         """
         title = _strip_html(record.get("title", "") or record.get("brief", ""))
         content = _strip_html(record.get("content", "") or record.get("brief", ""))
         link = record.get("shareurl", "") or None
         ts = record.get("ctime")
+        article_id = record.get("id")  # V6.1.1: CLS article ID for dedup
+        level = record.get("level", "")  # V6.1.1: A/B/C importance level
+        stock_list = record.get("stock_list", [])  # V6.1.1: API-returned stock entities
+        subjects = record.get("subjects", [])  # V6.1.1: topic tags
 
         # Build episode body
         episode_body = _build_episode_body(title, content)
         severity = rule_based_severity(episode_body)
-        content_hash = hashlib.sha256(episode_body.encode("utf-8")).hexdigest()
+        
+        # V6.1.1: Use article_id for content_hash if available (precise dedup)
+        if article_id:
+            content_hash = hashlib.sha256(f"cls-{article_id}".encode("utf-8")).hexdigest()
+        else:
+            content_hash = hashlib.sha256(episode_body.encode("utf-8")).hexdigest()
+        
         valid_at = _parse_cls_time(ts)
         keywords = _extract_keywords(title)
 
@@ -160,8 +181,11 @@ class CLSAdapter(BaseAdapter):
         if valid_at < cutoff:
             return None  # type: ignore[return-value]
 
-        # Extract entities from content (stock mentions)
-        entities = self._extract_stock_entities(title, content)
+        # V6.1.1: Extract entities from API-returned stock_list (precise)
+        entities = self._extract_entities_from_stock_list(stock_list)
+        
+        # V6.1.1: Extract subject names for metadata
+        subject_names = [s.get("subject_name", "") for s in (subjects or []) if s.get("subject_name")]
 
         name = NormalizedEpisode.make_name(
             source_type="cls_telegraph",
@@ -185,35 +209,62 @@ class CLSAdapter(BaseAdapter):
                 "content_scope": "MACRO",  # CLS is market-wide, not stock-specific
                 "adapter": "cls",
                 "content_fetched": True,  # API returns full text
+                # V6.1.1: Enhanced metadata
+                "cls_article_id": article_id,  # Precise dedup key
+                "cls_level": level,  # A/B/C importance level
+                "cls_subjects": subject_names,  # Topic tags for filtering
+                "cls_stock_count": len(stock_list),  # Number of related stocks
             },
         )
 
-    def _extract_stock_entities(
-        self, title: str, content: str
+    def _extract_entities_from_stock_list(
+        self, stock_list: list[dict]
     ) -> list[EntityItem]:
-        """Extract stock entities from CLS content using ticker whitelist.
+        """Extract stock entities from API-returned stock_list.
 
-        Matches stock names from whitelist against title and content.
+        V6.1.1: Uses CLS API's editor-annotated stock_list for precise
+        entity extraction, replacing the old name_map text matching.
+
+        Args:
+            stock_list: List of stock dicts from CLS API, each containing:
+                - name: Stock name (e.g., "兆易创新")
+                - StockID: Stock code (e.g., "sh603986")
+                - RiseRange: Price change % (e.g., 3.3)
+                - last: Latest price
+                - is_stib: Whether it's STAR Market (科创板)
+
+        Returns:
+            List of EntityItem with precise stock info.
         """
         entities: list[EntityItem] = []
-        text = f"{title} {content}"
 
-        for name, entry in self._name_map.items():
-            if name and name in text:
-                symbol = entry.get("symbol", "")
-                sector = entry.get("sector", "")
-                exchange = entry.get("exchange", "")
+        for stock in stock_list:
+            name = stock.get("name", "")
+            stock_id = stock.get("StockID", "")
+            rise_range = stock.get("RiseRange")
+            is_stib = stock.get("is_stib", False)
 
-                kwargs: dict[str, Any] = {
-                    "type": "stock",
-                    "name": name,
-                    "ticker": symbol,
-                }
-                if sector:
-                    kwargs["sector"] = sector
-                if exchange:
-                    kwargs["exchange"] = exchange
-                entities.append(EntityItem(**kwargs))
+            if not name or not stock_id:
+                continue
+
+            # Parse exchange from StockID (e.g., "sh603986" -> "SH")
+            exchange = ""
+            if stock_id.startswith("sh"):
+                exchange = "SH"
+            elif stock_id.startswith("sz"):
+                exchange = "SZ"
+
+            kwargs: dict[str, Any] = {
+                "type": "stock",
+                "name": name,
+                "ticker": stock_id.upper(),  # e.g., "SH603986"
+            }
+            if exchange:
+                kwargs["exchange"] = exchange
+            if is_stib:
+                kwargs["sector"] = "STAR Market"  # 科创板
+
+            entities.append(EntityItem(**kwargs))
 
         return entities
 
