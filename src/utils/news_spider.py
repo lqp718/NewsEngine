@@ -139,7 +139,7 @@ DEFAULT_TIMEOUT_MS: int = 30000
 CAMOUFOX_TIMEOUT_MS: int = 25000
 """Timeout for Camoufox page loads — fast failure to avoid queue backup."""
 
-CAMOUFOX_MAX_CONCURRENT: int = 4
+CAMOUFOX_MAX_CONCURRENT: int = 1
 """Maximum concurrent Camoufox pages (browser instance is shared)."""
 
 BLOCKED_STATUS_CODES: frozenset[int] = frozenset({403, 429, 503})
