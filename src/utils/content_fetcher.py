@@ -47,9 +47,6 @@ DEFAULT_TIMEOUT: int = 30
 """Default HTTP request timeout in seconds."""
 
 DOMAIN_RATE_LIMIT_SEC: float = 2.0
-
-# Minimum content length to consider successful (shorter triggers Camoufox fallback)
-MIN_CONTENT_LENGTH: int = 500
 """Minimum gap (seconds) between requests to the same domain."""
 
 MAX_CONCURRENT: int = 5
@@ -334,21 +331,7 @@ class ContentFetcher:
         if extracted and extracted.strip():
             engine = "news_spider+trafilatura"
             text = extracted.strip()
-            
-            # Check if content is too short (likely RSS summary, not full article)
-            if len(text) < MIN_CONTENT_LENGTH and not spider_result.used_stealth:
-                logger.debug(
-                    "Content too short (%d chars) from %s — marking for Camoufox fallback",
-                    len(text),
-                    url,
-                )
-                return ContentResult(
-                    url=url,
-                    success=False,
-                    error=f"Content too short ({len(text)} chars, need {MIN_CONTENT_LENGTH})",
-                    engine=engine,
-                )
-            
+                        
             logger.debug(
                 "Extracted %d chars from %s%s",
                 len(text),

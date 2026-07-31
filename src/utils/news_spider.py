@@ -1,20 +1,20 @@
 """NewsSpider — concurrent URL fetcher with anti-bot bypass and domain rate-limiting.
 
-V5.0: Camoufox integration for Tier 2 stealth.
+V6.0: CloakBrowser integration for Tier 2 stealth.
 
 Uses Scrapling's official ``scrapling.spiders.Spider`` base class with:
 
 - ``FetcherSession(impersonate="chrome")`` for fast requests (Tier 1)
   - Uses curl_cffi with chrome146 TLS fingerprint
-- ``Camoufox`` (patched Firefox) for blocked requests (Tier 2)
-  - C++ level fingerprint spoofing, Juggler protocol (no CDP detection)
-  - Shared browser instance with concurrent page pool (max 2)
-  - 20s timeout for fast failure
+- ``CloakBrowser`` (patched Chromium) for blocked requests (Tier 2)
+  - 71 C++ source-level stealth patches
+  - Native Playwright async API, stable multi-page concurrency
+  - 30s timeout for page loads
 
 Architecture:
     Tier 1: FetcherSession (curl_cffi, chrome146) → fast, ~1s/page
         ↓ blocked (403/429/503 + CF challenge)
-    Tier 2: Camoufox (Firefox, C++ stealth) → stealth, ~5-15s/page
+    Tier 2: CloakBrowser (Chromium, C++ stealth) → stealth, ~5-15s/page
         ↓ failed
     Mark as failed, return to caller
 
@@ -136,16 +136,16 @@ DEFAULT_CONCURRENT_PER_DOMAIN: int = 1
 DEFAULT_TIMEOUT_MS: int = 30000
 """Default request timeout in milliseconds."""
 
-CAMOUFOX_TIMEOUT_MS: int = 25000
-"""Timeout for Camoufox page loads — fast failure to avoid queue backup."""
+CLOAK_TIMEOUT_MS: int = 30000
+"""Timeout for CloakBrowser page loads."""
 
-CAMOUFOX_MAX_CONCURRENT: int = 1
-"""Maximum concurrent Camoufox pages (browser instance is shared)."""
+CLOAK_MAX_CONCURRENT: int = 3
+"""Maximum concurrent CloakBrowser pages (Chromium handles multi-page well)."""
 
 BLOCKED_STATUS_CODES: frozenset[int] = frozenset({403, 429, 503})
-"""HTTP status codes that trigger Tier 2 (Camoufox) fallback."""
+"""HTTP status codes that trigger Tier 2 (CloakBrowser) fallback."""
 
-BATCH_SIZE: int = 15  # V5.5: 50→15, 配合 180s batch timeout
+BATCH_SIZE: int = 15
 """Number of URLs to process in one batch (for interface compatibility)."""
 
 
@@ -160,7 +160,7 @@ class SpiderResult:
         status: HTTP status code (0 if fetch failed entirely).
         html_content: Raw HTML string from the page (or empty).
         error: Human-readable error message if the request failed.
-        used_stealth: Whether the request was fetched via Camoufox (Tier 2).
+        used_stealth: Whether the request was fetched via CloakBrowser (Tier 2).
     """
 
     __slots__ = ("url", "status", "html_content", "error", "used_stealth", "was_blocked")
@@ -194,25 +194,24 @@ class SpiderResult:
 
 
 class NewsSpider(Spider):
-    """Concurrent URL spider with Camoufox stealth fallback.
+    """Concurrent URL spider with CloakBrowser stealth fallback.
 
-    V5.0 architecture:
+    V6.0 architecture:
     * **Tier 1** (``FetcherSession`` — curl_cffi with chrome146 TLS fingerprint)
-    * **Tier 2** (``Camoufox`` — patched Firefox with C++ level stealth)
+    * **Tier 2** (``CloakBrowser`` — patched Chromium with 71 C++ stealth patches)
 
     When Tier 1 returns a blocked status code (403/429/503) with Cloudflare
-    challenge markers, the spider falls back to Camoufox for that URL.
+    challenge markers, the spider falls back to CloakBrowser for that URL.
 
-    Camoufox uses a shared browser instance with concurrent page pool (max 2)
-    to avoid memory explosion. The browser is lazily initialized on first
-    blocked request and cleaned up when the spider closes.
+    CloakBrowser uses a shared browser instance with concurrent page pool.
+    Chromium handles multi-page concurrency much better than Firefox (Camoufox).
     """
 
     name = "news_spider"
     concurrent_requests = DEFAULT_CONCURRENT_REQUESTS
     concurrent_requests_per_domain = DEFAULT_CONCURRENT_PER_DOMAIN
     # V5.2: Disable Scrapling's retry for TLS errors — they won't succeed on retry
-    # because the same engine is used. Failed URLs go directly to Camoufox fallback
+    # because the same engine is used. Failed URLs go directly to CloakBrowser fallback
     # in fetch_urls_with_spider(), which is more effective.
     max_blocked_retries = 0
 
@@ -237,21 +236,20 @@ class NewsSpider(Spider):
         # Internal tracking for gap-fill detection
         self._completed_urls: set[str] = set()
 
-        # ── Camoufox browser pool ─────────────────────────────────────
+        # ── CloakBrowser pool ─────────────────────────────────────────
         # Shared browser instance with concurrent page pool
-        self._camoufox_manager: Any = None  # AsyncCamoufox context manager
-        self._camoufox_browser: Any = None  # BrowserContext (from __aenter__)
-        self._camoufox_lock = asyncio.Lock()  # Protects browser initialization
-        self._camoufox_semaphore = asyncio.Semaphore(CAMOUFOX_MAX_CONCURRENT)
+        self._cloak_browser: Any = None  # Playwright Browser (from launch_async)
+        self._cloak_lock = asyncio.Lock()  # Protects browser initialization
+        self._cloak_semaphore = asyncio.Semaphore(CLOAK_MAX_CONCURRENT)
 
     # ── Session configuration ─────────────────────────────────────────
 
     def configure_sessions(self, manager):
-        """Configure Tier 1 session only (Camoufox is handled in parse callback).
+        """Configure Tier 1 session only (CloakBrowser is handled in parse callback).
         
         V5.2: retries=0 disables FetcherSession's internal retry for TLS errors.
         TLS errors won't succeed on retry (same engine), so we skip directly to
-        Camoufox fallback in fetch_urls_with_spider().
+        CloakBrowser fallback in fetch_urls_with_spider().
         """
         # follow_redirects=True bypasses SSRF protection for sites like EastMoney
         # that may have redirect chains through internal IPs (anti-bot mechanisms)
@@ -259,7 +257,7 @@ class NewsSpider(Spider):
         manager.add("fast", FetcherSession(
             impersonate="chrome",
             follow_redirects=True,
-            retries=0,  # V5.2: Disable TLS error retry — Camoufox fallback handles it
+            retries=0,  # V5.2: Disable TLS error retry — CloakBrowser fallback handles it
         ))
 
     # ── Request generation ────────────────────────────────────────────
@@ -272,24 +270,24 @@ class NewsSpider(Spider):
     # ── Response parsing ──────────────────────────────────────────────
 
     async def parse(self, response: Response):
-        """Process response, falling back to Camoufox if blocked.
+        """Process response, falling back to CloakBrowser if blocked.
 
-        V5.0: When Tier 1 is blocked (403/429/503 + CF challenge),
-        fetch via Camoufox directly in the parse callback.
+        V6.0: When Tier 1 is blocked (403/429/503 + CF challenge),
+        fetch via CloakBrowser directly in the parse callback.
         """
         # Use the original request URL (handles redirects correctly)
         url = getattr(response.request, "url", response.url)
         self._completed_urls.add(url)
 
-        # Check if blocked → fall back to Camoufox
+        # Check if blocked → fall back to CloakBrowser
         if self._is_blocked_response(response):
             logger.warning(
-                "Tier 1 (chrome146) blocked for %s (status=%d) — falling back to Camoufox",
+                "Tier 1 (chrome146) blocked for %s (status=%d) — falling back to CloakBrowser",
                 url,
                 response.status,
             )
-            # Fetch via Camoufox (shared browser, concurrent page pool)
-            html_content, error = await self._fetch_with_camoufox(url)
+            # Fetch via CloakBrowser (shared browser, concurrent page pool)
+            html_content, error = await self._fetch_with_cloak(url)
             if html_content:
                 yield {
                     "url": url,
@@ -303,7 +301,7 @@ class NewsSpider(Spider):
                     "url": url,
                     "status": 0,
                     "html_content": "",
-                    "error": error or "Camoufox fetch failed",
+                    "error": error or "CloakBrowser fetch failed",
                     "used_stealth": True,
                 }
         else:
@@ -316,66 +314,48 @@ class NewsSpider(Spider):
                 "used_stealth": False,
             }
 
-    # ── Camoufox browser pool ─────────────────────────────────────────
+    # ── CloakBrowser pool ─────────────────────────────────────────────
 
-    async def _get_camoufox_browser(self) -> Any:
-        """Get or create the shared Camoufox browser context.
+    async def _get_cloak_browser(self) -> Any:
+        """Get or create the shared CloakBrowser instance.
         
         Thread-safe: uses asyncio.Lock to prevent race conditions
         during lazy initialization.
         
-        Returns the BrowserContext (from __aenter__), not the AsyncCamoufox
-        context manager itself.
+        Returns a Playwright async Browser object.
         
-        V5.1: Optimized parameters for Cloudflare bypass:
-        - geoip=True: Auto-set timezone/language/coords based on IP
-        - os="windows": Match fingerprint to Windows OS
-        - block_webrtc=True: Prevent WebRTC IP leak
-        - disable_coop=True: Allow clicking CF Turnstile in cross-origin iframes
-        - enable_cache=True: Reuse CF cookies for same domain
+        V6.0: CloakBrowser parameters:
+        - headless=True: Run without visible window
+        - geoip=True: Auto-set timezone/language based on IP
+        - humanize=True: Enable human-like mouse/keyboard behavior
         """
-        async with self._camoufox_lock:
-            if self._camoufox_browser is None:
-                logger.info("Initializing Camoufox browser (shared instance)...")
+        async with self._cloak_lock:
+            if self._cloak_browser is None:
+                logger.info("Initializing CloakBrowser (shared instance)...")
                 try:
-                    from camoufox.async_api import AsyncCamoufox
-                    # AsyncCamoufox is a context manager that returns BrowserContext
-                    self._camoufox_manager = AsyncCamoufox(
+                    from cloakbrowser import launch_async
+                    
+                    self._cloak_browser = await launch_async(
                         headless=True,
-                        humanize=True,
-                        # V5.1: Optimized for Cloudflare bypass
-                        geoip=True,           # Auto-set timezone/language based on IP
-                        os="windows",         # Match fingerprint to Windows
-                        block_webrtc=True,    # Prevent WebRTC IP leak
-                        disable_coop=True,    # Allow clicking CF Turnstile
-                        enable_cache=True,    # Reuse CF cookies
-                        i_know_what_im_doing=True,  # Suppress LeakWarning for disable_coop
+                        geoip=True,      # Auto-set timezone/language based on IP
+                        humanize=True,   # Human-like mouse/keyboard behavior
                     )
-                    # __aenter__ returns the Browser/BrowserContext
-                    self._camoufox_browser = await self._camoufox_manager.__aenter__()
-                    logger.info("Camoufox browser initialized successfully")
+                    logger.info("CloakBrowser initialized successfully")
                 except ImportError:
                     logger.error(
-                        "Camoufox not installed. Run: pip install 'camoufox[geoip]' && camoufox fetch"
+                        "CloakBrowser not installed. Run: pip install cloakbrowser"
                     )
                     raise
                 except Exception as e:
-                    logger.error("Failed to initialize Camoufox browser: %s", e)
+                    logger.error("Failed to initialize CloakBrowser: %s", e)
                     raise
-        return self._camoufox_browser
+        return self._cloak_browser
 
-    async def _fetch_with_camoufox(self, url: str) -> tuple[str, str | None]:
-        """Fetch a URL using the shared Camoufox browser.
+    async def _fetch_with_cloak(self, url: str) -> tuple[str, str | None]:
+        """Fetch a URL using the shared CloakBrowser.
 
         Uses semaphore to limit concurrent pages.
-        Timeout: 25s for fast failure.
-
-        V5.2: page.close() wrapped in try/except to prevent TargetClosedError
-        when the page is still navigating at timeout.
-        
-        V5.3: Detect anti-bot challenge pages in returned HTML. If Camoufox
-        successfully fetched HTML but it contains challenge markers, treat as
-        failure to avoid saving garbage content.
+        Timeout: 30s for page loads.
 
         Args:
             url: URL to fetch.
@@ -385,64 +365,60 @@ class NewsSpider(Spider):
             On success: (html, None)
             On failure: ("", error_string)
         """
-        # Acquire semaphore to limit concurrent Camoufox pages
-        await self._camoufox_semaphore.acquire()
+        # Acquire semaphore to limit concurrent CloakBrowser pages
+        await self._cloak_semaphore.acquire()
         try:
-            browser = await self._get_camoufox_browser()
+            browser = await self._get_cloak_browser()
             page = await browser.new_page()
             try:
-                await page.goto(url, timeout=CAMOUFOX_TIMEOUT_MS)
+                await page.goto(url, timeout=CLOAK_TIMEOUT_MS, wait_until="domcontentloaded")
                 html = await page.content()
                 
-                # V5.3: Check if the returned HTML is an anti-bot challenge page
-                # V5.4: Only flag as challenge if it's small (< 50KB) or has specific markers
-                # (large pages that mention "cloudflare" are usually real pages using CF CDN)
+                # Check if the returned HTML is an anti-bot challenge page
                 if html and self._has_cloudflare_challenge(html):
                     # Verify it's actually a challenge page, not just a normal page mentioning CF
                     if len(html) < 50000 or "challenge-platform" in html.lower() or "just a moment" in html.lower():
-                        error = "Camoufox returned anti-bot challenge page"
+                        error = "CloakBrowser returned anti-bot challenge page"
                         logger.warning("%s: %s", url, error)
                         return "", error
                 
                 logger.debug(
-                    "Camoufox fetched %d chars from %s",
+                    "CloakBrowser fetched %d chars from %s",
                     len(html or ""),
                     url,
                 )
                 return html or "", None
             except asyncio.TimeoutError:
-                error = f"Camoufox timeout after {CAMOUFOX_TIMEOUT_MS}ms"
+                error = f"CloakBrowser timeout after {CLOAK_TIMEOUT_MS}ms"
                 logger.warning("%s: %s", url, error)
                 return "", error
             except Exception as e:
-                error = f"Camoufox error: {e}"
+                error = f"CloakBrowser error: {e}"
                 logger.warning("%s: %s", url, error)
                 return "", error
             finally:
-                # V5.2: Safe close — suppress TargetClosedError
-                # (page may still be navigating when timeout fires)
+                # Safe close — suppress errors
                 try:
                     await page.close()
                 except Exception:
                     pass
         finally:
-            self._camoufox_semaphore.release()
+            self._cloak_semaphore.release()
 
-    async def _close_camoufox_browser(self):
-        """Close the shared Camoufox browser instance.
+    async def _close_cloak_browser(self):
+        """Close the shared CloakBrowser instance.
         
         Called when the spider closes to prevent zombie processes.
         """
-        async with self._camoufox_lock:
-            if self._camoufox_manager is not None:
+        async with self._cloak_lock:
+            if self._cloak_browser is not None:
                 try:
-                    logger.info("Closing Camoufox browser...")
-                    await self._camoufox_manager.__aexit__(None, None, None)
-                    self._camoufox_browser = None
-                    self._camoufox_manager = None
-                    logger.info("Camoufox browser closed")
+                    logger.info("Closing CloakBrowser...")
+                    await self._cloak_browser.close()
+                    self._cloak_browser = None
+                    logger.info("CloakBrowser closed")
                 except Exception as e:
-                    logger.warning("Error closing Camoufox browser: %s", e)
+                    logger.warning("Error closing CloakBrowser: %s", e)
 
     # ── Blocked detection ─────────────────────────────────────────────
 
@@ -450,7 +426,7 @@ class NewsSpider(Spider):
         """Always return False — blocked detection is handled in parse() callback.
         
         V5.0: We don't use Scrapling's retry mechanism because we handle
-        Camoufox fallback directly in parse(). This avoids conflicts with
+        CloakBrowser fallback directly in parse(). This avoids conflicts with
         the removed AsyncStealthySession.
         """
         return False
@@ -469,7 +445,7 @@ class NewsSpider(Spider):
         if not html:
             # Blocked status with no HTML — treat as blocked
             logger.warning(
-                "Tier 1 blocked for %s (status=%d, no HTML) — falling back to Camoufox",
+                "Tier 1 blocked for %s (status=%d, no HTML) — falling back to CloakBrowser",
                 response.url,
                 response.status,
             )
@@ -477,7 +453,7 @@ class NewsSpider(Spider):
 
         if self._has_cloudflare_challenge(html):
             logger.warning(
-                "Tier 1 blocked for %s (status=%d, CF challenge detected, html_len=%d) — falling back to Camoufox",
+                "Tier 1 blocked for %s (status=%d, CF challenge detected, html_len=%d) — falling back to CloakBrowser",
                 response.url,
                 response.status,
                 len(html),
@@ -625,8 +601,8 @@ async def fetch_urls_with_spider(
 ) -> list[SpiderResult]:
     """Convenience: create a NewsSpider, fetch URLs, return results.
 
-    V5.1: For URLs that failed at Tier 1 (TLS errors, connection refused, etc.),
-    retry with Camoufox as a final fallback. This handles cases where curl_cffi
+    V6.0: For URLs that failed at Tier 1 (TLS errors, connection refused, etc.),
+    retry with CloakBrowser as a final fallback. This handles cases where curl_cffi
     fails before getting any HTTP response.
 
     Args:
@@ -648,8 +624,8 @@ async def fetch_urls_with_spider(
         async for item in spider.stream():
             stream_items.append(item)
     finally:
-        # ── Cleanup: Close Camoufox browser to prevent zombie processes ──
-        await spider._close_camoufox_browser()
+        # ── Cleanup: Close CloakBrowser to prevent zombie processes ──
+        await spider._close_cloak_browser()
 
         # Explicitly close session manager to prevent "Event loop is closed"
         # errors on exit. Scrapling's stream() doesn't do this automatically.
@@ -660,31 +636,31 @@ async def fetch_urls_with_spider(
 
     results = spider._collect_results(stream_items)
 
-    # V5.1: Retry failed URLs with Camoufox (handles TLS errors, connection refused, etc.)
+    # V6.0: Retry failed URLs with CloakBrowser (handles TLS errors, connection refused, etc.)
     failed_urls = [r for r in results if r.error and not r.html_content]
     if failed_urls:
         logger.info(
-            "Retrying %d failed URLs with Camoufox fallback (TLS errors, connection refused, etc.)",
+            "Retrying %d failed URLs with CloakBrowser fallback (TLS errors, connection refused, etc.)",
             len(failed_urls),
         )
-        # Create a temporary spider just for Camoufox access
+        # Create a temporary spider just for CloakBrowser access
         retry_spider = NewsSpider(urls=[])
         try:
-            # Initialize Camoufox browser
-            await retry_spider._get_camoufox_browser()
+            # Initialize CloakBrowser
+            await retry_spider._get_cloak_browser()
             
-            # Retry each failed URL with Camoufox
+            # Retry each failed URL with CloakBrowser
             retry_tasks = [
-                retry_spider._fetch_with_camoufox(r.url)
+                retry_spider._fetch_with_cloak(r.url)
                 for r in failed_urls
             ]
             retry_results = await asyncio.gather(*retry_tasks, return_exceptions=True)
             
-            # Update results with Camoufox responses
+            # Update results with CloakBrowser responses
             for i, (result, retry_result) in enumerate(zip(failed_urls, retry_results)):
                 if isinstance(retry_result, Exception):
                     logger.warning(
-                        "Camoufox retry failed for %s: %s",
+                        "CloakBrowser retry failed for %s: %s",
                         result.url,
                         retry_result,
                     )
@@ -701,12 +677,12 @@ async def fetch_urls_with_spider(
                         used_stealth=True,
                     )
                     logger.info(
-                        "Camoufox retry succeeded for %s (%d chars)",
+                        "CloakBrowser retry succeeded for %s (%d chars)",
                         result.url,
                         len(html_content),
                     )
         finally:
-            await retry_spider._close_camoufox_browser()
+            await retry_spider._close_cloak_browser()
 
     return results
 
@@ -718,8 +694,8 @@ __all__ = [
     "DEFAULT_CONCURRENT_REQUESTS",
     "DEFAULT_CONCURRENT_PER_DOMAIN",
     "DEFAULT_TIMEOUT_MS",
-    "CAMOUFOX_TIMEOUT_MS",
-    "CAMOUFOX_MAX_CONCURRENT",
+    "CLOAK_TIMEOUT_MS",
+    "CLOAK_MAX_CONCURRENT",
     "BLOCKED_STATUS_CODES",
     "BATCH_SIZE",
 ]
