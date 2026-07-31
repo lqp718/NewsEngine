@@ -139,8 +139,8 @@ DEFAULT_TIMEOUT_MS: int = 30000
 CLOAK_TIMEOUT_MS: int = 30000
 """Timeout for CloakBrowser page loads."""
 
-CLOAK_MAX_CONCURRENT: int = 3
-"""Maximum concurrent CloakBrowser pages (Chromium handles multi-page well)."""
+CLOAK_MAX_CONCURRENT: int = 1
+"""Maximum concurrent CloakBrowser pages (free version limits 1 session)."""
 
 BLOCKED_STATUS_CODES: frozenset[int] = frozenset({403, 429, 503})
 """HTTP status codes that trigger Tier 2 (CloakBrowser) fallback."""
@@ -279,31 +279,24 @@ class NewsSpider(Spider):
         url = getattr(response.request, "url", response.url)
         self._completed_urls.add(url)
 
-        # Check if blocked → fall back to CloakBrowser
+        # Check if blocked → defer to Tier 2 (CloakBrowser) AFTER spider completes
         if self._is_blocked_response(response):
             logger.warning(
-                "Tier 1 (chrome146) blocked for %s (status=%d) — falling back to CloakBrowser",
+                "Tier 1 (chrome146) blocked for %s (status=%d) — queued for CloakBrowser retry",
                 url,
                 response.status,
             )
-            # Fetch via CloakBrowser (shared browser, concurrent page pool)
-            html_content, error = await self._fetch_with_cloak(url)
-            if html_content:
-                yield {
-                    "url": url,
-                    "status": 200,
-                    "html_content": html_content,
-                    "error": None,
-                    "used_stealth": True,
-                }
-            else:
-                yield {
-                    "url": url,
-                    "status": 0,
-                    "html_content": "",
-                    "error": error or "CloakBrowser fetch failed",
-                    "used_stealth": True,
-                }
+            # IMPORTANT: Do NOT call CloakBrowser here. Scrapling's Spider engine
+            # shares the event loop with Tier 1 concurrent requests, which interferes
+            # with Playwright's WebSocket connection (ERR_CONNECTION_CLOSED).
+            # Tier 2 runs after spider.stream() completes in fetch_urls_with_spider().
+            yield {
+                "url": url,
+                "status": response.status,
+                "html_content": "",
+                "error": "Tier 1 blocked, queued for CloakBrowser retry",
+                "used_stealth": False,
+            }
         else:
             # Tier 1 succeeded
             yield {
