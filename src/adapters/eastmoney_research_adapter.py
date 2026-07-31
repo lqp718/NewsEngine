@@ -325,8 +325,12 @@ class EastMoneyResearchAdapter(BaseAdapter):
     async def _fetch_pdf_content(self, info_code: str) -> str:
         """Download and extract text from PDF.
         
-        Uses infoCode (e.g., 'AP202607281827423474') to construct PDF URL.
-        URL format: https://pdf.dfcfw.com/pdf/H3_AP{infoCode}_1.pdf
+        TODO: PDF 反爬问题 - pdf.dfcfw.com 返回 HTTP 200 但 Content-Length: 0
+        原因：东财检测到非住宅 IP / WSL2 环境，返回空内容而非 403
+        当前状态：使用 abstract 兜底，后续可考虑：
+          1. 用 browser 工具模拟浏览器下载（慢但可靠）
+          2. 换用 iwencai 研报 API（需要 X-Claw Header）
+          3. 接受 abstract 兜底方案
         """
         if not info_code:
             return ""

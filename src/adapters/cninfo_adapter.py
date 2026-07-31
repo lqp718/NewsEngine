@@ -164,37 +164,51 @@ class CNInfoAdapter(BaseAdapter):
     async def _fetch_stock_announcements(
         self, symbol: str, entry: dict[str, str]
     ) -> list[dict]:
-        """Fetch announcements for a single stock."""
-        # Build request payload
-        # Convert ticker format: "0700.HK" -> "00700", "000001.SZ" -> "000001"
-        stock_code = symbol.split(".")[0] if "." in symbol else symbol
-        # Remove exchange prefix (SH/SZ) if present
-        stock_code = re.sub(r"^(SH|SZ|sh|sz)", "", stock_code)
-        # Ensure 6-digit format for A-shares
-        if len(stock_code) < 6 and stock_code.isdigit():
-            stock_code = stock_code.zfill(6)
+        """Fetch announcements for a single stock.
         
-        # Skip non-A-share stocks (CNInfo only supports A-shares)
-        if not stock_code.isdigit() or len(stock_code) != 6:
-            logger.debug("CNInfo: skipping non-A-share stock %s", symbol)
-            return []
+        Supports A-shares (SSE/SZSE) and HK stocks (HKEX).
+        """
+        # Parse ticker format
+        exchange = entry.get("exchange", "").upper()
         
-        # Determine exchange and build orgId
-        # For SZSE: orgId format is "gssz" + 7-digit code
-        # For SSE: orgId format is "gssh" + 7-digit code
-        if stock_code.startswith("6"):
-            column = "sse"  # 上交所
-            org_id = f"gssh{stock_code.zfill(7)}"
-        elif stock_code.startswith("0") or stock_code.startswith("3"):
-            column = "szse"  # 深交所
-            org_id = f"gssz{stock_code.zfill(7)}"
+        # Determine column and stock_param based on exchange
+        if exchange == "HKEX":
+            # HK stocks: column="hke", stock="00700,gshk0000700"
+            stock_code = symbol.split(".")[0] if "." in symbol else symbol
+            stock_code = re.sub(r"^(HK|hk)", "", stock_code)
+            # Ensure 5-digit format
+            if len(stock_code) < 5 and stock_code.isdigit():
+                stock_code = stock_code.zfill(5)
+            
+            if not stock_code.isdigit() or len(stock_code) != 5:
+                logger.debug("CNInfo: skipping invalid HK stock %s", symbol)
+                return []
+            
+            column = "hke"
+            org_id = f"gshk{stock_code.zfill(7)}"
+            stock_param = f"{stock_code},{org_id}"
         else:
-            # Skip non-A-share codes (e.g., HK stocks)
-            logger.debug("CNInfo: skipping non-A-share code %s", stock_code)
-            return []
-        
-        # CNInfo API requires stock parameter in format: "stockCode,orgId"
-        stock_param = f"{stock_code},{org_id}"
+            # A-shares: column="sse" or "szse"
+            stock_code = symbol.split(".")[0] if "." in symbol else symbol
+            stock_code = re.sub(r"^(SH|SZ|sh|sz)", "", stock_code)
+            if len(stock_code) < 6 and stock_code.isdigit():
+                stock_code = stock_code.zfill(6)
+            
+            if not stock_code.isdigit() or len(stock_code) != 6:
+                logger.debug("CNInfo: skipping non-A-share stock %s", symbol)
+                return []
+            
+            if stock_code.startswith("6"):
+                column = "sse"
+                org_id = f"gssh{stock_code.zfill(7)}"
+            elif stock_code.startswith("0") or stock_code.startswith("3"):
+                column = "szse"
+                org_id = f"gssz{stock_code.zfill(7)}"
+            else:
+                logger.debug("CNInfo: skipping non-A-share code %s", stock_code)
+                return []
+            
+            stock_param = f"{stock_code},{org_id}"
         
         payload = {
             "pageNum": "1",
