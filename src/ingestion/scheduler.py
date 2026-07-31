@@ -182,6 +182,8 @@ class IngestionScheduler:
         self._cls_adapter: Any = None  # V6.1: CLS telegraph (primary stock news)
         self._eastmoney_adapter: Any = None  # V6.1: demoted to fallback
         self._akshare_adapter: Any = None
+        self._cninfo_adapter: Any = None  # V6.2: CNInfo announcements (Phase 2)
+        self._eastmoney_research_adapter: Any = None  # V6.3: EastMoney research reports (Phase 3)
 
         # ── Briefing Aggregator ───────────────────────────────────
         self._aggregator = SectorBriefingAggregator() if not dry_run else None
@@ -413,9 +415,13 @@ class IngestionScheduler:
 
         # ── Stock pipeline: CLS (primary) → EastMoney (fallback) → AkShare (fallback) ──
         # V6.1: CLS telegraph replaces EastMoney as primary stock news source
+        # V6.2: CNInfo announcements (Phase 2)
+        # V6.3: EastMoney research reports (Phase 3)
         if "akshare" in sources:
             from src.adapters.cls_adapter import CLSAdapter
             from src.adapters.eastmoney_adapter import EastMoneyAdapter
+            from src.adapters.cninfo_adapter import CNInfoAdapter
+            from src.adapters.eastmoney_research_adapter import EastMoneyResearchAdapter
 
             settings = get_settings()
             
@@ -436,18 +442,34 @@ class IngestionScheduler:
                 dedup_cache=self._dedup_cache,
                 content_fetcher=content_fetcher,
             )
+            
+            # V6.2: CNInfo announcements (Phase 2)
+            self._cninfo_adapter = CNInfoAdapter(
+                max_announcements=getattr(settings, 'cninfo_max_announcements', 5),
+                max_pdf_pages=getattr(settings, 'cninfo_max_pdf_pages', 10),
+                dedup_cache=self._dedup_cache,
+            )
+            
+            # V6.3: EastMoney research reports (Phase 3)
+            self._eastmoney_research_adapter = EastMoneyResearchAdapter(
+                max_reports=getattr(settings, 'eastmoney_research_max_reports', 3),
+                max_pdf_pages=getattr(settings, 'eastmoney_research_max_pdf_pages', 15),
+                dedup_cache=self._dedup_cache,
+            )
         else:
-            logger.info("Dry-run: CLS/EastMoney/AkShare adapters skipped (source_filter=%s)", self._source_filter)
+            logger.info("Dry-run: CLS/EastMoney/AkShare/CNInfo/EastMoneyResearch adapters skipped (source_filter=%s)", self._source_filter)
 
         logger.info(
             "Scheduler components initialized: "
-            "GDELT=%s, RSS=%s feeds, CLS=%s, EastMoney=%s, AkShare=%s"
+            "GDELT=%s, RSS=%s feeds, CLS=%s, EastMoney=%s, AkShare=%s, CNInfo=%s, EastMoneyResearch=%s"
             "%s",
             "yes" if self._gdelt_adapter else "no",
             len(self._rss_adapter.feed_urls) if self._rss_adapter else "no",
             "yes" if self._cls_adapter else "no",
             "yes" if self._eastmoney_adapter else "no",
             "yes" if self._akshare_adapter else "no",
+            "yes" if self._cninfo_adapter else "no",
+            "yes" if self._eastmoney_research_adapter else "no",
             " [dry-run mode]" if self._dry_run else ""
         )
 
@@ -553,19 +575,39 @@ class IngestionScheduler:
             return await self._run_adapter_pipeline(
                 self._akshare_adapter, self._symbol_writer, tickers
             )
+        
+        # V6.2/V6.3: CNInfo and EastMoney Research run in parallel with stock pipeline
+        async def _cninfo_pipeline() -> PipelineResult | None:
+            """CNInfo announcements pipeline (Phase 2)."""
+            if self._cninfo_adapter is None:
+                return None
+            return await self._run_adapter_pipeline(
+                self._cninfo_adapter, self._symbol_writer, tickers
+            )
+        
+        async def _eastmoney_research_pipeline() -> PipelineResult | None:
+            """EastMoney research reports pipeline (Phase 3)."""
+            if self._eastmoney_research_adapter is None:
+                return None
+            return await self._run_adapter_pipeline(
+                self._eastmoney_research_adapter, self._symbol_writer, tickers
+            )
 
         macro_coros = [
             self._run_adapter_pipeline(self._gdelt_adapter, self._macro_writer, tickers),
             self._run_adapter_pipeline(self._rss_adapter, self._macro_writer, tickers),
         ]
 
-        # Run macro pipelines + stock pipeline concurrently
-        all_coros = [*macro_coros, _stock_pipeline()]
+        # Run macro pipelines + stock pipeline + CNInfo + EastMoney Research concurrently
+        all_coros = [*macro_coros, _stock_pipeline(), _cninfo_pipeline(), _eastmoney_research_pipeline()]
 
         completed = await asyncio.gather(*all_coros, return_exceptions=True)
 
-        source_names = ["gdelt_csv", "rss", "stock"]
+        source_names = ["gdelt_csv", "rss", "stock", "cninfo", "eastmoney_research"]
         for i, result in enumerate(completed):
+            # Skip None results (adapter not initialized)
+            if result is None:
+                continue
             if isinstance(result, Exception):
                 logger.error(
                     "Adapter pipeline [%s] threw unhandled exception: %s",
@@ -651,9 +693,13 @@ class IngestionScheduler:
         """Update ticker whitelists for CLS, EastMoney and AkShare stock pipelines.
 
         V6.1: CLS adapter now primary, EastMoney demoted to fallback.
+        V6.2: CNInfo announcements (Phase 2)
+        V6.3: EastMoney research reports (Phase 3)
         - CLSAdapter: name-based entity extraction (uses stock Chinese name)
         - EastMoneyAdapter: name-based search (uses stock Chinese name)
         - AkShareAdapter: symbol-based search (uses biz_code)
+        - CNInfoAdapter: symbol-based search (uses symbol)
+        - EastMoneyResearchAdapter: symbol-based search (uses symbol)
 
         GDELT/RSS macro pipeline no longer uses ticker whitelist.
         """
@@ -686,6 +732,32 @@ class IngestionScheduler:
                 biz_code = entry.get("biz_code", "")
                 if biz_code:
                     self._akshare_adapter._symbol_map[biz_code] = entry
+        
+        # V6.2: CNInfoAdapter: index by symbol (support both 'ticker' and 'symbol' fields)
+        if self._cninfo_adapter is not None:
+            self._cninfo_adapter.ticker_whitelist = tickers
+            self._cninfo_adapter._symbol_map = {}
+            self._cninfo_adapter._name_map = {}
+            for entry in tickers:
+                symbol = entry.get("ticker", "") or entry.get("symbol", "")
+                name = entry.get("name", "")
+                if symbol:
+                    self._cninfo_adapter._symbol_map[symbol] = entry
+                if name:
+                    self._cninfo_adapter._name_map[name] = entry
+        
+        # V6.3: EastMoneyResearchAdapter: index by symbol (support both 'ticker' and 'symbol' fields)
+        if self._eastmoney_research_adapter is not None:
+            self._eastmoney_research_adapter.ticker_whitelist = tickers
+            self._eastmoney_research_adapter._symbol_map = {}
+            self._eastmoney_research_adapter._name_map = {}
+            for entry in tickers:
+                symbol = entry.get("ticker", "") or entry.get("symbol", "")
+                name = entry.get("name", "")
+                if symbol:
+                    self._eastmoney_research_adapter._symbol_map[symbol] = entry
+                if name:
+                    self._eastmoney_research_adapter._name_map[name] = entry
 
     # ── TTL Cleanup (V2.2 Layer 2) ─────────────────────────────────────
 
@@ -816,6 +888,14 @@ class IngestionScheduler:
         elif self._akshare_adapter is not None:
             # Neither CLS nor EastMoney configured, use AkShare
             adapters_to_run.append((self._akshare_adapter, "akshare"))
+        
+        # V6.2: CNInfo announcements (Phase 2) - supplementary source
+        if self._cninfo_adapter is not None:
+            adapters_to_run.append((self._cninfo_adapter, "cninfo"))
+        
+        # V6.3: EastMoney research reports (Phase 3) - supplementary source
+        if self._eastmoney_research_adapter is not None:
+            adapters_to_run.append((self._eastmoney_research_adapter, "eastmoney_research"))
 
         if not adapters_to_run:
             logger.warning("Dry-run: no adapters to run (all skipped by source_filter)")
@@ -837,7 +917,7 @@ class IngestionScheduler:
                 result = await run_pipeline(
                     adapter=adapter,
                     writer=None,
-                    tickers=tickers if source_name in ("akshare", "eastmoney", "cls") else None,
+                    tickers=tickers if source_name in ("akshare", "eastmoney", "cls", "cninfo", "eastmoney_research") else None,
                     dry_run=True,
                 )
                 results.append(result)
@@ -848,13 +928,20 @@ class IngestionScheduler:
                         result.episode_count,
                         result.elapsed_seconds,
                     )
-                    # Stock pipeline: if CLS/EastMoney returned episodes, skip fallback
+                    # Stock pipeline fallback: if CLS returned episodes, skip EastMoney/AkShare
+                    # But CNInfo and EastMoney Research should still run (they are supplementary)
                     if source_name == "cls" and result.episode_count > 0:
                         logger.info("CLS returned %d episodes, skipping EastMoney/AkShare fallback", result.episode_count)
-                        break
+                        # Skip only the fallback chain, not supplementary sources
+                        while idx < len(adapters_to_run) and adapters_to_run[idx][1] in ("eastmoney", "akshare"):
+                            idx += 1
+                        continue  # Continue to run CNInfo and EastMoney Research
                     if source_name == "eastmoney" and result.episode_count > 0:
                         logger.info("EastMoney returned %d episodes, skipping AkShare fallback", result.episode_count)
-                        break
+                        # Skip only AkShare fallback
+                        while idx < len(adapters_to_run) and adapters_to_run[idx][1] == "akshare":
+                            idx += 1
+                        continue
                 else:
                     logger.error(
                         "Dry-run [%s]: FAILED after %.1fs: %s",

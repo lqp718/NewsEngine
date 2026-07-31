@@ -89,4 +89,6 @@ class BaseAdapter(ABC):
         import asyncio
         records = await self.fetch(**kwargs)
         episodes = await asyncio.gather(*[self.normalize(r) for r in records])
-        return self.dedup(episodes)
+        # Filter out None results (e.g., when normalize skips due to date cutoff)
+        valid_episodes = [ep for ep in episodes if ep is not None]
+        return self.dedup(valid_episodes)
