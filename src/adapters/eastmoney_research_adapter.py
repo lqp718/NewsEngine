@@ -335,8 +335,9 @@ class EastMoneyResearchAdapter(BaseAdapter):
         if not info_code:
             return ""
         
-        # PDF URL format: https://pdf.dfcfw.com/pdf/H3_AP{infoCode}_1.pdf
-        pdf_url = f"https://pdf.dfcfw.com/pdf/H3_AP{info_code}_1.pdf"
+        # PDF URL format: https://pdf.dfcfw.com/pdf/H3_{infoCode}_1.pdf
+        # info_code already contains 'AP' prefix (e.g. AP202607311827537552)
+        pdf_url = f"https://pdf.dfcfw.com/pdf/H3_{info_code}_1.pdf"
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Referer": "https://data.eastmoney.com/",

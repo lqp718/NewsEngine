@@ -173,7 +173,9 @@ class RssAdapter(BaseAdapter):
             old_timeout = socket.getdefaulttimeout()
             socket.setdefaulttimeout(_RSS_SOCKET_TIMEOUT)
             try:
-                parsed = feedparser.parse(feed_url)
+                # Use a browser-like User-Agent to avoid 403 blocks from sites like mining.com
+                user_agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                parsed = feedparser.parse(feed_url, agent=user_agent)
             finally:
                 socket.setdefaulttimeout(old_timeout)
         except Exception as exc:

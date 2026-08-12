@@ -13,3 +13,26 @@ httpx>=0.27.0,<1.0
 pytest>=8.0.0,<9.0
 pytest-asyncio>=0.24.0,<1.0
 cloakbrowser>=0.5.0,<1.0
+
+# Web scraping & content extraction
+scrapling>=0.4.0,<1.0
+trafilatura>=2.0.0,<3.0
+curl_cffi>=0.16.0,<1.0
+
+# Optional soft dependency — Tier 3 Camoufox fallback (Firefox engine + Juggler protocol).
+# Used only when CloakBrowser (Tier 2) fails or crashes; lazily imported, skipped when absent.
+# Install manually when Tier 3 is needed:  pip install "camoufox[geoip]"
+# (Downloads a Firefox binary on first use; requires ~300MB disk and >=4GB RAM.)
+# camoufox[geoip]
+
+# RSS & feed parsing
+feedparser>=6.0.0,<7.0
+
+# PDF extraction (CNInfo, EastMoney Research)
+PyMuPDF>=1.24.0,<2.0
+
+# YAML parsing
+pyyaml>=6.0.0,<7.0
+
+# HTML/XML processing
+lxml>=5.0.0,<7.0

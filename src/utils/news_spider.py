@@ -1,20 +1,31 @@
 """NewsSpider — concurrent URL fetcher with anti-bot bypass and domain rate-limiting.
 
-V6.0: CloakBrowser integration for Tier 2 stealth.
+V7.0: 5-tier funnel (4 fetch tiers + 1 extraction tier).
 
 Uses Scrapling's official ``scrapling.spiders.Spider`` base class with:
 
 - ``FetcherSession(impersonate="chrome")`` for fast requests (Tier 1)
   - Uses curl_cffi with chrome146 TLS fingerprint
+  - Injects pooled ``cf_clearance`` cookies from ``(domain, "chrome146")``
+- Alternate TLS fingerprints ``firefox135`` / ``safari15_5`` (Tier 1.5)
+  - Independent ``FetcherSession`` per fingerprint, runs after Tier 1 stream
 - ``CloakBrowser`` (patched Chromium) for blocked requests (Tier 2)
   - 71 C++ source-level stealth patches
   - Native Playwright async API, stable multi-page concurrency
   - 30s timeout for page loads
+  - On success, extracts cookies (incl. ``cf_clearance``) into the pool
+- ``Camoufox`` (Firefox engine + Juggler protocol) ultimate fallback (Tier 3)
+  - Optional soft dependency: lazily imported, skipped when not installed
+  - On success, writes cookies into the pool under ``(domain, "firefox135")``
 
-Architecture:
+Architecture (4 fetch tiers + 1 extraction tier):
     Tier 1: FetcherSession (curl_cffi, chrome146) → fast, ~1s/page
-        ↓ blocked (403/429/503 + CF challenge)
+        ↓ blocked (403/429/503 + CF challenge) or connection failure
+    Tier 1.5: FetcherSession firefox135 → safari15_5 → ~1s/page each
+        ↓ still failed
     Tier 2: CloakBrowser (Chromium, C++ stealth) → stealth, ~5-15s/page
+        ↓ failed / crashed
+    Tier 3: Camoufox (Firefox + Juggler) → ultimate stealth, ~10-15s/page
         ↓ failed
     Mark as failed, return to caller
 
@@ -25,14 +36,17 @@ Usage::
         timeout_ms=30000,
     )
     for result in results:
-        print(result.url, result.status, len(result.html_content or ""))
+        print(result.url, result.status, result.fetch_tier, len(result.html_content or ""))
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
+from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlparse
 
 from scrapling.fetchers import FetcherSession
 from scrapling.spiders import Request, Response, Spider
@@ -148,6 +162,116 @@ BLOCKED_STATUS_CODES: frozenset[int] = frozenset({403, 429, 503})
 BATCH_SIZE: int = 15
 """Number of URLs to process in one batch (for interface compatibility)."""
 
+TIER1_FINGERPRINT: str = "chrome146"
+"""TLS fingerprint label used by Tier 1 (curl_cffi ``impersonate="chrome"`` → chrome146).
+
+Also the pool key fingerprint for cookies harvested by CloakBrowser (D7):
+CloakBrowser is a Chromium kernel, so its JA3 matches chrome146 closely and
+its ``cf_clearance`` can be reused by Tier 1 requests.
+"""
+
+TIER15_FINGERPRINTS: tuple[str, ...] = ("firefox135", "safari15_5")
+"""TLS fingerprints tried in order by Tier 1.5 (D5)."""
+
+CAMOUFOX_FINGERPRINT: str = "firefox135"
+"""Pool key fingerprint for cookies harvested by Camoufox (D13):
+Camoufox is a Firefox kernel, its TLS/JA3 fingerprint is closest to
+firefox135, so Tier 1.5 firefox135 requests can reuse those cookies.
+"""
+
+COOKIE_TTL_SEC: float = 25 * 60
+"""TTL for pooled cookies in seconds (D8: < cf_clearance's common ~30min lifetime)."""
+
+CAMOUFOX_PAGE_TIMEOUT_SEC: int = 15
+"""Page load timeout for Camoufox (Tier 3) in seconds."""
+
+
+# ── In-memory cookie pool (module-level, process memory only) ─────────
+# Cloudflare ``cf_clearance`` is bound to the TLS/JA3 fingerprint that
+# obtained it, so the pool is keyed by ``(domain, fingerprint)`` (D6).
+
+
+@dataclass
+class _CookieEntry:
+    """A single pooled cookie set with its fetch timestamp."""
+
+    cookies: dict[str, str]  # name -> value (may include cf_clearance)
+    fetched_at: float  # time.monotonic()
+
+
+def _domain_of(url: str) -> str:
+    """Extract the lowercase hostname from a URL (empty string if unparseable)."""
+    try:
+        return (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+_domain_cookie_pool: dict[tuple[str, str], _CookieEntry] = {}
+"""Module-level cookie pool keyed by ``(domain, fingerprint)``."""
+
+_pool_lock = asyncio.Lock()
+"""Protects concurrent reads/writes of the cookie pool."""
+
+
+async def pool_get(domain: str, fingerprint: str) -> dict[str, str] | None:
+    """Return non-expired pooled cookies for ``(domain, fingerprint)``.
+
+    Lazily evicts expired entries (D8): an entry older than ``COOKIE_TTL_SEC``
+    is removed on read and treated as a miss.
+
+    Returns:
+        A copy of the cookie dict, or ``None`` when no valid entry exists.
+    """
+    key = (domain, fingerprint)
+    async with _pool_lock:
+        entry = _domain_cookie_pool.get(key)
+        if entry is None:
+            return None
+        if time.monotonic() - entry.fetched_at > COOKIE_TTL_SEC:
+            del _domain_cookie_pool[key]
+            logger.debug(
+                "Evicted expired pooled cookies for %s (%s)", domain, fingerprint
+            )
+            return None
+        return dict(entry.cookies)
+
+
+async def pool_put(
+    domain: str, fingerprint: str, cookies: dict[str, str]
+) -> None:
+    """Store cookies in the pool under ``(domain, fingerprint)``.
+
+    Empty cookie dicts are ignored. Existing entries are replaced with a
+    fresh timestamp.
+    """
+    if not cookies:
+        return
+    key = (domain, fingerprint)
+    async with _pool_lock:
+        _domain_cookie_pool[key] = _CookieEntry(
+            cookies=dict(cookies),
+            fetched_at=time.monotonic(),
+        )
+    logger.debug(
+        "Pooled %d cookies for %s (%s)", len(cookies), domain, fingerprint
+    )
+
+
+async def pool_invalidate(domain: str, fingerprint: str) -> None:
+    """Remove a pool entry — injected cookies failed to bypass the block.
+
+    Keeps stale ``cf_clearance`` cookies from being reused repeatedly
+    against the same wall (D8).
+    """
+    key = (domain, fingerprint)
+    async with _pool_lock:
+        removed = _domain_cookie_pool.pop(key, None)
+    if removed is not None:
+        logger.debug(
+            "Invalidated pooled cookies for %s (%s)", domain, fingerprint
+        )
+
 
 # ── Data classes ──────────────────────────────────────────────────────
 
@@ -160,10 +284,22 @@ class SpiderResult:
         status: HTTP status code (0 if fetch failed entirely).
         html_content: Raw HTML string from the page (or empty).
         error: Human-readable error message if the request failed.
-        used_stealth: Whether the request was fetched via CloakBrowser (Tier 2).
+        used_stealth: Whether the request was fetched via a stealth browser
+            (Tier 2 CloakBrowser or Tier 3 Camoufox).
+        was_blocked: Whether the request was detected as blocked.
+        fetch_tier: Which fetch tier produced the HTML — "1" | "1.5" | "2" | "3"
+            (D10; defaults to "1", failed results may keep the attempted tier).
     """
 
-    __slots__ = ("url", "status", "html_content", "error", "used_stealth", "was_blocked")
+    __slots__ = (
+        "url",
+        "status",
+        "html_content",
+        "error",
+        "used_stealth",
+        "was_blocked",
+        "fetch_tier",
+    )
 
     def __init__(
         self,
@@ -173,6 +309,7 @@ class SpiderResult:
         error: str | None = None,
         used_stealth: bool = False,
         was_blocked: bool = False,
+        fetch_tier: str = "1",
     ) -> None:
         self.url = url
         self.status = status
@@ -180,6 +317,7 @@ class SpiderResult:
         self.error = error
         self.used_stealth = used_stealth
         self.was_blocked = was_blocked
+        self.fetch_tier = fetch_tier
 
     def __repr__(self) -> str:
         parts = [f"url={self.url!r}", f"status={self.status}"]
@@ -187,6 +325,8 @@ class SpiderResult:
             parts.append(f"error={self.error!r}")
         if self.used_stealth:
             parts.append("used_stealth=True")
+        if self.fetch_tier != "1":
+            parts.append(f"fetch_tier={self.fetch_tier!r}")
         return f"SpiderResult({', '.join(parts)})"
 
 
@@ -247,9 +387,14 @@ class NewsSpider(Spider):
     def configure_sessions(self, manager):
         """Configure Tier 1 session only (CloakBrowser is handled in parse callback).
         
-        V5.2: retries=0 disables FetcherSession's internal retry for TLS errors.
+        V5.2: retries disabled FetcherSession's internal retry for TLS errors.
         TLS errors won't succeed on retry (same engine), so we skip directly to
-        CloakBrowser fallback in fetch_urls_with_spider().
+        Tier 1.5 / CloakBrowser fallback in fetch_urls_with_spider().
+        
+        V7.0: ``retries=1`` (not ``retries=0``) — scrapling 0.4.14 builds the
+        attempt loop as ``range(max_retries)``, so ``retries=0`` never executes
+        a single request and raises "No active session available". ``retries=1``
+        preserves the original no-internal-retry intent (exactly one attempt).
         """
         # follow_redirects=True bypasses SSRF protection for sites like EastMoney
         # that may have redirect chains through internal IPs (anti-bot mechanisms)
@@ -257,15 +402,28 @@ class NewsSpider(Spider):
         manager.add("fast", FetcherSession(
             impersonate="chrome",
             follow_redirects=True,
-            retries=0,  # V5.2: Disable TLS error retry — CloakBrowser fallback handles it
+            retries=1,  # V7.0: 1 attempt (0 = never sends request in scrapling 0.4.14)
         ))
 
     # ── Request generation ────────────────────────────────────────────
 
     async def start_requests(self):
-        """Yield one Request per URL, starting with Tier 1 (fast session)."""
+        """Yield one Request per URL, starting with Tier 1 (fast session).
+
+        V7.0: injects pooled cookies for ``(domain, "chrome146")`` via the
+        Scrapling Request-level ``cookies`` parameter (D9).
+        """
         for url in self._urls:
-            yield Request(url, sid="fast")
+            cookies = await pool_get(_domain_of(url), TIER1_FINGERPRINT)
+            if cookies:
+                logger.debug(
+                    "Injecting %d pooled cookies for %s (chrome146)",
+                    len(cookies),
+                    url,
+                )
+                yield Request(url, sid="fast", cookies=cookies)
+            else:
+                yield Request(url, sid="fast")
 
     # ── Response parsing ──────────────────────────────────────────────
 
@@ -274,28 +432,39 @@ class NewsSpider(Spider):
 
         V6.0: When Tier 1 is blocked (403/429/503 + CF challenge),
         fetch via CloakBrowser directly in the parse callback.
+        V7.0: blocked results first go through Tier 1.5 (alternate TLS
+        fingerprints) in fetch_urls_with_spider() before Tier 2.
         """
         # Use the original request URL (handles redirects correctly)
         url = getattr(response.request, "url", response.url)
         self._completed_urls.add(url)
 
-        # Check if blocked → defer to Tier 2 (CloakBrowser) AFTER spider completes
+        # Check if blocked → defer to Tier 1.5 / Tier 2 AFTER spider completes
         if self._is_blocked_response(response):
+            # V7.0: injected pooled cookies still got blocked → invalidate them
+            request_kwargs = getattr(response.request, "_session_kwargs", None) or {}
+            if request_kwargs.get("cookies"):
+                await pool_invalidate(_domain_of(url), TIER1_FINGERPRINT)
+                logger.debug(
+                    "Invalidated pooled cookies for %s (chrome146) after continued block",
+                    url,
+                )
             logger.warning(
-                "Tier 1 (chrome146) blocked for %s (status=%d) — queued for CloakBrowser retry",
+                "Tier 1 (chrome146) blocked for %s (status=%d) — queued for Tier 1.5/2 retry",
                 url,
                 response.status,
             )
             # IMPORTANT: Do NOT call CloakBrowser here. Scrapling's Spider engine
             # shares the event loop with Tier 1 concurrent requests, which interferes
             # with Playwright's WebSocket connection (ERR_CONNECTION_CLOSED).
-            # Tier 2 runs after spider.stream() completes in fetch_urls_with_spider().
+            # Tier 1.5 / Tier 2 run after spider.stream() completes in fetch_urls_with_spider().
             yield {
                 "url": url,
                 "status": response.status,
                 "html_content": "",
-                "error": "Tier 1 blocked, queued for CloakBrowser retry",
+                "error": "Tier 1 blocked, queued for retry",
                 "used_stealth": False,
+                "fetch_tier": "1",
             }
         else:
             # Tier 1 succeeded
@@ -305,6 +474,7 @@ class NewsSpider(Spider):
                 "html_content": str(response.html_content),
                 "error": None,
                 "used_stealth": False,
+                "fetch_tier": "1",
             }
 
     # ── CloakBrowser pool ─────────────────────────────────────────────
@@ -330,8 +500,8 @@ class NewsSpider(Spider):
                     
                     self._cloak_browser = await launch_async(
                         headless=True,
-                        geoip=True,      # Auto-set timezone/language based on IP
-                        humanize=True,   # Human-like mouse/keyboard behavior
+                        geoip=True,
+                        humanize=True,
                     )
                     logger.info("CloakBrowser initialized successfully")
                 except ImportError:
@@ -349,6 +519,10 @@ class NewsSpider(Spider):
 
         Uses semaphore to limit concurrent pages.
         Timeout: 30s for page loads.
+
+        V7.0: on success, extracts ``page.context.cookies()`` and, when the
+        response context contains ``cf_clearance``, writes the cookies into
+        the pool under ``(domain, "chrome146")`` (D7) for Tier 1 reuse.
 
         Args:
             url: URL to fetch.
@@ -374,6 +548,28 @@ class NewsSpider(Spider):
                         error = "CloakBrowser returned anti-bot challenge page"
                         logger.warning("%s: %s", url, error)
                         return "", error
+                
+                # V7.0: harvest cookies for the cookie pool
+                if html:
+                    try:
+                        raw_cookies = await page.context.cookies()
+                        cookie_dict = {
+                            c["name"]: c["value"]
+                            for c in raw_cookies
+                            if c.get("name") and c.get("value") is not None
+                        }
+                        if "cf_clearance" in cookie_dict:
+                            await pool_put(
+                                _domain_of(url),
+                                TIER1_FINGERPRINT,
+                                cookie_dict,
+                            )
+                    except Exception as e:
+                        logger.debug(
+                            "Failed to harvest cookies from CloakBrowser for %s: %s",
+                            url,
+                            e,
+                        )
                 
                 logger.debug(
                     "CloakBrowser fetched %d chars from %s",
@@ -412,6 +608,253 @@ class NewsSpider(Spider):
                     logger.info("CloakBrowser closed")
                 except Exception as e:
                     logger.warning("Error closing CloakBrowser: %s", e)
+
+    # ── Tier 1.5: alternate TLS fingerprint retry ────────────────────
+
+    async def _retry_with_alt_fingerprints(
+        self,
+        results: list[SpiderResult],
+        failed_urls: list[tuple[int, SpiderResult]],
+    ) -> list[tuple[int, SpiderResult]]:
+        """Tier 1.5 — retry failed URLs with alternate TLS fingerprints.
+
+        Tries ``firefox135`` first, then ``safari15_5`` (D5), using an
+        independent ``FetcherSession`` per fingerprint (D4). Pooled cookies
+        for ``(domain, fingerprint)`` are injected when available (D9); a
+        continued block invalidates that pool entry (D8).
+
+        Args:
+            results: The ordered result list (mutated in place on success).
+            failed_urls: ``(index, result)`` pairs that failed Tier 1.
+
+        Returns:
+            The ``(index, result)`` pairs that STILL failed after all
+            fingerprints — these proceed to Tier 2 (CloakBrowser).
+        """
+        remaining = list(failed_urls)
+        timeout = max(self._timeout_ms / 1000.0, 1.0)
+
+        for fp in TIER15_FINGERPRINTS:
+            if not remaining:
+                break
+
+            logger.info(
+                "Tier 1.5: retrying %d URLs with fingerprint %s",
+                len(remaining),
+                fp,
+            )
+
+            session_mgr = FetcherSession(
+                impersonate=fp,
+                follow_redirects=True,
+                retries=1,  # exactly one attempt (retries=0 never sends in scrapling 0.4.14)
+            )
+            outcomes: list[tuple[int, SpiderResult, Response | None, str | None]] = []
+            # ``async with`` guarantees the session is closed in a finally block.
+            async with session_mgr as session:
+                async def _retry_one(
+                    item: tuple[int, SpiderResult],
+                ) -> tuple[int, SpiderResult, Response | None, str | None]:
+                    idx, result = item
+                    domain = _domain_of(result.url)
+                    cookies = await pool_get(domain, fp)
+                    try:
+                        response = await session.get(
+                            result.url,
+                            timeout=timeout,
+                            cookies=cookies or None,
+                        )
+                        return idx, result, response, None
+                    except Exception as exc:
+                        return idx, result, None, str(exc)
+
+                outcomes = await asyncio.gather(
+                    *[_retry_one(item) for item in remaining]
+                )
+
+            still_failed: list[tuple[int, SpiderResult]] = []
+            for idx, result, response, err in outcomes:
+                if err is not None:
+                    logger.warning(
+                        "Tier 1.5 (%s) connection failed for %s: %s",
+                        fp,
+                        result.url,
+                        err,
+                    )
+                    still_failed.append((idx, result))
+                    continue
+
+                html = str(response.html_content or "")
+                domain = _domain_of(result.url)
+
+                # Blocked status + Cloudflare challenge → invalidate pooled
+                # cookies for this fingerprint and keep retrying.
+                if response.status in BLOCKED_STATUS_CODES and self._has_cloudflare_challenge(html):
+                    await pool_invalidate(domain, fp)
+                    logger.warning(
+                        "Tier 1.5 (%s) blocked for %s (status=%d) — invalidated pooled cookies",
+                        fp,
+                        result.url,
+                        response.status,
+                    )
+                    still_failed.append((idx, result))
+                    continue
+
+                if not html:
+                    logger.warning(
+                        "Tier 1.5 (%s) empty response for %s (status=%d)",
+                        fp,
+                        result.url,
+                        response.status,
+                    )
+                    still_failed.append((idx, result))
+                    continue
+
+                # Tier 1.5 success
+                results[idx] = SpiderResult(
+                    url=result.url,
+                    status=response.status,
+                    html_content=html,
+                    error=None,
+                    used_stealth=False,
+                    fetch_tier="1.5",
+                )
+                logger.info(
+                    "Tier 1.5 (%s) succeeded for %s (status=%d, %d chars)",
+                    fp,
+                    result.url,
+                    response.status,
+                    len(html),
+                )
+
+            remaining = still_failed
+
+        return remaining
+
+    # ── Tier 3: Camoufox ultimate fallback ───────────────────────────
+
+    async def _fetch_with_camoufox(
+        self, url: str, timeout: int = CAMOUFOX_PAGE_TIMEOUT_SEC
+    ) -> SpiderResult:
+        """Tier 3 — fetch a URL with Camoufox (Firefox engine + Juggler protocol).
+
+        Ultimate fallback when CloakBrowser (Tier 2) fails or crashes. Uses an
+        independent browser instance (D12). On success, extracts cookies and
+        writes them into the pool under ``(domain, "firefox135")`` (D13) so
+        Tier 1.5 firefox135 requests can reuse them.
+
+        ``camoufox`` is an optional soft dependency: when not installed, Tier 3
+        is silently skipped (returns an error result) without blocking the rest
+        of the funnel.
+
+        Args:
+            url: URL to fetch.
+            timeout: Page load timeout in seconds (default 15s).
+
+        Returns:
+            ``SpiderResult`` with ``fetch_tier="3"`` — success (used_stealth=True)
+            or a failure result carrying the error.
+        """
+        await self._cloak_semaphore.acquire()
+        try:
+            try:
+                from camoufox.async_api import AsyncCamoufox
+            except ImportError:
+                logger.warning(
+                    "camoufox not installed, Tier 3 unavailable for %s",
+                    url,
+                )
+                return SpiderResult(
+                    url=url,
+                    error="Tier 3 unavailable: camoufox not installed",
+                    fetch_tier="3",
+                )
+
+            # Playwright-style TimeoutError (camoufox is built on it);
+            # fall back to asyncio.TimeoutError when playwright is unavailable.
+            try:
+                from playwright._impl._errors import TimeoutError as _PlaywrightTimeoutError
+            except ImportError:  # pragma: no cover
+                _PlaywrightTimeoutError = asyncio.TimeoutError
+
+            domain = _domain_of(url)
+            try:
+                async with AsyncCamoufox(
+                    headless=True,
+                    geoip=True,
+                    humanize=True,
+                ) as browser:
+                    page = await browser.new_page()
+                    try:
+                        await page.goto(
+                            url,
+                            wait_until="domcontentloaded",
+                            timeout=timeout * 1000,
+                        )
+                        html = await page.content()
+                        cookies = await page.context.cookies()
+                    finally:
+                        # Safe close — suppress errors
+                        try:
+                            await page.close()
+                        except Exception:
+                            pass
+
+                    if not html:
+                        logger.warning(
+                            "Tier 3 Camoufox empty content for %s", url
+                        )
+                        return SpiderResult(
+                            url=url,
+                            error="Tier 3 Camoufox returned empty content",
+                            fetch_tier="3",
+                        )
+
+                    # D13: write cookies back to the pool under (domain, "firefox135")
+                    cookie_dict = {
+                        c["name"]: c["value"]
+                        for c in cookies
+                        if c.get("name") and c.get("value") is not None
+                    }
+                    if "cf_clearance" in cookie_dict:
+                        await pool_put(domain, CAMOUFOX_FINGERPRINT, cookie_dict)
+
+                    logger.warning(
+                        "Tier 3 Camoufox succeeded for %s (%d chars)",
+                        url,
+                        len(html),
+                    )
+                    return SpiderResult(
+                        url=url,
+                        status=200,
+                        html_content=html,
+                        error=None,
+                        used_stealth=True,
+                        fetch_tier="3",
+                    )
+            except _PlaywrightTimeoutError:
+                logger.warning(
+                    "Tier 3 Camoufox timeout for %s after %ds", url, timeout
+                )
+                return SpiderResult(
+                    url=url,
+                    error=f"Tier 3 Camoufox timeout after {timeout}s",
+                    fetch_tier="3",
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Tier 3 Camoufox error for %s: %s (%s)",
+                    url,
+                    exc,
+                    type(exc).__name__,
+                )
+                return SpiderResult(
+                    url=url,
+                    error=f"Tier 3 Camoufox error: {exc}",
+                    fetch_tier="3",
+                )
+        finally:
+            self._cloak_semaphore.release()
 
     # ── Blocked detection ─────────────────────────────────────────────
 
@@ -561,6 +1004,7 @@ class NewsSpider(Spider):
                         error=item.get("error"),
                         used_stealth=item.get("used_stealth", False),
                         was_blocked=item.get("_blocked", False),
+                        fetch_tier=item.get("fetch_tier", "1"),
                     )
                 )
             elif url in self._errors:
@@ -594,9 +1038,17 @@ async def fetch_urls_with_spider(
 ) -> list[SpiderResult]:
     """Convenience: create a NewsSpider, fetch URLs, return results.
 
-    V6.0: For URLs that failed at Tier 1 (TLS errors, connection refused, etc.),
-    retry with CloakBrowser as a final fallback. This handles cases where curl_cffi
-    fails before getting any HTTP response.
+    V7.0 funnel orchestration (D4/D5/D11):
+
+    1. Tier 1 — ``spider.stream()`` (curl_cffi chrome146, pooled cookies injected)
+    2. Tier 1.5 — retry blocked/connection-failed URLs with ``firefox135`` →
+       ``safari15_5`` (independent ``FetcherSession`` instances)
+    3. Tier 2 — remaining failures go to CloakBrowser (existing behavior),
+       which harvests ``cf_clearance`` cookies into the pool on success
+    4. Tier 3 — URLs that still failed after CloakBrowser are retried with
+       Camoufox (ultimate fallback, Firefox engine + Juggler protocol)
+
+    Semantic failures (e.g. HTTP 404 with content) never enter the retry set.
 
     Args:
         urls: URLs to fetch.
@@ -606,6 +1058,7 @@ async def fetch_urls_with_spider(
 
     Returns:
         List of ``SpiderResult``, one per input URL, in input order.
+        Successful results carry ``fetch_tier`` = "1" | "1.5" | "2" | "3".
     """
     spider = NewsSpider(urls=urls, timeout_ms=timeout_ms)
     # Allow overrides via instance attributes
@@ -629,53 +1082,99 @@ async def fetch_urls_with_spider(
 
     results = spider._collect_results(stream_items)
 
-    # V6.0: Retry failed URLs with CloakBrowser (handles TLS errors, connection refused, etc.)
-    failed_urls = [r for r in results if r.error and not r.html_content]
+    # ── Tier 1.5: alternate TLS fingerprints ─────────────────────────
+    # Only blocked / connection-failed URLs qualify. Semantic failures
+    # (e.g. 404 with content) have no error and never enter the retry set.
+    failed_urls = [
+        (idx, r)
+        for idx, r in enumerate(results)
+        if r.error and not r.html_content
+    ]
     if failed_urls:
         logger.info(
-            "Retrying %d failed URLs with CloakBrowser fallback (TLS errors, connection refused, etc.)",
+            "Tier 1.5: %d URLs failed Tier 1 — trying alternate TLS fingerprints",
             len(failed_urls),
+        )
+        remaining = await spider._retry_with_alt_fingerprints(results, failed_urls)
+    else:
+        remaining = []
+
+    # ── Tier 2: CloakBrowser (existing behavior) ─────────────────────
+    if remaining:
+        logger.info(
+            "Tier 2: %d URLs still failed after Tier 1.5 — falling back to CloakBrowser",
+            len(remaining),
         )
         # Create a temporary spider just for CloakBrowser access
         retry_spider = NewsSpider(urls=[])
         try:
             # Initialize CloakBrowser
             await retry_spider._get_cloak_browser()
-            
-            # Retry each failed URL with CloakBrowser
+
+            # Retry each remaining URL with CloakBrowser
             retry_tasks = [
-                retry_spider._fetch_with_cloak(r.url)
-                for r in failed_urls
+                retry_spider._fetch_with_cloak(r.url) for _, r in remaining
             ]
             retry_results = await asyncio.gather(*retry_tasks, return_exceptions=True)
-            
+
             # Update results with CloakBrowser responses
-            for i, (result, retry_result) in enumerate(zip(failed_urls, retry_results)):
+            for (idx, result), retry_result in zip(remaining, retry_results):
                 if isinstance(retry_result, Exception):
                     logger.warning(
-                        "CloakBrowser retry failed for %s: %s",
+                        "Tier 2 CloakBrowser retry failed for %s: %s",
                         result.url,
                         retry_result,
                     )
                     continue
-                    
+
                 html_content, error = retry_result
                 if html_content:
-                    idx = results.index(result)
                     results[idx] = SpiderResult(
                         url=result.url,
                         status=200,
                         html_content=html_content,
                         error=None,
                         used_stealth=True,
+                        fetch_tier="2",
                     )
                     logger.info(
-                        "CloakBrowser retry succeeded for %s (%d chars)",
+                        "Tier 2 CloakBrowser succeeded for %s (%d chars)",
                         result.url,
                         len(html_content),
                     )
         finally:
             await retry_spider._close_cloak_browser()
+
+    # ── Tier 3: Camoufox ultimate fallback ───────────────────────────
+    # Only URLs that failed ALL previous tiers (incl. CloakBrowser) qualify.
+    tier3_urls = [
+        (idx, r)
+        for idx, r in enumerate(results)
+        if r.error and not r.html_content
+    ]
+    if tier3_urls:
+        logger.warning(
+            "Tier 3: %d URLs failed Tier 2 — starting Camoufox fallback",
+            len(tier3_urls),
+        )
+        for idx, result in tier3_urls:
+            tier3_result = await spider._fetch_with_camoufox(
+                result.url,
+                timeout=CAMOUFOX_PAGE_TIMEOUT_SEC,
+            )
+            if tier3_result.html_content:
+                results[idx] = tier3_result
+                logger.warning(
+                    "Tier 3 Camoufox recovered %s (%d chars)",
+                    result.url,
+                    len(tier3_result.html_content),
+                )
+            else:
+                logger.warning(
+                    "Tier 3 Camoufox failed for %s: %s",
+                    result.url,
+                    tier3_result.error,
+                )
 
     return results
 
@@ -684,6 +1183,13 @@ __all__ = [
     "NewsSpider",
     "SpiderResult",
     "fetch_urls_with_spider",
+    "pool_get",
+    "pool_put",
+    "pool_invalidate",
+    "COOKIE_TTL_SEC",
+    "CAMOUFOX_PAGE_TIMEOUT_SEC",
+    "TIER1_FINGERPRINT",
+    "TIER15_FINGERPRINTS",
     "DEFAULT_CONCURRENT_REQUESTS",
     "DEFAULT_CONCURRENT_PER_DOMAIN",
     "DEFAULT_TIMEOUT_MS",

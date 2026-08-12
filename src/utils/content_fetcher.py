@@ -3,10 +3,14 @@
 Uses NewsSpider (built on Scrapling FetcherSession + AsyncStealthySession)
 for unified fetch+extract with built-in anti-bot and Cloudflare bypass capabilities.
 
-V4.0: Refactored to use NewsSpider for 10-concurrent Spider-like dispatch
-with domain-level rate limiting (2 concurrent/domain). ``AsyncStealthySession``
-is configured with ``solve_cloudflare=True`` for Investing.com and similar
-protected sites.
+V5.0: Tier 0 static extraction — before falling back to Trafilatura, try to
+pull article text from in-page structured data:
+
+- ``extract_next_data`` — ``<script id="__NEXT_DATA__">`` JSON (Next.js sites)
+- ``extract_json_ld`` — ``application/ld+json`` blocks (NewsArticle/Article)
+
+Tier 0 runs on the HTML of ANY fetch tier, improving extraction quality for
+Next.js / structured-data sites and reducing reliance on Trafilatura heuristics.
 
 Usage::
 
@@ -25,7 +29,9 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import re
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -45,6 +51,38 @@ logger = get_logger(__name__)
 
 DEFAULT_TIMEOUT: int = 30
 """Default HTTP request timeout in seconds."""
+
+TIER0_MIN_TEXT_LEN: int = 200
+"""Minimum article-text length (chars) for Tier 0 static extraction to be a hit.
+
+Prevents navigation snippets / short summaries from being treated as article
+bodies (D3). Below this threshold the pipeline falls back to Trafilatura.
+"""
+
+_MAX_TIER0_SEARCH_DEPTH: int = 8
+"""Max nesting depth for the recursive __NEXT_DATA__ path search."""
+
+_NEXT_DATA_PREFERRED_KEYS: frozenset[str] = frozenset(
+    {
+        "articlebody",
+        "article_body",
+        "bodyhtml",
+        "articlebodyhtml",
+        "articletext",
+        "maincontent",
+        "contentbody",
+        "article_content",
+    }
+)
+"""Leaf keys that are strongly preferred when searching __NEXT_DATA__ JSON."""
+
+_JSONLD_ARTICLE_TYPES: frozenset[str] = frozenset(
+    {"newsarticle", "article", "blogposting"}
+)
+"""JSON-LD @type values that count as article nodes."""
+
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_WS_RE = re.compile(r"\s+")
 
 DOMAIN_RATE_LIMIT_SEC: float = 2.0
 """Minimum gap (seconds) between requests to the same domain."""
@@ -97,6 +135,215 @@ class ContentResult:
 
     def __post_init__(self) -> None:
         self.content_length = len(self.text)
+
+
+# ── Tier 0: static extraction ──────────────────────────────────────────
+
+
+def _strip_html_tags(text: str) -> str:
+    """Remove HTML tags and collapse whitespace in a candidate string."""
+    cleaned = _HTML_TAG_RE.sub(" ", text)
+    cleaned = _WS_RE.sub(" ", cleaned)
+    return cleaned.strip()
+
+
+def _walk_json_texts(
+    node: Any,
+    depth: int,
+    path: tuple[str, ...],
+    preferred: list[str],
+    all_strings: list[str],
+) -> None:
+    """Recursively collect string leaves from parsed JSON.
+
+    Args:
+        node: Current JSON node (dict/list/str/scalar).
+        depth: Current nesting depth (capped by ``_MAX_TIER0_SEARCH_DEPTH``).
+        path: Key path leading to this node.
+        preferred: Output list for strings under preferred article keys.
+        all_strings: Output list for every string ≥ ``TIER0_MIN_TEXT_LEN``.
+    """
+    if depth > _MAX_TIER0_SEARCH_DEPTH or node is None:
+        return
+    if isinstance(node, str):
+        if len(node) < TIER0_MIN_TEXT_LEN:
+            return
+        all_strings.append(node)
+        leaf = path[-1].lower() if path else ""
+        parent = path[-2].lower() if len(path) >= 2 else ""
+        if leaf in _NEXT_DATA_PREFERRED_KEYS or (
+            parent in ("article", "page", "post") and leaf in ("body", "content")
+        ):
+            preferred.append(node)
+        return
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if not isinstance(key, str):
+                continue
+            _walk_json_texts(value, depth + 1, path + (key,), preferred, all_strings)
+    elif isinstance(node, list):
+        for index, item in enumerate(node):
+            _walk_json_texts(
+                item, depth + 1, path + (f"[{index}]",), preferred, all_strings
+            )
+
+
+def _search_next_data_text(data: Any) -> str | None:
+    """Locate the best article-text candidate inside parsed __NEXT_DATA__ JSON.
+
+    Prefers strings under known article keys (``articleBody``, ``article.body``,
+    ``bodyHtml``, ...), otherwise falls back to the longest qualifying string
+    leaf. The quality threshold (``TIER0_MIN_TEXT_LEN``) is the final guard.
+    """
+    preferred: list[str] = []
+    all_strings: list[str] = []
+    _walk_json_texts(data, 0, (), preferred, all_strings)
+
+    pool = preferred if preferred else all_strings
+    if not pool:
+        return None
+    best = max(pool, key=len)
+    if "<" in best:
+        best = _strip_html_tags(best)
+    if not best or len(best) < TIER0_MIN_TEXT_LEN:
+        return None
+    return best
+
+
+def extract_next_data(html: str) -> str | None:
+    """Tier 0a — extract article text from ``<script id="__NEXT_DATA__">``.
+
+    Locates the script block with ``re``, parses its JSON with the standard
+    library ``json`` module, then recursively searches the JSON for article
+    body candidates. If ``json.loads`` fails, ``chompjs`` is tried as a lazy
+    fallback (skipped silently when not installed).
+
+    Args:
+        html: Raw page HTML.
+
+    Returns:
+        Extracted article text (≥ ``TIER0_MIN_TEXT_LEN`` chars) or ``None``
+        when the page has no usable ``__NEXT_DATA__``.
+    """
+    if not html:
+        return None
+
+    match = re.search(
+        r'<script[^>]*id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>',
+        html,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if not match:
+        return None
+
+    raw = match.group(1).strip()
+    if not raw:
+        return None
+
+    data: Any = None
+    try:
+        data = json.loads(raw)
+    except (ValueError, json.JSONDecodeError):
+        # Lazy chompjs fallback — silently skipped when not installed (D2)
+        try:
+            import chompjs  # noqa: PLC0415
+        except ImportError:
+            chompjs = None
+        if chompjs is not None:
+            try:
+                data = chompjs.parse_js_object(raw)
+            except Exception:
+                data = None
+
+    if not isinstance(data, dict):
+        return None
+    return _search_next_data_text(data)
+
+
+def _jsonld_text_from_node(node: dict[str, Any]) -> str | None:
+    """Extract article text from a single JSON-LD node.
+
+    Only NewsArticle / Article / BlogPosting nodes qualify. ``articleBody``
+    is preferred over ``description``; both must pass the quality threshold.
+    """
+    node_type = node.get("@type")
+    if isinstance(node_type, list):
+        types = {str(t).lower() for t in node_type if t}
+    else:
+        types = {str(node_type).lower()} if node_type else set()
+
+    if not types or not (types & _JSONLD_ARTICLE_TYPES):
+        return None
+
+    for key in ("articleBody", "article_body", "articlebody"):
+        value = node.get(key)
+        if isinstance(value, str) and len(value) >= TIER0_MIN_TEXT_LEN:
+            return value
+
+    description = node.get("description")
+    if isinstance(description, str) and len(description) >= TIER0_MIN_TEXT_LEN:
+        return description
+
+    return None
+
+
+def _iter_jsonld_nodes(data: Any):
+    """Yield article-candidate dict nodes from a parsed JSON-LD payload.
+
+    Handles: a single node dict, an array of nodes, and ``@graph`` expansion.
+    """
+    if isinstance(data, dict):
+        if isinstance(data.get("@graph"), list):
+            for node in data["@graph"]:
+                if isinstance(node, dict):
+                    yield node
+        yield data
+    elif isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict):
+                if isinstance(item.get("@graph"), list):
+                    for node in item["@graph"]:
+                        if isinstance(node, dict):
+                            yield node
+                yield item
+
+
+def extract_json_ld(html: str) -> str | None:
+    """Tier 0b — extract article text from ``application/ld+json`` blocks.
+
+    Parses every ``<script type="application/ld+json">`` block, expands
+    ``@graph`` nesting, and returns the first NewsArticle/Article/BlogPosting
+    candidate whose ``articleBody`` (or ``description``) passes the quality
+    threshold.
+
+    Args:
+        html: Raw page HTML.
+
+    Returns:
+        Extracted article text or ``None`` when no block qualifies.
+    """
+    if not html:
+        return None
+
+    blocks = re.findall(
+        r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+        html,
+        re.DOTALL | re.IGNORECASE,
+    )
+    for block in blocks:
+        raw = block.strip()
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except (ValueError, json.JSONDecodeError):
+            continue
+
+        for node in _iter_jsonld_nodes(data):
+            text = _jsonld_text_from_node(node)
+            if text:
+                return text
+    return None
 
 
 # ── ContentFetcher ─────────────────────────────────────────────────────
@@ -326,7 +573,37 @@ class ContentFetcher:
                 error="Empty HTML content",
             )
 
-        # Extract with Trafilatura
+        # Tier 0a: __NEXT_DATA__ static extraction (before Trafilatura)
+        text = extract_next_data(html_content)
+        if text:
+            logger.debug(
+                "Tier 0 (__NEXT_DATA__) extracted %d chars from %s",
+                len(text),
+                url,
+            )
+            return ContentResult(
+                url=url,
+                text=text.strip(),
+                success=True,
+                engine="tier0_next_data",
+            )
+
+        # Tier 0b: JSON-LD static extraction (before Trafilatura)
+        text = extract_json_ld(html_content)
+        if text:
+            logger.debug(
+                "Tier 0 (JSON-LD) extracted %d chars from %s",
+                len(text),
+                url,
+            )
+            return ContentResult(
+                url=url,
+                text=text.strip(),
+                success=True,
+                engine="tier0_jsonld",
+            )
+
+        # Fallback: extract with Trafilatura
         extracted = self._extract_content(html_content, url)
         if extracted and extracted.strip():
             engine = "news_spider+trafilatura"
@@ -442,6 +719,9 @@ class ContentFetcher:
 __all__ = [
     "ContentFetcher",
     "ContentResult",
+    "extract_next_data",
+    "extract_json_ld",
+    "TIER0_MIN_TEXT_LEN",
     "DEFAULT_TIMEOUT",
     "DOMAIN_RATE_LIMIT_SEC",
     "MAX_CONCURRENT",
