@@ -145,7 +145,7 @@ class IngestionScheduler:
             interval_sec: Ingestion cycle interval.
             min_cycle_gap_sec: Minimum gap between cycles.
             dry_run: When True, skip Graphiti/EpisodeWriter/Neo4j initialization.
-            source_filter: Filter adapters ("gdelt", "rss", "akshare", None for all).
+            source_filter: Filter adapters ("gdelt", "rss", "akshare", "fred", "sanctions", "acled", "eia", "bls", None for all).
             fetch_content: When True, enable ContentFetcher for RSS (dry-run mode).
         """
         self._dry_run = dry_run
@@ -184,6 +184,14 @@ class IngestionScheduler:
         self._akshare_adapter: Any = None
         self._cninfo_adapter: Any = None  # V6.2: CNInfo announcements (Phase 2)
         self._eastmoney_research_adapter: Any = None  # V6.3: EastMoney research reports (Phase 3)
+
+        # ── Phase 1 macro adapters (add-phase1-macro-adapters) ────
+        self._fred_adapter: Any = None
+        self._sanctions_adapter: Any = None
+        self._acled_adapter: Any = None
+        self._eia_adapter: Any = None
+        self._bls_adapter: Any = None
+        self._treasury_adapter: Any = None
 
         # ── Briefing Aggregator ───────────────────────────────────
         self._aggregator = SectorBriefingAggregator() if not dry_run else None
@@ -303,11 +311,23 @@ class IngestionScheduler:
         """Resolve which data sources to run based on source_filter.
 
         Returns:
-            Set of source names ("gdelt", "rss", "akshare").
+            Set of source names ("gdelt", "rss", "stock", "fred",
+            "sanctions", "acled", "eia", "bls", "treasury").
         """
         source_filter = self._source_filter
         if source_filter is None or source_filter == "all":
-            return {"gdelt", "rss", "akshare"}
+            return {
+                "gdelt",
+                "rss",
+                "stock",
+                # ── Phase 1 macro adapters (add-phase1-macro-adapters) ──
+                "fred",
+                "sanctions",
+                "acled",
+                "eia",
+                "bls",
+                "treasury",
+            }
         return {source_filter}
 
     def _lazy_init_components(self) -> None:
@@ -413,11 +433,57 @@ class IngestionScheduler:
         else:
             logger.info("Dry-run: RSS adapter skipped (source_filter=%s)", self._source_filter)
 
+        # ── Macro pipeline: Phase 1 macro data adapters (add-phase1-macro-adapters) ──
+        # FRED / ACLED / EIA are key-gated (degrade gracefully when unconfigured);
+        # OFAC/OpenSanctions (sanctions) and BLS need no key.
+        if "fred" in sources:
+            from src.adapters.fred_adapter import FredAdapter
+
+            self._fred_adapter = FredAdapter(dedup_cache=self._dedup_cache)
+        else:
+            logger.info("Dry-run: FRED adapter skipped (source_filter=%s)", self._source_filter)
+
+        if "sanctions" in sources:
+            from src.adapters.sanctions_adapter import SanctionsAdapter
+
+            self._sanctions_adapter = SanctionsAdapter(dedup_cache=self._dedup_cache)
+        else:
+            logger.info("Dry-run: Sanctions adapter skipped (source_filter=%s)", self._source_filter)
+
+        if "acled" in sources:
+            from src.adapters.acled_adapter import AcledAdapter
+
+            self._acled_adapter = AcledAdapter(dedup_cache=self._dedup_cache)
+        else:
+            logger.info("Dry-run: ACLED adapter skipped (source_filter=%s)", self._source_filter)
+
+        if "eia" in sources:
+            from src.adapters.eia_adapter import EiaAdapter
+
+            self._eia_adapter = EiaAdapter(dedup_cache=self._dedup_cache)
+        else:
+            logger.info("Dry-run: EIA adapter skipped (source_filter=%s)", self._source_filter)
+
+        if "bls" in sources:
+            from src.adapters.bls_adapter import BlsAdapter
+
+            self._bls_adapter = BlsAdapter(dedup_cache=self._dedup_cache)
+        else:
+            logger.info("Dry-run: BLS adapter skipped (source_filter=%s)", self._source_filter)
+
+        # ── Treasury yield curve (US Treasury, no API key needed) ──
+        if "treasury" in sources:
+            from src.adapters.treasury_adapter import TreasuryAdapter
+
+            self._treasury_adapter = TreasuryAdapter(dedup_cache=self._dedup_cache)
+        else:
+            logger.info("Dry-run: Treasury adapter skipped (source_filter=%s)", self._source_filter)
+
         # ── Stock pipeline: CLS (primary) → EastMoney (fallback) → AkShare (fallback) ──
         # V6.1: CLS telegraph replaces EastMoney as primary stock news source
         # V6.2: CNInfo announcements (Phase 2)
         # V6.3: EastMoney research reports (Phase 3)
-        if "akshare" in sources:
+        if "stock" in sources:
             from src.adapters.cls_adapter import CLSAdapter
             from src.adapters.eastmoney_adapter import EastMoneyAdapter
             from src.adapters.cninfo_adapter import CNInfoAdapter
@@ -471,6 +537,15 @@ class IngestionScheduler:
             "yes" if self._cninfo_adapter else "no",
             "yes" if self._eastmoney_research_adapter else "no",
             " [dry-run mode]" if self._dry_run else ""
+        )
+        logger.info(
+            "Phase 1 macro adapters: FRED=%s, Sanctions=%s, ACLED=%s, EIA=%s, BLS=%s, Treasury=%s",
+            "yes" if self._fred_adapter else "no",
+            "yes" if self._sanctions_adapter else "no",
+            "yes" if self._acled_adapter else "no",
+            "yes" if self._eia_adapter else "no",
+            "yes" if self._bls_adapter else "no",
+            "yes" if self._treasury_adapter else "no",
         )
 
     # ── Internal: cycle loop ──────────────────────────────────────────
@@ -596,6 +671,13 @@ class IngestionScheduler:
         macro_coros = [
             self._run_adapter_pipeline(self._gdelt_adapter, self._macro_writer, tickers),
             self._run_adapter_pipeline(self._rss_adapter, self._macro_writer, tickers),
+            # ── Phase 1 macro adapters (add-phase1-macro-adapters) ──
+            self._run_adapter_pipeline(self._fred_adapter, self._macro_writer, tickers),
+            self._run_adapter_pipeline(self._sanctions_adapter, self._macro_writer, tickers),
+            self._run_adapter_pipeline(self._acled_adapter, self._macro_writer, tickers),
+            self._run_adapter_pipeline(self._eia_adapter, self._macro_writer, tickers),
+            self._run_adapter_pipeline(self._bls_adapter, self._macro_writer, tickers),
+            self._run_adapter_pipeline(self._treasury_adapter, self._macro_writer, tickers),
         ]
 
         # Run macro pipelines + stock pipeline + CNInfo + EastMoney Research concurrently
@@ -603,7 +685,19 @@ class IngestionScheduler:
 
         completed = await asyncio.gather(*all_coros, return_exceptions=True)
 
-        source_names = ["gdelt_csv", "rss", "stock", "cninfo", "eastmoney_research"]
+        source_names = [
+            "gdelt_csv",
+            "rss",
+            "fred",
+            "sanctions",
+            "acled",
+            "eia",
+            "bls",
+            "treasury",
+            "stock",
+            "cninfo",
+            "eastmoney_research",
+        ]
         for i, result in enumerate(completed):
             # Skip None results (adapter not initialized)
             if result is None:
@@ -877,6 +971,20 @@ class IngestionScheduler:
             adapters_to_run.append((self._gdelt_adapter, "gdelt_csv"))
         if self._rss_adapter is not None:
             adapters_to_run.append((self._rss_adapter, "rss"))
+
+        # ── Phase 1 macro adapters (add-phase1-macro-adapters) ──
+        if self._fred_adapter is not None:
+            adapters_to_run.append((self._fred_adapter, "fred"))
+        if self._sanctions_adapter is not None:
+            adapters_to_run.append((self._sanctions_adapter, "sanctions"))
+        if self._acled_adapter is not None:
+            adapters_to_run.append((self._acled_adapter, "acled"))
+        if self._eia_adapter is not None:
+            adapters_to_run.append((self._eia_adapter, "eia"))
+        if self._bls_adapter is not None:
+            adapters_to_run.append((self._bls_adapter, "bls"))
+        if self._treasury_adapter is not None:
+            adapters_to_run.append((self._treasury_adapter, "treasury"))
 
         # Stock pipeline: CLS (primary) → EastMoney (fallback) → AkShare (fallback)
         # V6.1: CLS telegraph replaces EastMoney as primary stock news source

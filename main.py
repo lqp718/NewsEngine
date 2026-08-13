@@ -513,9 +513,21 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--source",
-        choices=["gdelt", "rss", "akshare", "all"],
+        choices=[
+            "gdelt",
+            "rss",
+            "stock",  # CLS → EastMoney → AkShare fallback chain + CNInfo + EastMoneyResearch
+            # ── Phase 1 macro adapters (add-phase1-macro-adapters) ──
+            "fred",
+            "sanctions",
+            "acled",
+            "eia",
+            "bls",
+            "treasury",
+            "all",
+        ],
         default="all",
-        help="Filter which data source adapters to run (default: all)",
+        help="Filter which data source adapters to run (default: all). 'stock' covers CLS/EastMoney/AkShare/CNInfo/EastMoneyResearch.",
     )
     parser.add_argument(
         "--fetch-content",

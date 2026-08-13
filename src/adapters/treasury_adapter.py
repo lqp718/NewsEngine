@@ -75,6 +75,8 @@ class TreasuryAdapter(BaseAdapter):
     Phase 2+: Full HTTP fetch from Treasury API.
     """
 
+    SOURCE_TYPE = "treasury"
+
     def __init__(
         self,
         api_url: str | None = None,
