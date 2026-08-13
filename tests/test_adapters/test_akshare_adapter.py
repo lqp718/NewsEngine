@@ -14,9 +14,10 @@ from src.adapters.models import NormalizedEpisode
 class TestAkShareNormalize:
     """AkShareAdapter.normalize() output fields."""
 
-    def test_normalize_valid_item(self, sample_akshare_item):
+    @pytest.mark.asyncio
+    async def test_normalize_valid_item(self, sample_akshare_item):
         adapter = AkShareAdapter(ticker_whitelist=[])
-        episode = adapter.normalize(sample_akshare_item)
+        episode = await adapter.normalize(sample_akshare_item)
 
         assert isinstance(episode, NormalizedEpisode)
         assert episode.source_type == "akshare"
@@ -27,7 +28,7 @@ class TestAkShareNormalize:
         # Verify entity from whitelist
         assert len(episode.entities) == 1
         assert episode.entities[0].type == "stock"
-        assert episode.entities[0].ticker == "0700.HK"
+        assert episode.entities[0].ticker == "00700.HK"
         assert episode.entities[0].name == "腾讯控股"
 
         # Verify metadata
@@ -41,34 +42,39 @@ class TestAkShareNormalize:
         assert episode.name.startswith("akshare-")
         assert "00700" in episode.name
 
-    def test_normalize_empty_content(self, sample_akshare_item):
+    @pytest.mark.asyncio
+    async def test_normalize_empty_content(self, sample_akshare_item):
         """Empty content → only title in body."""
         item = dict(sample_akshare_item)
         item["content"] = ""
         adapter = AkShareAdapter()
-        episode = adapter.normalize(item)
+        episode = await adapter.normalize(item)
         assert "## 腾讯控股股价创历史新高" in episode.episode_body
 
-    def test_normalize_no_entity_without_whitelist_data(self):
+    @pytest.mark.asyncio
+    async def test_normalize_no_entity_without_whitelist_data(self):
         """No ticker metadata → entities list empty."""
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
         item = {
             "title": "Some Stock News",
             "content": "General market news...",
-            "time": "2025-06-09 10:30:00",
+            "time": now.strftime("%Y-%m-%d %H:%M:%S"),
             "source": "东方财富",
             "symbol": "00001",
             "_ticker_name": "",
             "_ticker_full": "",
         }
         adapter = AkShareAdapter()
-        episode = adapter.normalize(item)
+        episode = await adapter.normalize(item)
         assert len(episode.entities) == 0
 
-    def test_dedup_by_hash(self, sample_akshare_item):
+    @pytest.mark.asyncio
+    async def test_dedup_by_hash(self, sample_akshare_item):
         """Same content_hash → only first retained."""
         adapter = AkShareAdapter()
-        ep1 = adapter.normalize(sample_akshare_item)
-        ep2 = adapter.normalize(sample_akshare_item)  # same body → same hash
+        ep1 = await adapter.normalize(sample_akshare_item)
+        ep2 = await adapter.normalize(sample_akshare_item)  # same body → same hash
         result = adapter.dedup([ep1, ep2])
         assert len(result) == 1
 

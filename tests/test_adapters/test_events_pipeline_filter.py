@@ -547,11 +547,26 @@ class TestLoadConfig:
 
 
 class TestEventsPipelineFilter:
-    """Full pipeline integration: all three stages together."""
+    """Full pipeline integration: all three stages together.
+
+    Uses a temp config file with DEFAULT values (min_count=5) so tests are
+    deterministic and independent of the production config file
+    (data/gdelt_events_filter.json tunes min_count=1 for real data).
+    """
+
+    @staticmethod
+    def _make_filter() -> EventsPipelineFilter:
+        """Build EventsPipelineFilter backed by a temp default-valued config."""
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False
+        ) as f:
+            json.dump(DEFAULT_EVENTS_FILTER_CONFIG, f)
+            tmp_path = f.name
+        return EventsPipelineFilter(config_path=tmp_path)
 
     def test_all_filters_pass(self):
         """Event passes CAMEO, Goldstein, and Mentions filters."""
-        filt = EventsPipelineFilter()
+        filt = self._make_filter()
         events = [make_event(cameo_code="141", goldstein_scale=7.2)]
         mentions = {"1": [make_mention() for _ in range(5)]}
         result = filt.filter(events, mentions)
@@ -560,7 +575,7 @@ class TestEventsPipelineFilter:
 
     def test_cameo_filter_blocks(self):
         """CAMEO filter blocks event with non-matching code."""
-        filt = EventsPipelineFilter()
+        filt = self._make_filter()
         events = [make_event(cameo_code="010", goldstein_scale=7.2)]
         mentions = {"1": [make_mention() for _ in range(5)]}
         result = filt.filter(events, mentions)
@@ -568,7 +583,7 @@ class TestEventsPipelineFilter:
 
     def test_goldstein_filter_blocks(self):
         """Goldstein filter blocks event with low score."""
-        filt = EventsPipelineFilter()
+        filt = self._make_filter()
         events = [make_event(cameo_code="141", goldstein_scale=2.3)]
         mentions = {"1": [make_mention() for _ in range(5)]}
         result = filt.filter(events, mentions)
@@ -576,7 +591,7 @@ class TestEventsPipelineFilter:
 
     def test_mentions_filter_blocks(self):
         """Mentions filter blocks event with insufficient mentions."""
-        filt = EventsPipelineFilter()
+        filt = self._make_filter()
         events = [make_event(cameo_code="141", goldstein_scale=7.2)]
         mentions = {"1": [make_mention() for _ in range(2)]}
         result = filt.filter(events, mentions)
@@ -584,7 +599,7 @@ class TestEventsPipelineFilter:
 
     def test_no_matching_events_returns_empty(self):
         """No events match any filter → empty result."""
-        filt = EventsPipelineFilter()
+        filt = self._make_filter()
         events = [make_event(cameo_code="010", goldstein_scale=2.3)]
         mentions = {"1": [make_mention() for _ in range(2)]}
         result = filt.filter(events, mentions)
@@ -592,13 +607,13 @@ class TestEventsPipelineFilter:
 
     def test_empty_events_list(self):
         """Empty events list → empty result."""
-        filt = EventsPipelineFilter()
+        filt = self._make_filter()
         result = filt.filter([], {})
         assert len(result) == 0
 
     def test_multiple_events_mixed_results(self):
         """Mixed events: some pass, some fail different stages."""
-        filt = EventsPipelineFilter()
+        filt = self._make_filter()
         events = [
             make_event(event_id="1", cameo_code="141", goldstein_scale=7.2),  # all pass
             make_event(event_id="2", cameo_code="010", goldstein_scale=7.2),  # CAMEO fail
@@ -618,7 +633,7 @@ class TestEventsPipelineFilter:
 
     def test_mentions_attached_to_result(self):
         """Result tuples carry the correct MentionRecords."""
-        filt = EventsPipelineFilter()
+        filt = self._make_filter()
         event = make_event(event_id="1", cameo_code="141", goldstein_scale=7.2)
         ment = [make_mention(confidence=i * 10) for i in range(5)]
         result = filt.filter([event], {"1": ment})

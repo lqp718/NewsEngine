@@ -49,17 +49,8 @@ class TestGdeltRealHttp:
             )
 
     async def test_filter_by_ticker(self):
-        """Real data filtered by whitelist should return relevant records."""
-        adapter = GdeltAdapter(
-            ticker_whitelist=[
-                {
-                    "symbol": "HK.00700",
-                    "biz_code": "00700",
-                    "name_zh": "腾讯",
-                    "name_en": "Tencent",
-                }
-            ]
-        )
+        """Real data filtered should return relevant records."""
+        adapter = GdeltAdapter()
         try:
             csv_url = adapter.fetch_lastupdate()
             csv_path = adapter.download_gkg(csv_url)

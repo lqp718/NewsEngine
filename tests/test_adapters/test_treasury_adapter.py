@@ -29,9 +29,10 @@ class TestTreasurySkeleton:
         result = await adapter.fetch()
         assert result == []
 
-    def test_normalize_mock_record(self, sample_treasury_record):
+    @pytest.mark.asyncio
+    async def test_normalize_mock_record(self, sample_treasury_record):
         adapter = TreasuryAdapter()
-        episode = adapter.normalize(sample_treasury_record)
+        episode = await adapter.normalize(sample_treasury_record)
 
         assert isinstance(episode, NormalizedEpisode)
         assert episode.source_type == "treasury"

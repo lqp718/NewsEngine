@@ -34,7 +34,7 @@ LLM_MODEL = os.getenv("LLM_MODEL", "qwen-plus")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-v3")
 
 # 导入模块
-from src.graphiti.entity_types import ENTITY_TYPES
+from src.graphiti.entity_types import MACRO_ENTITY_TYPES, SYMBOL_ENTITY_TYPES
 from src.graphiti.relation_types import EDGE_TYPES, DEFAULT_EDGE_TYPE_MAP
 from src.graphiti.episode_writer import EpisodeWriter, WriteResult, BatchWriteResult
 from src.adapters.models import NormalizedEpisode, EntityItem
@@ -100,12 +100,14 @@ async def graphiti_client():
 
 
 class TestEntityTypesIntegration:
-    """验收标准 1: entity_types.py 实现 4 种实体类型"""
+    """验收标准 1: entity_types.py 实现双注册表"""
 
     def test_import_entity_types(self):
-        """验证 ENTITY_TYPES 可导入且包含 4 个键"""
-        assert len(ENTITY_TYPES) == 4
-        assert set(ENTITY_TYPES.keys()) == {"Stock", "Sector", "Country", "Policy"}
+        """验证 MACRO_ENTITY_TYPES 和 SYMBOL_ENTITY_TYPES 可导入"""
+        assert len(MACRO_ENTITY_TYPES) == 6
+        assert len(SYMBOL_ENTITY_TYPES) == 6
+        assert "Stock" in SYMBOL_ENTITY_TYPES
+        assert "Event" in MACRO_ENTITY_TYPES
 
     def test_stock_entity_pydantic_validation(self):
         """验证 StockEntity Pydantic 校验"""
@@ -113,12 +115,12 @@ class TestEntityTypesIntegration:
         from pydantic import ValidationError
 
         # 合法实例化
-        s = StockEntity(ticker="0700.HK", entity_name="腾讯控股")
+        s = StockEntity(ticker="0700.HK", entity_name="腾讯控股", sector="互联网平台", exchange="HKEX")
         assert s.ticker == "0700.HK"
 
         # 缺少必填字段
         try:
-            StockEntity(entity_name="测试")
+            StockEntity(entity_name="测试", sector="互联网平台", exchange="HKEX")
             assert False, "应抛出 ValidationError"
         except ValidationError:
             pass
@@ -127,23 +129,22 @@ class TestEntityTypesIntegration:
         """验证 SectorEntity Pydantic 校验"""
         from src.graphiti.entity_types import SectorEntity
 
-        s = SectorEntity(entity_name="互联网平台", code="GICS_50")
+        s = SectorEntity(entity_name="互联网平台")
         assert s.entity_name == "互联网平台"
-        assert s.code == "GICS_50"
 
     def test_country_entity_validation(self):
         """验证 CountryEntity Pydantic 校验"""
         from src.graphiti.entity_types import CountryEntity
 
-        c = CountryEntity(entity_name="中国", code="CN")
-        assert c.code == "CN"
+        c = CountryEntity(entity_name="中国")
+        assert c.entity_name == "中国"
 
     def test_policy_entity_validation(self):
         """验证 PolicyEntity Pydantic 校验"""
         from src.graphiti.entity_types import PolicyEntity
 
-        p = PolicyEntity(entity_name="降息", type="monetary")
-        assert p.status == "rumor"  # 默认值
+        p = PolicyEntity(entity_name="降息", type="monetary", status="rumor")
+        assert p.status == "rumor"
 
 
 class TestRelationTypesIntegration:
@@ -179,12 +180,12 @@ class TestEpisodeWriterIntegration:
         """验证 EpisodeWriter 初始化"""
         writer = EpisodeWriter(
             graphiti=graphiti_client,
-            entity_types=ENTITY_TYPES,
+            entity_types=MACRO_ENTITY_TYPES,
             edge_types=EDGE_TYPES,
             edge_type_map=DEFAULT_EDGE_TYPE_MAP,
         )
 
-        assert writer._entity_types == ENTITY_TYPES
+        assert writer._entity_types == MACRO_ENTITY_TYPES
         assert writer._edge_types == EDGE_TYPES
         assert writer._seen_hashes == set()
         await writer.close()
@@ -194,7 +195,7 @@ class TestEpisodeWriterIntegration:
         """验收标准 5: 完整集成测试 — 真实 Neo4j + graphiti-core"""
         writer = EpisodeWriter(
             graphiti=graphiti_client,
-            entity_types=ENTITY_TYPES,
+            entity_types=MACRO_ENTITY_TYPES,
             edge_types=EDGE_TYPES,
             edge_type_map=DEFAULT_EDGE_TYPE_MAP,
         )
@@ -250,7 +251,7 @@ class TestEpisodeWriterIntegration:
         """验收标准 6: 去重验证 — 相同 URL 不重复写入"""
         writer = EpisodeWriter(
             graphiti=graphiti_client,
-            entity_types=ENTITY_TYPES,
+            entity_types=MACRO_ENTITY_TYPES,
             edge_types=EDGE_TYPES,
             edge_type_map=DEFAULT_EDGE_TYPE_MAP,
         )
@@ -385,7 +386,7 @@ class TestFullIntegration:
 
         writer = EpisodeWriter(
             graphiti=graphiti_client,
-            entity_types=ENTITY_TYPES,
+            entity_types=MACRO_ENTITY_TYPES,
             edge_types=EDGE_TYPES,
             edge_type_map=DEFAULT_EDGE_TYPE_MAP,
         )

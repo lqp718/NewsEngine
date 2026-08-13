@@ -8,6 +8,7 @@ Tests the normalize() method's fetch_results branch:
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
 import pytest
@@ -26,6 +27,10 @@ def _make_content_result(success: bool, text: str | None, url: str, error: str |
     return result
 
 
+def _recent_time_str() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
 # ── EastMoneyAdapter Tests ──────────────────────────────────────────────
 
 
@@ -41,7 +46,7 @@ class TestEastMoneyAdapterNormalize:
         return {
             "title": "腾讯控股<em>大涨</em>5%",
             "content": "<em>API</em> summary text",
-            "time": "2025-07-25 10:00:00",
+            "time": _recent_time_str(),
             "source": "东方财富",
             "link": "http://finance.eastmoney.com/a/12345.html",
             "symbol": "00700",
@@ -119,7 +124,7 @@ class TestAkShareAdapterNormalize:
         return {
             "title": "A股三大指数集体上涨",
             "content": "API returned summary content",
-            "time": "2025-07-25 09:30:00",
+            "time": _recent_time_str(),
             "source": "东方财富",
             "link": "http://finance.eastmoney.com/a/67890.html",
             "symbol": "00700",
@@ -205,7 +210,7 @@ class TestRunMethodIntegration:
                 {
                     "title": "Test",
                     "content": "Summary",
-                    "time": "2025-07-25 10:00:00",
+                    "time": _recent_time_str(),
                     "source": "Test",
                     "link": "http://finance.eastmoney.com/a/1.html",
                     "symbol": "00700",
@@ -240,7 +245,7 @@ class TestRunMethodIntegration:
                 {
                     "title": "Test",
                     "content": "Summary",
-                    "time": "2025-07-25 10:00:00",
+                    "time": _recent_time_str(),
                     "source": "Test",
                     "link": "http://finance.eastmoney.com/a/2.html",
                     "symbol": "00700",

@@ -27,9 +27,11 @@ class TestRssNormalize:
         assert episode.source_url == "http://example.com/rss/tencent-earnings"
         assert episode.severity == "medium"
         assert "Tencent Stock Rises" in episode.episode_body
-        assert episode.valid_at.year == 2025
-        assert episode.valid_at.month == 6
-        assert episode.valid_at.day == 9
+        # Verify valid_at is recent (within last 10 seconds)
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        delta = abs((now - episode.valid_at).total_seconds())
+        assert delta < 10, f"valid_at too far from now: {episode.valid_at} vs {now}"
 
         # Verify content_hash
         assert len(episode.content_hash) == 64
@@ -42,17 +44,16 @@ class TestRssNormalize:
     @pytest.mark.asyncio
     async def test_normalize_atom_entry(self):
         """Atom format compatibility."""
-        from time import struct_time
-        import time
+        from datetime import datetime, timezone
 
-        now = time.gmtime()
+        now = datetime.now(timezone.utc)
         entry = {
             "title": "Markets Update",
             "link": "http://atom.example.com/markets",
             "id": "atom-guid-001",
             "summary": "Stock markets rallied today...",
-            "published": "2025-06-09T02:00:00Z",
-            "published_parsed": struct_time((2025, 6, 9, 2, 0, 0, 0, 0, 0)),
+            "published": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "published_parsed": now.timetuple(),
             "updated_parsed": None,
             "authors": [{"name": "Atom Reporter"}],
             "feed_url": "http://atom.example.com/feed",
@@ -60,7 +61,9 @@ class TestRssNormalize:
         adapter = RssAdapter()
         episode = await adapter.normalize(entry)
         assert episode.source_type == "rss"
-        assert episode.valid_at.year == 2025
+        # Verify valid_at is recent (within last 10 seconds)
+        delta = abs((now - episode.valid_at).total_seconds())
+        assert delta < 10, f"valid_at too far from now: {episode.valid_at} vs {now}"
 
     @pytest.mark.asyncio
     async def test_missing_published_date(self, sample_rss_entry):
