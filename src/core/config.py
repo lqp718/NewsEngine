@@ -187,6 +187,52 @@ class Settings(BaseSettings):
         description="Maximum age of news articles in days (older articles are discarded)",
     )
 
+    # === 宏观数据源 API Key (Phase 1, add-phase1-macro-adapters) ===
+    # FRED / ACLED / EIA 需免费注册 API key；未配置时对应 adapter 优雅降级（fetch 返回空列表）。
+    # OFAC SDN / OpenSanctions / BLS 无需 API key。
+    fred_api_key: str = Field(
+        "",
+        description="FRED API Key（免费注册，https://fred.stlouisfed.org/docs/api/api_key.html）",
+    )
+    acled_api_key: str = Field(
+        "",
+        description="ACLED API Key（免费注册，https://acleddata.com）",
+    )
+    acled_email: str = Field(
+        "",
+        description="ACLED 注册邮箱（与 acled_api_key 配套）",
+    )
+    eia_api_key: str = Field(
+        "",
+        description="EIA API Key（免费注册，https://www.eia.gov/opendata/register.php）",
+    )
+
+    # === 宏观数据源超时 (Phase 1, add-phase1-macro-adapters) ===
+    fred_timeout_sec: int = Field(
+        30,
+        description="FRED HTTP 超时（秒）",
+    )
+    acled_timeout_sec: int = Field(
+        30,
+        description="ACLED HTTP 超时（秒）",
+    )
+    eia_timeout_sec: int = Field(
+        30,
+        description="EIA HTTP 超时（秒）",
+    )
+    bls_timeout_sec: int = Field(
+        30,
+        description="BLS HTTP 超时（秒）",
+    )
+    open_sanctions_timeout_sec: int = Field(
+        30,
+        description="OpenSanctions/OFAC HTTP 超时（秒）",
+    )
+    open_sanctions_api_key: str | None = Field(
+        None,
+        description="OpenSanctions API key（付费）。未配置时跳过 OpenSanctions，直接使用 OFAC SDN。",
+    )
+
     # === Scheduler Cycle Guard (V2.3) ===
     min_cycle_gap_sec: int = Field(
         60,

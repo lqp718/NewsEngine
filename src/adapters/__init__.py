@@ -36,6 +36,39 @@ from src.adapters.gdelt_mentions_parser import (
 from src.adapters.rss_adapter import RssAdapter
 from src.adapters.akshare_adapter import AkShareAdapter
 from src.adapters.treasury_adapter import TreasuryAdapter, _detect_inversion
+from src.adapters.fred_adapter import (
+    FredAdapter,
+    _FRED_SERIES,
+    _map_fred_severity,
+    _build_fred_body,
+)
+from src.adapters.sanctions_adapter import (
+    SanctionsAdapter,
+    _map_ofac_type,
+    _map_sanctions_severity,
+    _build_sanctions_body,
+    _OFAC_SDN_CSV_URL,
+    _OPEN_SANCTIONS_SEARCH_URL,
+)
+from src.adapters.acled_adapter import (
+    AcledAdapter,
+    _map_acled_severity,
+    _build_acled_body,
+    _ACLED_API_URL,
+)
+from src.adapters.eia_adapter import (
+    EiaAdapter,
+    _EIA_SERIES,
+    _map_eia_severity,
+    _build_eia_body,
+)
+from src.adapters.bls_adapter import (
+    BlsAdapter,
+    _BLS_SERIES,
+    _parse_bls_period,
+    _map_bls_severity,
+    _build_bls_body,
+)
 
 __all__ = [
     "BaseAdapter",
@@ -65,4 +98,28 @@ __all__ = [
     "AkShareAdapter",
     "TreasuryAdapter",
     "_detect_inversion",
+    # ── Phase 1 macro adapters (add-phase1-macro-adapters) ──
+    "FredAdapter",
+    "_FRED_SERIES",
+    "_map_fred_severity",
+    "_build_fred_body",
+    "SanctionsAdapter",
+    "_map_ofac_type",
+    "_map_sanctions_severity",
+    "_build_sanctions_body",
+    "_OFAC_SDN_CSV_URL",
+    "_OPEN_SANCTIONS_SEARCH_URL",
+    "AcledAdapter",
+    "_map_acled_severity",
+    "_build_acled_body",
+    "_ACLED_API_URL",
+    "EiaAdapter",
+    "_EIA_SERIES",
+    "_map_eia_severity",
+    "_build_eia_body",
+    "BlsAdapter",
+    "_BLS_SERIES",
+    "_parse_bls_period",
+    "_map_bls_severity",
+    "_build_bls_body",
 ]

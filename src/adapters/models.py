@@ -14,7 +14,23 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-SourceType = Literal["gdelt_csv", "gdelt_events", "rss", "akshare", "treasury", "eastmoney", "cls_telegraph", "cninfo_announcement", "eastmoney_research"]
+SourceType = Literal[
+    "gdelt_csv",
+    "gdelt_events",
+    "rss",
+    "akshare",
+    "treasury",
+    "eastmoney",
+    "cls_telegraph",
+    "cninfo_announcement",
+    "eastmoney_research",
+    # ── Phase 1 macro data sources (add-phase1-macro-adapters) ──
+    "fred",
+    "sanctions",
+    "acled",
+    "eia",
+    "bls",
+]
 Severity = Literal["low", "medium", "high", "critical"]
 
 
