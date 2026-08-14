@@ -1,14 +1,23 @@
 """ACLED Adapter — armed conflict event data.
 
-Data source: ACLED API (https://api.acleddata.com/acled/read, free
-registration requires an API key + email).
+Data source: ACLED API (https://acleddata.com/api/acled/read, requires a
+myACLED account). Authentication uses the OAuth2 resource-owner password
+grant (https://acleddata.com/api-documentation/getting-started):
 
-Phase 1 (add-phase1-macro-adapters): key-gated fetch of recent conflict
+1. POST ``https://acleddata.com/oauth/token`` with username + password
+   → ``access_token`` (valid 24h) + ``refresh_token`` (valid 14 days)
+2. Every data request carries ``Authorization: Bearer <access_token>``
+3. Expired access tokens are refreshed via ``grant_type=refresh_token``
+   before falling back to a fresh password grant
+
+Phase 1 (add-phase1-macro-adapters): OAuth-gated fetch of recent conflict
 events (battles / explosions / protests / riots) within the
 ``news_max_age_days`` window. Each event becomes one NormalizedEpisode.
 
 Contract: BaseAdapter (fetch → normalize → dedup).
-- fetch(): httpx.AsyncClient; returns [] + warning when key/email unconfigured
+- fetch(): httpx.AsyncClient; returns [] + warning when username/password
+  unconfigured; returns [] + explicit ERROR with the OAuth failure reason
+  when credentials are rejected or the account is blocked
 - normalize(): one NormalizedEpisode per event; fatality-based severity
 - severity: module-level `_map_acled_severity` (>=100 → critical,
   >=25 → high, >=1 → medium, 0 → low; battles/explosions >= medium)
@@ -16,7 +25,9 @@ Contract: BaseAdapter (fetch → normalize → dedup).
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -31,7 +42,16 @@ logger = get_logger(__name__)
 
 # ── Module-level constants ─────────────────────────────────────────────
 
-_ACLED_API_URL = "https://api.acleddata.com/acled/read"
+_ACLED_OAUTH_TOKEN_URL = "https://acleddata.com/oauth/token"
+_ACLED_API_URL = "https://acleddata.com/api/acled/read"
+
+# OAuth2 password-grant constants (per official ACLED docs).
+_ACLED_CLIENT_ID = "acled"
+_ACLED_SCOPE = "authenticated"
+
+# Access tokens are valid for 24h (86400s) per ACLED docs. Refresh with a
+# safety margin so requests never ride a token that is about to expire.
+_ACLED_TOKEN_SAFETY_MARGIN_SEC = 300
 
 # ACLED fields requested from the API.
 _ACLED_FIELDS = (
@@ -41,6 +61,153 @@ _ACLED_FIELDS = (
 
 # Event types that are treated as at-least-medium regardless of fatalities.
 _HIGH_IMPACT_EVENT_TYPES = {"Battles", "Explosions/Remote violence"}
+
+
+# ── OAuth token cache (module-level, process-lifetime) ─────────────────
+
+
+class AcledAuthError(Exception):
+    """ACLED OAuth authentication failure with a human-readable reason.
+
+    Raised by ``_get_access_token`` when the token endpoint rejects the
+    credentials (wrong password, unverified account) or rate-limits the
+    account (flood_user_blocked). The message is specific enough to log
+    directly — never a generic "fetch failed".
+    """
+
+
+_token_cache: dict[str, Any] = {
+    "access_token": None,
+    "refresh_token": None,
+    "expires_at": 0.0,  # epoch seconds
+}
+_token_lock = asyncio.Lock()
+
+
+def _clear_token_cache() -> None:
+    """Drop cached tokens (call after a 401 or an auth failure)."""
+    _token_cache["access_token"] = None
+    _token_cache["refresh_token"] = None
+    _token_cache["expires_at"] = 0.0
+
+
+def _oauth_error_reason(status_code: int, payload: dict[str, Any]) -> str:
+    """Map a failed token-endpoint response to a clear, actionable message."""
+    error = str(payload.get("error", "")).lower()
+    desc = str(payload.get("error_description", "") or "")
+
+    if error == "invalid_grant":
+        return (
+            "ACLED 用户名或密码错误 (invalid_grant: "
+            "The user credentials were incorrect) — 请检查 ACLED_USERNAME / "
+            "ACLED_PASSWORD，或确认账号已激活"
+        )
+    if error == "flood_user_blocked":
+        return (
+            "ACLED 账号因多次登录失败被暂时封禁 (flood_user_blocked) — "
+            "请稍后再试，或确认密码正确"
+        )
+    if error:
+        base = f"ACLED OAuth 认证被拒绝 (error={error}"
+        if desc:
+            base += f": {desc}"
+        return base + ")"
+    return f"ACLED OAuth 认证失败 (HTTP {status_code})"
+
+
+async def _request_token(form_data: dict[str, str], timeout_sec: float) -> dict:
+    """POST the ACLED token endpoint; return the parsed JSON payload.
+
+    Raises:
+        AcledAuthError: token endpoint rejected the request (non-2xx or an
+            ``error`` field in the payload — e.g. invalid_grant /
+            flood_user_blocked).
+        httpx.HTTPError / ValueError: transport-level failure (network,
+            timeout, bad JSON) — callers treat these as transient.
+    """
+    async with httpx.AsyncClient(timeout=timeout_sec) as client:
+        resp = await client.post(
+            _ACLED_OAUTH_TOKEN_URL,
+            data=form_data,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        try:
+            payload = resp.json()
+        except ValueError:
+            payload = {}
+
+    if resp.status_code != 200 or payload.get("error"):
+        raise AcledAuthError(_oauth_error_reason(resp.status_code, payload))
+    if not payload.get("access_token"):
+        raise AcledAuthError(
+            f"ACLED OAuth 响应缺少 access_token (HTTP {resp.status_code})"
+        )
+    return payload
+
+
+async def _get_access_token(settings: Any) -> str:
+    """Return a valid Bearer access token (cached, refreshed, or new).
+
+    Order of attempts, all serialized by ``_token_lock``:
+    1. Cached token still valid (with safety margin) → return it
+    2. Cached refresh token → ``grant_type=refresh_token``
+    3. Fresh password grant with settings credentials
+
+    Raises:
+        AcledAuthError: credentials rejected / account blocked / no usable
+            refresh token and password grant fails.
+        httpx.HTTPError / ValueError: transient transport failure.
+    """
+    async with _token_lock:
+        now = time.time()
+        cached = _token_cache["access_token"]
+        if cached and _token_cache["expires_at"] > now + _ACLED_TOKEN_SAFETY_MARGIN_SEC:
+            return cached
+
+        # Try refresh first — avoids re-entering credentials every 24h.
+        refresh_token = _token_cache.get("refresh_token")
+        if refresh_token:
+            try:
+                payload = await _request_token(
+                    {
+                        "refresh_token": refresh_token,
+                        "grant_type": "refresh_token",
+                        "client_id": _ACLED_CLIENT_ID,
+                    },
+                    settings.acled_timeout_sec,
+                )
+                _token_cache["access_token"] = payload["access_token"]
+                _token_cache["refresh_token"] = payload.get(
+                    "refresh_token", refresh_token
+                )
+                _token_cache["expires_at"] = now + int(
+                    payload.get("expires_in", 86400)
+                )
+                return payload["access_token"]
+            except AcledAuthError as exc:
+                # Refresh token rejected/expired → fall back to password grant.
+                logger.warning(
+                    "ACLED refresh token rejected (%s) — re-authenticating "
+                    "with credentials",
+                    exc,
+                )
+                _token_cache["refresh_token"] = None
+
+        # Fresh password grant.
+        payload = await _request_token(
+            {
+                "username": settings.acled_username,
+                "password": settings.acled_password,
+                "grant_type": "password",
+                "client_id": _ACLED_CLIENT_ID,
+                "scope": _ACLED_SCOPE,
+            },
+            settings.acled_timeout_sec,
+        )
+        _token_cache["access_token"] = payload["access_token"]
+        _token_cache["refresh_token"] = payload.get("refresh_token")
+        _token_cache["expires_at"] = now + int(payload.get("expires_in", 86400))
+        return payload["access_token"]
 
 
 # ── Module-level helper functions ──────────────────────────────────────
@@ -110,10 +277,12 @@ def _build_acled_body(
 
 
 class AcledAdapter(BaseAdapter):
-    """ACLED armed-conflict events adapter.
+    """ACLED armed-conflict events adapter (OAuth2 password grant).
 
     Degrades gracefully to ``[]`` (with a warning) when
-    ``acled_api_key`` or ``acled_email`` is unconfigured.
+    ``acled_username`` or ``acled_password`` is unconfigured, and to ``[]``
+    (with an explicit ERROR carrying the OAuth failure reason) when the
+    token endpoint rejects the credentials or blocks the account.
     """
 
     SOURCE_TYPE = "acled"
@@ -128,14 +297,15 @@ class AcledAdapter(BaseAdapter):
             List of raw event records with ``event_id_cnty`` /
             ``event_date`` / ``event_type`` / ``country`` / ``actor1`` /
             ``actor2`` / ``fatalities`` / ``notes`` / ``latitude`` /
-            ``longitude``. Empty list (with warning) when key or email
-            is unconfigured.
+            ``longitude``. Empty list (with warning) when username or
+            password is unconfigured; empty list (with explicit error)
+            when OAuth authentication fails.
         """
         settings = get_settings()
-        if not settings.acled_api_key or not settings.acled_email:
+        if not settings.acled_username or not settings.acled_password:
             logger.warning(
-                "ACLED API key or email not configured — skipping ACLED fetch "
-                "(set ACLED_API_KEY and ACLED_EMAIL to enable)"
+                "ACLED username or password not configured — skipping ACLED "
+                "fetch (set ACLED_USERNAME and ACLED_PASSWORD to enable)"
             )
             return []
 
@@ -146,8 +316,6 @@ class AcledAdapter(BaseAdapter):
         start_date = cutoff.strftime("%Y-%m-%d")
 
         params = {
-            "key": settings.acled_api_key,
-            "email": settings.acled_email,
             "event_date": start_date,
             "event_date_where": ">=",
             "limit": "500",
@@ -155,10 +323,39 @@ class AcledAdapter(BaseAdapter):
         }
 
         try:
+            token = await _get_access_token(settings)
+        except AcledAuthError as exc:
+            logger.error("ACLED authentication failed: %s", exc)
+            return []
+        except (httpx.HTTPError, ValueError) as exc:
+            logger.warning("ACLED OAuth request failed: %s", exc)
+            return []
+
+        headers = {"Authorization": f"Bearer {token}"}
+
+        try:
             async with httpx.AsyncClient(
                 timeout=settings.acled_timeout_sec
             ) as client:
-                resp = await client.get(_ACLED_API_URL, params=params)
+                resp = await client.get(_ACLED_API_URL, params=params, headers=headers)
+                if resp.status_code == 401:
+                    # Stale/revoked token → clear cache and re-authenticate once.
+                    logger.info(
+                        "ACLED API returned 401 — re-authenticating and retrying"
+                    )
+                    _clear_token_cache()
+                    try:
+                        token = await _get_access_token(settings)
+                    except AcledAuthError as exc:
+                        logger.error("ACLED authentication failed: %s", exc)
+                        return []
+                    except (httpx.HTTPError, ValueError) as exc:
+                        logger.warning("ACLED OAuth request failed: %s", exc)
+                        return []
+                    headers = {"Authorization": f"Bearer {token}"}
+                    resp = await client.get(
+                        _ACLED_API_URL, params=params, headers=headers
+                    )
                 resp.raise_for_status()
                 payload = resp.json()
         except (httpx.HTTPError, ValueError) as exc:
@@ -283,8 +480,13 @@ def _parse_event_date(date_str: str) -> datetime | None:
 
 __all__ = [
     "AcledAdapter",
+    "AcledAuthError",
+    "_clear_token_cache",
+    "_get_access_token",
     "_map_acled_severity",
+    "_oauth_error_reason",
     "_build_acled_body",
     "_ACLED_API_URL",
+    "_ACLED_OAUTH_TOKEN_URL",
     "_HIGH_IMPACT_EVENT_TYPES",
 ]

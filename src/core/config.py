@@ -187,20 +187,21 @@ class Settings(BaseSettings):
         description="Maximum age of news articles in days (older articles are discarded)",
     )
 
-    # === 宏观数据源 API Key (Phase 1, add-phase1-macro-adapters) ===
-    # FRED / ACLED / EIA 需免费注册 API key；未配置时对应 adapter 优雅降级（fetch 返回空列表）。
+    # === 宏观数据源认证 (Phase 1, add-phase1-macro-adapters) ===
+    # FRED / EIA 需免费注册 API key；ACLED 使用账号密码（OAuth2 password-grant）。
+    # 未配置时对应 adapter 优雅降级（fetch 返回空列表 + warning）。
     # OFAC SDN / OpenSanctions / BLS 无需 API key。
     fred_api_key: str = Field(
         "",
         description="FRED API Key（免费注册，https://fred.stlouisfed.org/docs/api/api_key.html）",
     )
-    acled_api_key: str = Field(
+    acled_username: str = Field(
         "",
-        description="ACLED API Key（免费注册，https://acleddata.com）",
+        description="ACLED 用户名（邮箱）",
     )
-    acled_email: str = Field(
+    acled_password: str = Field(
         "",
-        description="ACLED 注册邮箱（与 acled_api_key 配套）",
+        description="ACLED 密码",
     )
     eia_api_key: str = Field(
         "",

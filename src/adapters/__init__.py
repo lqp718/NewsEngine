@@ -52,9 +52,11 @@ from src.adapters.sanctions_adapter import (
 )
 from src.adapters.acled_adapter import (
     AcledAdapter,
+    AcledAuthError,
     _map_acled_severity,
     _build_acled_body,
     _ACLED_API_URL,
+    _ACLED_OAUTH_TOKEN_URL,
 )
 from src.adapters.eia_adapter import (
     EiaAdapter,
@@ -110,9 +112,11 @@ __all__ = [
     "_OFAC_SDN_CSV_URL",
     "_OPEN_SANCTIONS_SEARCH_URL",
     "AcledAdapter",
+    "AcledAuthError",
     "_map_acled_severity",
     "_build_acled_body",
     "_ACLED_API_URL",
+    "_ACLED_OAUTH_TOKEN_URL",
     "EiaAdapter",
     "_EIA_SERIES",
     "_map_eia_severity",

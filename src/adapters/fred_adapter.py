@@ -8,6 +8,13 @@ observations for a fixed set of key macro series (GDP / CPI /
 unemployment rate / federal funds rate / PPI), one snapshot episode
 per series per cycle.
 
+Robustness (fred-adapter-optimization): serial requests, one series
+at a time; per-series retry for transient failures (429 rate limit /
+5xx / transport errors) with exponential backoff that honors the
+``Retry-After`` header, so a failing series never blocks the others;
+server-side ``observation_start`` filter (90-day lookback) keeps
+payloads small on top of the client-side ``limit``.
+
 Contract: BaseAdapter (fetch → normalize → dedup).
 - fetch(): httpx.AsyncClient; returns [] + warning when api_key is unconfigured
 - normalize(): one NormalizedEpisode per series snapshot; date-window
@@ -18,6 +25,7 @@ Contract: BaseAdapter (fetch → normalize → dedup).
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -37,6 +45,27 @@ _FRED_API_URL = "https://api.stlouisfed.org/fred/series/observations"
 
 # Default series to track (design.md ADR: module-level constant).
 _FRED_SERIES = ["GDP", "CPIAUCSL", "UNRATE", "DFF", "PPIACO"]
+
+# How many observations to request per series (latest first, desc).
+# Latest + one previous is enough for the change delta; a third guards
+# against a masked/missing most-recent value.
+_FRED_FETCH_LENGTH = 3
+
+# How far back the server-side ``observation_start`` filter reaches.
+# 90 days covers every series' publication lag (GDP ~4-6 weeks,
+# CPI/PPI ~2-3 weeks, UNRATE ~1 week, DFF daily) while keeping the
+# payload small; normalize() still applies the authoritative
+# ``news_max_age_days`` window on top.
+_FRED_FETCH_LOOKBACK_DAYS = 90
+
+# Retry policy for transient failures. FRED rate-limits per key and
+# returns 429 when exceeded (errors.html); 5xx are transient server
+# errors. Exponential backoff: 1s, 3s, 9s (base 1.0s, multiplier 3.0).
+# Permanent 4xx (400/404/423 …) are logged and never retried.
+_FRED_MAX_RETRIES = 3  # retries after the initial attempt
+_FRED_RETRY_BACKOFF_BASE = 1.0  # seconds, multiplied by 3**attempt
+_FRED_RETRY_BACKOFF_MULTIPLIER = 3.0
+_FRED_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
 # Per-series display metadata: human name, units, topic entity name.
 _FRED_SERIES_META: dict[str, dict[str, str]] = {
@@ -80,6 +109,39 @@ def _parse_observation_date(date_str: str | None) -> datetime | None:
     except ValueError:
         logger.debug("FRED: unparseable observation date: %s", date_str)
         return None
+
+
+def _parse_retry_after(resp: httpx.Response) -> float | None:
+    """Parse the ``Retry-After`` header (delay-seconds) if present.
+
+    FRED returns delay-seconds on 429 (errors.html). Returns ``None``
+    when the header is absent or not a plain number (RFC 7231 also
+    allows an HTTP-date; FRED does not use it).
+    """
+    raw = resp.headers.get("retry-after")
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        logger.debug("FRED: unparseable Retry-After: %s", raw)
+        return None
+
+
+def _extract_error_message(resp: httpx.Response) -> str:
+    """Extract FRED's error message from a non-2xx JSON body.
+
+    FRED error bodies look like ``{"error_code": 400, "error_message":
+    "..."}`` (errors.html). Returns ``""`` when the body is not
+    parseable or has no message.
+    """
+    try:
+        data = resp.json()
+    except ValueError:
+        return ""
+    if isinstance(data, dict):
+        return str(data.get("error_message") or data.get("message") or "")
+    return ""
 
 
 def _map_fred_severity(
@@ -169,7 +231,18 @@ class FredAdapter(BaseAdapter):
 
         records: list[dict] = []
         timeout = settings.fred_timeout_sec
+        # Server-side date filter: only observations from the last
+        # ``_FRED_FETCH_LOOKBACK_DAYS`` days. Deliberately wider than the
+        # client-side ``news_max_age_days`` window so the API-side filter
+        # is a loose efficiency hint; normalize() stays authoritative.
+        observation_start = (
+            datetime.now(timezone.utc) - timedelta(days=_FRED_FETCH_LOOKBACK_DAYS)
+        ).strftime("%Y-%m-%d")
+
         async with httpx.AsyncClient(timeout=timeout) as client:
+            # Serial requests, one series at a time (deliberate: keep the
+            # request rate well inside FRED's 120 req/min/key limit and
+            # keep retry/backoff behavior deterministic).
             for series_id in _FRED_SERIES:
                 try:
                     params = {
@@ -177,10 +250,24 @@ class FredAdapter(BaseAdapter):
                         "api_key": settings.fred_api_key,
                         "file_type": "json",
                         "sort_order": "desc",
-                        "limit": "3",
+                        # Server-side + client-side limits together: the
+                        # API filters by date range first, then we cap
+                        # how many rows come back.
+                        "observation_start": observation_start,
+                        "limit": str(_FRED_FETCH_LENGTH),
                     }
-                    resp = await client.get(_FRED_API_URL, params=params)
-                    resp.raise_for_status()
+                    resp = await self._get_with_retry(client, params, series_id)
+                    if resp is None:
+                        continue
+                    if resp.status_code != 200:
+                        logger.warning(
+                            "FRED: series %s failed — HTTP %d: %s",
+                            series_id,
+                            resp.status_code,
+                            _extract_error_message(resp) or resp.reason_phrase,
+                        )
+                        continue
+
                     payload = resp.json()
                     observations = payload.get("observations") or []
                     if not observations:
@@ -210,6 +297,77 @@ class FredAdapter(BaseAdapter):
         self._pre_filter_count = len(records)
         logger.info("FRED: fetched %d series snapshots", len(records))
         return records
+
+    async def _get_with_retry(
+        self,
+        client: httpx.AsyncClient,
+        params: dict[str, Any],
+        series_id: str,
+    ) -> httpx.Response | None:
+        """GET the observations endpoint, retrying transient failures.
+
+        Retries 429 (rate limit) and 5xx / transport errors up to
+        ``_FRED_MAX_RETRIES`` times with exponential backoff
+        (``_FRED_RETRY_BACKOFF_BASE * multiplier**attempt`` → 1s/3s/9s),
+        honoring the ``Retry-After`` header when present (429).
+
+        Returns:
+            The final response (retryable statuses that exhausted their
+            attempts are returned as-is so the caller can log them), or
+            ``None`` when the connection itself keeps failing.
+        """
+        resp: httpx.Response | None = None
+        for attempt in range(_FRED_MAX_RETRIES + 1):
+            try:
+                resp = await client.get(_FRED_API_URL, params=params)
+            except httpx.HTTPError as exc:
+                if attempt >= _FRED_MAX_RETRIES:
+                    logger.warning(
+                        "FRED: request failed for series %s after %d attempts: %s",
+                        series_id,
+                        _FRED_MAX_RETRIES + 1,
+                        exc,
+                    )
+                    return None
+                delay = _FRED_RETRY_BACKOFF_BASE * (
+                    _FRED_RETRY_BACKOFF_MULTIPLIER**attempt
+                )
+                logger.warning(
+                    "FRED: request error for series %s (attempt %d/%d): %s"
+                    " — retrying in %.1fs",
+                    series_id,
+                    attempt + 1,
+                    _FRED_MAX_RETRIES,
+                    exc,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            if resp.status_code not in _FRED_RETRYABLE_STATUS:
+                return resp
+            if attempt >= _FRED_MAX_RETRIES:
+                return resp
+
+            retry_after = _parse_retry_after(resp)
+            delay = (
+                retry_after
+                if retry_after is not None
+                else _FRED_RETRY_BACKOFF_BASE
+                * (_FRED_RETRY_BACKOFF_MULTIPLIER**attempt)
+            )
+            logger.warning(
+                "FRED: HTTP %d for series %s (attempt %d/%d): %s"
+                " — retrying in %.1fs",
+                resp.status_code,
+                series_id,
+                attempt + 1,
+                _FRED_MAX_RETRIES,
+                _extract_error_message(resp) or resp.reason_phrase,
+                delay,
+            )
+            await asyncio.sleep(delay)
+        return resp
 
     async def normalize(self, record: dict) -> NormalizedEpisode | None:
         """Convert one FRED series snapshot to a NormalizedEpisode.
@@ -301,6 +459,11 @@ __all__ = [
     "FredAdapter",
     "_FRED_SERIES",
     "_FRED_SERIES_META",
+    "_FRED_FETCH_LENGTH",
+    "_FRED_FETCH_LOOKBACK_DAYS",
+    "_FRED_MAX_RETRIES",
+    "_parse_retry_after",
+    "_extract_error_message",
     "_map_fred_severity",
     "_build_fred_body",
 ]
