@@ -1,0 +1,70 @@
+"""Sanctions Codebook Translator — OFAC program codes to human-readable descriptions.
+
+Translates OFAC SDN program codes (e.g. ``"SDGT"``, ``"UKR"``) to
+human-readable descriptions using the JSON codebook in
+``data/codebooks/ofac_program_codes.json``.
+
+Data flow::
+
+    translate_program("SDGT")   →  "Specially Designated Global Terrorist"
+    translate_program("UKR")    →  "Ukraine-Related Sanctions"
+    translate_program("IRAN")   →  "Iran Sanctions"
+
+Design: mirrors ``gdelt_codebook.py`` — lazy loading, thread-safe, fail-open.
+"""
+
+from __future__ import annotations
+
+import json
+from functools import lru_cache
+from pathlib import Path
+from threading import Lock
+
+__all__ = ["translate_program"]
+
+# ── module-level state ───────────────────────────────────────────────
+
+_lock = Lock()
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+_CODEBOOK_PATH = _PROJECT_ROOT / "data" / "codebooks" / "ofac_program_codes.json"
+
+
+# ── internal helper ──────────────────────────────────────────────────
+
+@lru_cache(maxsize=1)
+def _load_codebook() -> dict[str, str]:
+    """Load the OFAC program codes JSON (lazy, thread-safe)."""
+    with _lock:
+        if not _CODEBOOK_PATH.exists():
+            return {}
+        try:
+            with open(_CODEBOOK_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return {}
+
+
+# ── public API ───────────────────────────────────────────────────────
+
+def translate_program(code: str) -> str:
+    """Translate an OFAC program code to a human-readable description.
+
+    Args:
+        code: OFAC program code (e.g. ``"SDGT"``, ``"UKR"``).
+
+    Returns:
+        Human-readable description, or the original code if unknown.
+
+    Examples::
+
+        >>> translate_program("SDGT")
+        'Specially Designated Global Terrorist'
+        >>> translate_program("UKR")
+        'Ukraine-Related Sanctions'
+        >>> translate_program("UNKNOWN_CODE")
+        'UNKNOWN_CODE'
+    """
+    if not code:
+        return code
+    codebook = _load_codebook()
+    return codebook.get(code, code)

@@ -34,6 +34,11 @@ logger = get_logger(__name__)
 
 _BLS_API_URL = "https://api.bls.gov/publicAPI/v2/timeseries/data/"
 
+# BLS is monthly data with ~1 month publication lag.
+# The global ``news_max_age_days`` (14) would filter out the latest
+# observation past mid-month.  Use a source-specific 90-day window.
+_BLS_MAX_AGE_DAYS = 90
+
 # Default series (design.md): nonfarm payrolls / unemployment rate /
 # average hourly earnings / CPI-U (all items).
 _BLS_SERIES: dict[str, dict[str, str]] = {
@@ -41,21 +46,25 @@ _BLS_SERIES: dict[str, dict[str, str]] = {
         "name": "All Employees, Total Nonfarm (Nonfarm Payrolls)",
         "units": "Thousands",
         "topic": "Nonfarm Payrolls",
+        "context": "Nonfarm payrolls measure the number of employed people excluding farm workers, government employees, and nonprofit organization employees. Released monthly (first Friday). Key labor market indicator — strong numbers signal economic growth, weak numbers may signal recession.",
     },
     "LNS14000000": {
         "name": "Unemployment Rate",
         "units": "Percent",
         "topic": "Unemployment",
+        "context": "Percentage of the labor force that is unemployed and actively seeking work. Lagging indicator — rises after recession ends, falls during recovery. Part of the Fed's dual mandate (maximum employment). Below 4% is historically tight.",
     },
     "CES0500000003": {
         "name": "Average Hourly Earnings of All Employees, Total Private",
         "units": "Dollars per Hour",
         "topic": "Wage Growth",
+        "context": "Average hourly earnings for private-sector workers. Key wage inflation indicator — sustained wage growth above 3-4% may feed into consumer price inflation and prompt Fed tightening.",
     },
     "CUUR0000SA0": {
         "name": "Consumer Price Index for All Urban Consumers, All Items",
         "units": "Index 1982-1984=100",
         "topic": "Inflation",
+        "context": "CPI tracks the average change in prices paid by urban consumers for a basket of goods and services. Primary inflation gauge for the Fed. Rising CPI may trigger rate hikes; falling CPI may signal easing.",
     },
 }
 
@@ -139,6 +148,7 @@ def _build_bls_body(
     value: str,
     previous_value: str | None,
     units: str,
+    context: str | None = None,
 ) -> str:
     """Build a structured Markdown episode body for one BLS snapshot."""
     lines = [f"## BLS: {name} ({series_id})", ""]
@@ -153,6 +163,8 @@ def _build_bls_body(
             )
         except (TypeError, ValueError):
             lines.append(f"- Previous value: {previous_value} {units}")
+    if context:
+        lines.append(f"\n**Context**: {context}")
     return "\n".join(lines)
 
 
@@ -235,6 +247,7 @@ class BlsAdapter(BaseAdapter):
                     "units": cfg.get("units", ""),
                     "name": cfg.get("name", series_id),
                     "topic": cfg.get("topic", series_id),
+                    "context": cfg.get("context", ""),
                 }
             )
 
@@ -257,6 +270,7 @@ class BlsAdapter(BaseAdapter):
         units = str(record.get("units", ""))
         name = str(record.get("name", series_id))
         topic = str(record.get("topic", series_id))
+        context = str(record.get("context", "") or "")
 
         valid_at = _parse_bls_period(year, period)
         if valid_at is None:
@@ -264,14 +278,12 @@ class BlsAdapter(BaseAdapter):
             return None
 
         settings = get_settings()
-        cutoff = datetime.now(timezone.utc) - timedelta(
-            days=settings.news_max_age_days
-        )
+        cutoff = datetime.now(timezone.utc) - timedelta(days=_BLS_MAX_AGE_DAYS)
         if valid_at < cutoff:
             logger.debug(
                 "BLS: %s period older than %d days — skipping",
                 series_id,
-                settings.news_max_age_days,
+                _BLS_MAX_AGE_DAYS,
             )
             return None
 
@@ -294,6 +306,7 @@ class BlsAdapter(BaseAdapter):
             value,
             previous_value,
             units,
+            context=context or None,
         )
         content_hash = hashlib.sha256(episode_body.encode("utf-8")).hexdigest()
 

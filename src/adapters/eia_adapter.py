@@ -40,33 +40,45 @@ _EIA_SERIES: dict[str, dict[str, Any]] = {
     "WCRSTUS1": {
         "route": "petroleum/stoc/wstk",
         "facets": {"duoarea": "NUS", "product": "WST"},
+        "frequency": "weekly",
         "name": "Weekly U.S. Crude Oil Ending Stocks",
         "units": "Thousand Barrels",
         "topic": "Crude Oil Inventories",
+        "context": "Weekly crude oil inventories reported by EIA every Wednesday at 10:30 AM ET. Inventory builds (increases) are typically bearish for oil prices; draws (decreases) are bullish. Compare against 5-year average for seasonal context.",
     },
     # Weekly US crude oil field production (thousand barrels/day)
     "WCRFPUS2": {
         "route": "petroleum/crd/crpdn",
         "facets": {"duoarea": "NUS"},
+        "frequency": "weekly",
         "name": "Weekly U.S. Field Production of Crude Oil",
         "units": "Thousand Barrels per Day",
         "topic": "Crude Oil Production",
+        "context": "Weekly US crude oil production volume. Tracks shale (Permian/Bakken/Eagle Ford) output trends. Production increases can offset OPEC+ cuts; declines may signal capital discipline or infrastructure constraints.",
     },
     # Weekly US crude oil imports (thousand barrels/day)
+    # Route: petroleum/move/wkly (Weekly Imports & Exports, from EIA OpenData docs)
+    # Facets: product=EPC0 (Crude Oil), process=IM0 (Imports), duoarea=NUS (US)
     "WCRIMUS2": {
-        "route": "petroleum/imp/impw",
-        "facets": {"duoarea": "NUS", "product": "WST"},
+        "route": "petroleum/move/wkly",
+        "facets": {"product": "EPC0", "process": "IM0", "duoarea": "NUS"},
+        "frequency": "weekly",
         "name": "Weekly U.S. Imports of Crude Oil",
         "units": "Thousand Barrels per Day",
         "topic": "Crude Oil Imports",
+        "context": "Weekly US crude oil imports. Key for supply/demand balance analysis. Import volumes reflect domestic production gaps and refinery demand. Spikes may signal supply disruptions or seasonal refinery maintenance.",
     },
     # Weekly US crude oil exports (thousand barrels/day)
+    # Route: petroleum/move/wkly (Weekly Imports & Exports, from EIA OpenData docs)
+    # Facets: product=EPC0 (Crude Oil), process=EEX (Exports), duoarea=NUS (US)
     "WCREXUS2": {
-        "route": "petroleum/exp/expw",
-        "facets": {"duoarea": "NUS", "product": "WST"},
+        "route": "petroleum/move/wkly",
+        "facets": {"product": "EPC0", "process": "EEX", "duoarea": "NUS"},
+        "frequency": "weekly",
         "name": "Weekly U.S. Exports of Crude Oil",
         "units": "Thousand Barrels per Day",
         "topic": "Crude Oil Exports",
+        "context": "Weekly US crude oil exports. Reflects global demand for US light sweet crude. Export volumes affect domestic inventory levels and are sensitive to international price spreads (Brent-WTI) and geopolitical events.",
     },
     # Weekly US retail regular gasoline price (dollars/gallon)
     "WGASUS1": {
@@ -75,6 +87,7 @@ _EIA_SERIES: dict[str, dict[str, Any]] = {
         "name": "Weekly U.S. Retail Gasoline Price",
         "units": "Dollars per Gallon",
         "topic": "Gasoline Prices",
+        "context": "Weekly US retail regular gasoline price. Direct consumer impact of oil market dynamics. Rising prices may signal supply constraints or geopolitical risk; may also influence consumer spending and inflation expectations.",
     },
 }
 
@@ -133,6 +146,7 @@ def _build_eia_body(
     value: str,
     previous_value: str | None,
     units: str,
+    context: str | None = None,
 ) -> str:
     """Build a structured Markdown episode body for one EIA snapshot."""
     lines = [f"## EIA: {name} ({series_id})", ""]
@@ -147,6 +161,8 @@ def _build_eia_body(
             )
         except (TypeError, ValueError):
             lines.append(f"- Previous value: {previous_value} {units}")
+    if context:
+        lines.append(f"\n**Context**: {context}")
     return "\n".join(lines)
 
 
@@ -194,6 +210,9 @@ class EiaAdapter(BaseAdapter):
                         "sort[0][direction]": "desc",
                         "length": str(_EIA_FETCH_LENGTH),
                     }
+                    # Optional explicit frequency (weekly/monthly/annual)
+                    if cfg.get("frequency"):
+                        params["frequency"] = cfg["frequency"]
                     for facet, value in cfg["facets"].items():
                         params[f"facets[{facet}][]"] = value
 
@@ -219,6 +238,7 @@ class EiaAdapter(BaseAdapter):
                             "units": cfg["units"],
                             "name": cfg["name"],
                             "topic": cfg["topic"],
+                            "context": cfg.get("context", ""),
                         }
                     )
                 except (httpx.HTTPError, ValueError) as exc:
@@ -243,6 +263,7 @@ class EiaAdapter(BaseAdapter):
         units = str(record.get("units", ""))
         name = str(record.get("name", series_id))
         topic = str(record.get("topic", series_id))
+        context = str(record.get("context", "") or "")
 
         valid_at = _parse_period_date(period)
         if valid_at is None:
@@ -272,7 +293,8 @@ class EiaAdapter(BaseAdapter):
 
         severity = _map_eia_severity(series_id, value_f, previous_f)
         episode_body = _build_eia_body(
-            series_id, name, period, value, previous_value, units
+            series_id, name, period, value, previous_value, units,
+            context=context or None,
         )
         content_hash = hashlib.sha256(episode_body.encode("utf-8")).hexdigest()
 

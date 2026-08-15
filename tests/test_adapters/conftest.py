@@ -182,4 +182,5 @@ def sample_bls_record() -> dict[str, Any]:
         "units": "Thousands",
         "name": "All Employees, Total Nonfarm (Nonfarm Payrolls)",
         "topic": "Nonfarm Payrolls",
+        "context": "Nonfarm payrolls measure the number of employed people excluding farm workers, government employees, and nonprofit organization employees. Released monthly (first Friday). Key labor market indicator — strong numbers signal economic growth, weak numbers may signal recession.",
     }

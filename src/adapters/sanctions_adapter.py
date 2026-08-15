@@ -94,12 +94,18 @@ def _build_sanctions_body(
     source: str,
 ) -> str:
     """Build a structured Markdown episode body for one sanction entry."""
+    from src.adapters.sanctions_codebook import translate_program
+
     lines = [f"## Sanctions: {entity_name}", ""]
     lines.append(f"- Target type: {target_type}")
     if country:
         lines.append(f"- Country: {country}")
     if sanction_program:
-        lines.append(f"- Sanction program: {sanction_program}")
+        program_desc = translate_program(sanction_program)
+        if program_desc != sanction_program:
+            lines.append(f"- Sanction program: {sanction_program} — {program_desc}")
+        else:
+            lines.append(f"- Sanction program: {sanction_program}")
     if listing_date:
         lines.append(f"- Listing date: {listing_date}")
     lines.append(f"- Source: {source}")

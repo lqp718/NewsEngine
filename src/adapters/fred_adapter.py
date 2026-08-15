@@ -58,6 +58,12 @@ _FRED_FETCH_LENGTH = 3
 # ``news_max_age_days`` window on top.
 _FRED_FETCH_LOOKBACK_DAYS = 90
 
+# FRED includes monthly/quarterly data (GDP, CPI, PPI, UNRATE) with
+# publication lags of 1-6 weeks.  The global ``news_max_age_days`` (14)
+# would filter out the latest observation for slow-moving series.
+# Use a source-specific 90-day window.
+_FRED_MAX_AGE_DAYS = 90
+
 # Retry policy for transient failures. FRED rate-limits per key and
 # returns 429 when exceeded (errors.html); 5xx are transient server
 # errors. Exponential backoff: 1s, 3s, 9s (base 1.0s, multiplier 3.0).
@@ -73,26 +79,31 @@ _FRED_SERIES_META: dict[str, dict[str, str]] = {
         "name": "Gross Domestic Product",
         "units": "Bil. of $",
         "topic": "GDP Growth",
+        "context": "GDP measures the total value of goods and services produced in the US. Released quarterly. Leading indicator for economic health. Strong GDP growth typically supports equity markets and may prompt Fed tightening.",
     },
     "CPIAUCSL": {
         "name": "Consumer Price Index for All Urban Consumers",
         "units": "Index 1982-1984=100",
         "topic": "Inflation",
+        "context": "CPI tracks the average change in prices paid by urban consumers for a basket of goods and services. Primary inflation gauge for the Fed. Rising CPI may trigger rate hikes; falling CPI may signal easing.",
     },
     "UNRATE": {
         "name": "Unemployment Rate",
         "units": "Percent",
         "topic": "Unemployment",
+        "context": "Percentage of the labor force that is unemployed and actively seeking work. Lagging indicator — rises after recession ends, falls during recovery. Part of the Fed's dual mandate (maximum employment).",
     },
     "DFF": {
         "name": "Federal Funds Rate",
         "units": "Percent",
         "topic": "Federal Funds Rate",
+        "context": "Interest rate at which depository institutions lend reserve balances to other institutions overnight. Primary tool for Fed monetary policy. Rate hikes tighten money supply; cuts stimulate economy.",
     },
     "PPIACO": {
         "name": "Producer Price Index",
         "units": "Index 1982=100",
         "topic": "Producer Prices",
+        "context": "PPI measures the average change in selling prices received by domestic producers. Leading indicator for consumer inflation — producer cost increases often pass through to consumer prices.",
     },
 }
 
@@ -180,6 +191,7 @@ def _build_fred_body(
     value: str,
     previous_value: str | None,
     units: str,
+    context: str | None = None,
 ) -> str:
     """Build a structured Markdown episode body for one series snapshot."""
     lines = [f"## FRED: {name} ({series_id})", ""]
@@ -194,6 +206,8 @@ def _build_fred_body(
             )
         except (TypeError, ValueError):
             lines.append(f"- Previous value: {previous_value} {units}")
+    if context:
+        lines.append(f"\n**Context**: {context}")
     return "\n".join(lines)
 
 
@@ -287,6 +301,7 @@ class FredAdapter(BaseAdapter):
                             "units": meta.get("units", ""),
                             "name": meta.get("name", series_id),
                             "topic": meta.get("topic", series_id),
+                            "context": meta.get("context", ""),
                         }
                     )
                 except (httpx.HTTPError, ValueError) as exc:
@@ -383,6 +398,7 @@ class FredAdapter(BaseAdapter):
         units = str(record.get("units", ""))
         name = str(record.get("name", series_id))
         topic = str(record.get("topic", series_id))
+        context = str(record.get("context", "") or "")
 
         valid_at = _parse_observation_date(date_str)
         if valid_at is None:
@@ -395,15 +411,12 @@ class FredAdapter(BaseAdapter):
         cutoff_date = _parse_observation_date(record.get("realtime_start"))
         if cutoff_date is None:
             cutoff_date = valid_at
-        settings = get_settings()
-        cutoff = datetime.now(timezone.utc) - timedelta(
-            days=settings.news_max_age_days
-        )
+        cutoff = datetime.now(timezone.utc) - timedelta(days=_FRED_MAX_AGE_DAYS)
         if cutoff_date < cutoff:
             logger.debug(
                 "FRED: %s observation older than %d days — skipping",
                 series_id,
-                settings.news_max_age_days,
+                _FRED_MAX_AGE_DAYS,
             )
             return None
 
@@ -418,7 +431,8 @@ class FredAdapter(BaseAdapter):
 
         severity = _map_fred_severity(series_id, value_f, previous_f)
         episode_body = _build_fred_body(
-            series_id, name, date_str, value, previous_value, units
+            series_id, name, date_str, value, previous_value, units,
+            context=context or None,
         )
         content_hash = hashlib.sha256(episode_body.encode("utf-8")).hexdigest()
 

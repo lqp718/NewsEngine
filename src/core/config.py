@@ -184,7 +184,11 @@ class Settings(BaseSettings):
     # === News Age Filter ===
     news_max_age_days: int = Field(
         14,
-        description="Maximum age of news articles in days (older articles are discarded)",
+        description=(
+            "Maximum age of news articles in days (older articles are discarded). "
+            "Applies to daily/weekly sources (GDELT, RSS, EIA, CLS, etc.). "
+            "BLS and FRED use their own 90-day windows (monthly/quarterly data)."
+        ),
     )
 
     # === 宏观数据源认证 (Phase 1, add-phase1-macro-adapters) ===
