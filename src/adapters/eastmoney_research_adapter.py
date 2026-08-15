@@ -26,6 +26,10 @@ from src.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
 
+# EastMoney research reports are low-frequency (weekly/monthly); 14-day window
+# too tight. Use 90-day window like BLS/FRED/EIA to ensure we capture reports.
+_EASTMONEY_RESEARCH_MAX_AGE_DAYS = 90
+
 
 def _extract_text_from_pdf(pdf_bytes: bytes, max_pages: int = 15) -> str:
     """Extract text from PDF using PyMuPDF.
@@ -278,9 +282,7 @@ class EastMoneyResearchAdapter(BaseAdapter):
         keywords = _extract_keywords(title)
         
         # Date window cutoff
-        settings = get_settings()
-        max_age_days = settings.news_max_age_days
-        cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=_EASTMONEY_RESEARCH_MAX_AGE_DAYS)
         if valid_at < cutoff:
             return None  # type: ignore[return-value]
         

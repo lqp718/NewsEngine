@@ -33,6 +33,10 @@ logger = get_logger(__name__)
 
 _EIA_API_BASE = "https://api.eia.gov/v2"
 
+# EIA data is weekly frequency; 14-day window too tight for reliable capture.
+# Use 90-day window like BLS/FRED to ensure we don't miss weekly releases.
+_EIA_MAX_AGE_DAYS = 90
+
 # Series definitions: series_id → route + facets + display metadata.
 # Facets disambiguate the series (area/product), per EIA v2 API docs.
 _EIA_SERIES: dict[str, dict[str, Any]] = {
@@ -47,9 +51,11 @@ _EIA_SERIES: dict[str, dict[str, Any]] = {
         "context": "Weekly crude oil inventories reported by EIA every Wednesday at 10:30 AM ET. Inventory builds (increases) are typically bearish for oil prices; draws (decreases) are bullish. Compare against 5-year average for seasonal context.",
     },
     # Weekly US crude oil field production (thousand barrels/day)
+    # Route: petroleum/prod/wkly (Weekly Production, from EIA API structure)
+    # Facets: product=EPC0 (Crude Oil), duoarea=NUS (US National)
     "WCRFPUS2": {
-        "route": "petroleum/crd/crpdn",
-        "facets": {"duoarea": "NUS"},
+        "route": "petroleum/prod/wkly",
+        "facets": {"product": "EPC0", "duoarea": "NUS"},
         "frequency": "weekly",
         "name": "Weekly U.S. Field Production of Crude Oil",
         "units": "Thousand Barrels per Day",
@@ -270,15 +276,12 @@ class EiaAdapter(BaseAdapter):
             logger.debug("EIA: invalid period, skipping: %r", record)
             return None
 
-        settings = get_settings()
-        cutoff = datetime.now(timezone.utc) - timedelta(
-            days=settings.news_max_age_days
-        )
+        cutoff = datetime.now(timezone.utc) - timedelta(days=_EIA_MAX_AGE_DAYS)
         if valid_at < cutoff:
             logger.debug(
                 "EIA: %s period older than %d days — skipping",
                 series_id,
-                settings.news_max_age_days,
+                _EIA_MAX_AGE_DAYS,
             )
             return None
 

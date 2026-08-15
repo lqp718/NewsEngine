@@ -186,8 +186,9 @@ class Settings(BaseSettings):
         14,
         description=(
             "Maximum age of news articles in days (older articles are discarded). "
-            "Applies to daily/weekly sources (GDELT, RSS, EIA, CLS, etc.). "
-            "BLS and FRED use their own 90-day windows (monthly/quarterly data)."
+            "Applies to daily/weekly sources (GDELT, RSS, CLS, etc.). "
+            "BLS, FRED, EIA, and EastMoney Research use their own 90-day windows "
+            "(monthly/quarterly/weekly low-frequency data)."
         ),
     )
 
