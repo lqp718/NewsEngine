@@ -641,6 +641,7 @@ class ContentFetcher:
         try:
             import trafilatura
 
+            # First attempt: favor_precision=True for clean extraction
             result = trafilatura.extract_with_metadata(
                 html,
                 url=url,
@@ -649,9 +650,42 @@ class ContentFetcher:
                 output_format="txt",
             )
             # extract_with_metadata 返回 Document 对象
+            text = None
             if hasattr(result, 'text'):
-                return result.text
-            return str(result) if result else ""
+                text = result.text
+            elif result:
+                text = str(result)
+            
+            # Fallback: if precision mode failed, try with favor_precision=False
+            # This helps when Camoufox got real content but trafilatura is too strict
+            if not text or not text.strip():
+                logger.warning(
+                    "Trafilatura precision mode failed for %s, trying fallback",
+                    url,
+                )
+                result = trafilatura.extract_with_metadata(
+                    html,
+                    url=url,
+                    favor_precision=False,
+                    include_tables=True,
+                    output_format="txt",
+                    min_extracted_size=50,  # Lower threshold
+                )
+                if hasattr(result, 'text'):
+                    text = result.text
+                elif result:
+                    text = str(result)
+            
+            # If still empty, log warning with HTML snippet for debugging
+            if not text or not text.strip():
+                logger.warning(
+                    "Trafilatura returned empty content for %s. HTML snippet: %s",
+                    url,
+                    html[:300] if html else "(empty)",
+                )
+                return None
+            
+            return text
 
         except ImportError:
             logger.warning("Trafilatura not installed")

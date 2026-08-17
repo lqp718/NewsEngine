@@ -810,6 +810,36 @@ class NewsSpider(Spider):
                             fetch_tier="3",
                         )
 
+                    # Validate that HTML contains actual article content, not just
+                    # a CF challenge page or JS-rendered empty shell.
+                    html_lower = html.lower()
+                    has_article_tag = "<article" in html_lower
+                    # Strip HTML tags to check text length
+                    import re as _re
+                    text_content = _re.sub(r"<[^>]+>", " ", html)
+                    text_content = _re.sub(r"\s+", " ", text_content).strip()
+                    min_text_chars = 200
+                    
+                    if not has_article_tag and len(text_content) < min_text_chars:
+                        logger.warning(
+                            "Tier 3 Camoufox got HTML but no article content for %s "
+                            "(has_article=%s, text_chars=%d). Likely CF challenge page.",
+                            url,
+                            has_article_tag,
+                            len(text_content),
+                        )
+                        # Log first 500 chars for debugging
+                        logger.debug(
+                            "Camoufox HTML snippet for %s: %s",
+                            url,
+                            html[:500],
+                        )
+                        return SpiderResult(
+                            url=url,
+                            error="Tier 3 Camoufox returned non-article content (likely CF challenge)",
+                            fetch_tier="3",
+                        )
+
                     # D13: write cookies back to the pool under (domain, "firefox135")
                     cookie_dict = {
                         c["name"]: c["value"]
@@ -820,9 +850,11 @@ class NewsSpider(Spider):
                         await pool_put(domain, CAMOUFOX_FINGERPRINT, cookie_dict)
 
                     logger.warning(
-                        "Tier 3 Camoufox succeeded for %s (%d chars)",
+                        "Tier 3 Camoufox succeeded for %s (%d chars, article_tag=%s, text_chars=%d)",
                         url,
                         len(html),
+                        has_article_tag,
+                        len(text_content),
                     )
                     return SpiderResult(
                         url=url,

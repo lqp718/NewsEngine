@@ -57,9 +57,9 @@ def _extract_text_from_pdf(pdf_bytes: bytes, max_pages: int = 10) -> str:
         Extracted text as string
     """
     try:
-        import fitz  # PyMuPDF
+        import pymupdf
         
-        doc = fitz.open(stream=io.BytesIO(pdf_bytes), filetype="pdf")
+        doc = pymupdf.open(stream=io.BytesIO(pdf_bytes), filetype="pdf")
         text_parts = []
         
         for i, page in enumerate(doc):

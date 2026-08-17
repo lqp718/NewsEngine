@@ -31,7 +31,7 @@ import zipfile
 # GDELT GKG themes/entities CSV fields can reach multiple MB
 # Python's default csv field size limit (128KB) is too small
 csv.field_size_limit(10485760)  # 10MB
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any
 
 import requests
@@ -54,6 +54,7 @@ from src.adapters.models import (
 from src.adapters.macro_themes import MACRO_THEME_KEYWORDS
 from src.adapters.cameo_event_codes_whitelist import CAMEO_EVENT_CODES_WHITELIST
 from src.ingestion.events_pipeline_filter import EventsPipelineFilter
+from src.core.config import get_settings
 from src.utils.content_fetcher import ContentResult
 from src.utils.logging_config import get_logger
 from src.utils.time_utils import now_hkt
@@ -1380,6 +1381,22 @@ class GdeltAdapter(BaseAdapter):
         merged = self.merge_event_data(events_records, mentions_by_event)
         if not merged:
             return []
+
+        # Step 1.5: Staleness filter — reject events with event_date older than news_max_age_days
+        settings = get_settings()
+        cutoff_date = (now_hkt() - timedelta(days=settings.news_max_age_days)).strftime("%Y-%m-%d")
+        fresh_events = [ev for ev in events_records if ev.event_date >= cutoff_date]
+        stale_count = len(events_records) - len(fresh_events)
+        if stale_count > 0:
+            logger.info(
+                "Staleness filter: %d/%d events rejected (event_date < %s)",
+                stale_count,
+                len(events_records),
+                cutoff_date,
+            )
+        if not fresh_events:
+            return []
+        events_records = fresh_events
 
         # Step 2: Three-stage filter
         config = self._events_filter._load_config()

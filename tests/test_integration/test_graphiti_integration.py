@@ -158,7 +158,7 @@ class TestRelationTypesIntegration:
 
     def test_edge_type_map_correct(self):
         """验证 DEFAULT_EDGE_TYPE_MAP 正确"""
-        assert len(DEFAULT_EDGE_TYPE_MAP) == 5
+        assert len(DEFAULT_EDGE_TYPE_MAP) == 9
         assert ("Entity", "Stock") in DEFAULT_EDGE_TYPE_MAP
         assert ("Stock", "Sector") in DEFAULT_EDGE_TYPE_MAP
         assert ("Stock", "Country") in DEFAULT_EDGE_TYPE_MAP

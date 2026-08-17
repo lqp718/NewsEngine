@@ -41,9 +41,11 @@ _EIA_MAX_AGE_DAYS = 90
 # Facets disambiguate the series (area/product), per EIA v2 API docs.
 _EIA_SERIES: dict[str, dict[str, Any]] = {
     # Weekly US crude oil ending stocks (thousand barrels)
+    # Route: petroleum/sum/sndw (Weekly Supply Estimates, from EIA API v2 metadata)
+    # Facets: series=WCRSTUS1 (direct series lookup)
     "WCRSTUS1": {
-        "route": "petroleum/stoc/wstk",
-        "facets": {"duoarea": "NUS", "product": "WST"},
+        "route": "petroleum/sum/sndw",
+        "facets": {"series": "WCRSTUS1"},
         "frequency": "weekly",
         "name": "Weekly U.S. Crude Oil Ending Stocks",
         "units": "Thousand Barrels",
@@ -51,11 +53,11 @@ _EIA_SERIES: dict[str, dict[str, Any]] = {
         "context": "Weekly crude oil inventories reported by EIA every Wednesday at 10:30 AM ET. Inventory builds (increases) are typically bearish for oil prices; draws (decreases) are bullish. Compare against 5-year average for seasonal context.",
     },
     # Weekly US crude oil field production (thousand barrels/day)
-    # Route: petroleum/prod/wkly (Weekly Production, from EIA API structure)
-    # Facets: product=EPC0 (Crude Oil), duoarea=NUS (US National)
+    # Route: petroleum/sum/sndw (Weekly Supply Estimates, from EIA API v2 metadata)
+    # Facets: series=WCRFPUS2 (direct series lookup)
     "WCRFPUS2": {
-        "route": "petroleum/prod/wkly",
-        "facets": {"product": "EPC0", "duoarea": "NUS"},
+        "route": "petroleum/sum/sndw",
+        "facets": {"series": "WCRFPUS2"},
         "frequency": "weekly",
         "name": "Weekly U.S. Field Production of Crude Oil",
         "units": "Thousand Barrels per Day",
@@ -63,11 +65,11 @@ _EIA_SERIES: dict[str, dict[str, Any]] = {
         "context": "Weekly US crude oil production volume. Tracks shale (Permian/Bakken/Eagle Ford) output trends. Production increases can offset OPEC+ cuts; declines may signal capital discipline or infrastructure constraints.",
     },
     # Weekly US crude oil imports (thousand barrels/day)
-    # Route: petroleum/move/wkly (Weekly Imports & Exports, from EIA OpenData docs)
-    # Facets: product=EPC0 (Crude Oil), process=IM0 (Imports), duoarea=NUS (US)
+    # Route: petroleum/sum/sndw (Weekly Supply Estimates, from EIA API v2 metadata)
+    # Facets: series=WCRIMUS2 (direct series lookup)
     "WCRIMUS2": {
-        "route": "petroleum/move/wkly",
-        "facets": {"product": "EPC0", "process": "IM0", "duoarea": "NUS"},
+        "route": "petroleum/sum/sndw",
+        "facets": {"series": "WCRIMUS2"},
         "frequency": "weekly",
         "name": "Weekly U.S. Imports of Crude Oil",
         "units": "Thousand Barrels per Day",
@@ -75,11 +77,11 @@ _EIA_SERIES: dict[str, dict[str, Any]] = {
         "context": "Weekly US crude oil imports. Key for supply/demand balance analysis. Import volumes reflect domestic production gaps and refinery demand. Spikes may signal supply disruptions or seasonal refinery maintenance.",
     },
     # Weekly US crude oil exports (thousand barrels/day)
-    # Route: petroleum/move/wkly (Weekly Imports & Exports, from EIA OpenData docs)
-    # Facets: product=EPC0 (Crude Oil), process=EEX (Exports), duoarea=NUS (US)
+    # Route: petroleum/sum/sndw (Weekly Supply Estimates, from EIA API v2 metadata)
+    # Facets: series=WCREXUS2 (direct series lookup)
     "WCREXUS2": {
-        "route": "petroleum/move/wkly",
-        "facets": {"product": "EPC0", "process": "EEX", "duoarea": "NUS"},
+        "route": "petroleum/sum/sndw",
+        "facets": {"series": "WCREXUS2"},
         "frequency": "weekly",
         "name": "Weekly U.S. Exports of Crude Oil",
         "units": "Thousand Barrels per Day",

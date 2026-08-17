@@ -17,6 +17,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+# Use a recent date for test data to pass staleness filter (news_max_age_days=14)
+_TEST_EVENT_DATE = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
 from src.adapters.gdelt_adapter import (
     GdeltAdapter,
     _build_event_episode_body,
@@ -42,10 +45,11 @@ def make_event(
     actor2_name: str = "China",
     source_url: str = "https://reuters.com/article1",
     avg_tone: float | None = -4.2,
+    event_date: str | None = None,
 ) -> EventRecord:
     return EventRecord(
         event_id=event_id,
-        event_date="2025-07-22",
+        event_date=event_date or _TEST_EVENT_DATE,
         actor1_code="USA",
         actor1_name=actor1_name,
         actor2_code="CHN",
@@ -137,7 +141,7 @@ class TestBuildEventEpisodeBody:
     def test_body_shows_event_date(self):
         ev = make_event()
         body = _build_event_episode_body(ev, [])
-        assert "2025-07-22" in body
+        assert _TEST_EVENT_DATE in body
 
     def test_body_shows_tone(self):
         ev = make_event(avg_tone=-4.2)
@@ -304,7 +308,8 @@ class TestEventsTupleToDict:
         assert d["source_url"] == "https://reuters.com/article1"
         assert d["resolved_urls"] == urls
         assert d["_event_record"] is ev
-        assert d["valid_at"] == "20250722000000"
+        expected_valid_at = _TEST_EVENT_DATE.replace("-", "") + "000000"
+        assert d["valid_at"] == expected_valid_at
 
     def test_empty_resolved_urls(self):
         adapter = GdeltAdapter()
@@ -409,7 +414,7 @@ class TestEventsFirstPipeline:
         adapter = GdeltAdapter()
         gkg_record = {
             "global_event_id": "123",
-            "valid_at": "20250722000000",
+            "valid_at": _TEST_EVENT_DATE.replace("-", "") + "000000",
             "source_collection": "1",
             "domain": "reuters.com",
             "source_url": "https://reuters.com/article",

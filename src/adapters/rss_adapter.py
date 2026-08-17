@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import re
 import socket
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -60,12 +62,86 @@ def _build_episode_body(title: str, summary: str | None) -> str:
     return body
 
 
-def _extract_keywords(title: str) -> list[str]:
-    """Simple keyword extraction from title."""
-    import re
-    words = re.findall(r"[A-Za-z\u4e00-\u9fff]+", title)
-    # Return shorter words list as keywords
-    return words[:8]
+_STOP_WORDS = frozenset({
+    "the", "a", "an", "and", "or", "is", "are", "was", "were", "in", "on", "at", "for",
+    "to", "of", "with", "by", "from", "as", "it", "its", "this", "that", "not", "but",
+    "has", "have", "had", "be", "been", "being", "will", "can", "may", "could", "should",
+    "would", "do", "does", "did", "if", "than", "then", "so", "no", "up", "out", "about",
+    "into", "over", "after", "more", "most", "some", "any", "all", "each", "every", "new",
+    "also", "how", "why", "what", "when", "where", "which", "who", "whom", "their", "our",
+    "your", "his", "her", "we", "they", "you", "he", "she", "i", "me", "my", "us", "them",
+    "s", "t", "re", "ve", "ll", "d", "m",  # contractions
+})
+
+
+def _extract_keywords(title: str, body: str) -> list[str]:
+    """Extract meaningful keywords using TF-based scoring with stopword filtering."""
+    # Weight title 2x
+    text = f"{title} {title} {body}"
+    words = re.findall(r"[A-Za-z\u4e00-\u9fff]{3,}", text.lower())
+    words = [w for w in words if w not in _STOP_WORDS]
+
+    freq = Counter(words)
+    return [w for w, _ in freq.most_common(8)]
+
+
+def _extract_entities(title: str, body: str) -> list[dict]:
+    """Extract entities from RSS content using pattern matching."""
+    entities: list[dict] = []
+    text = f"{title} {body}"
+
+    # Stock tickers: $AAPL, $TSLA
+    tickers = re.findall(r'\$([A-Z]{2,5})\b', text)
+    for ticker in set(tickers):
+        entities.append({"type": "stock", "name": ticker, "ticker": ticker, "sector": None, "exchange": None})
+
+    # Countries/regions (curated list)
+    countries = [
+        "United States", "China", "European Union", "Japan", "Russia",
+        "India", "UK", "Germany", "France", "Brazil", "Canada",
+        "Australia", "South Korea",
+    ]
+    for country in countries:
+        if re.search(rf'\b{re.escape(country)}\b', text, re.IGNORECASE):
+            entities.append({"type": "country", "name": country, "ticker": None, "sector": None, "exchange": None})
+
+    # Commodities
+    commodities = {
+        r"\b(?:crude\s+)?oil\b": "Crude Oil",
+        r"\bgold\b": "Gold",
+        r"\bsilver\b": "Silver",
+        r"\bcopper\b": "Copper",
+        r"\bnatural\s+gas\b": "Natural Gas",
+        r"\bwheat\b": "Wheat",
+        r"\bcorn\b": "Corn",
+        r"\bsoybean\b": "Soybeans",
+    }
+    matched_commodities: set[str] = set()
+    for pattern, name in commodities.items():
+        if re.search(pattern, text, re.IGNORECASE) and name not in matched_commodities:
+            entities.append({"type": "commodity", "name": name, "ticker": None, "sector": None, "exchange": None})
+            matched_commodities.add(name)
+
+    # Themes (financial concepts)
+    themes = {
+        r"\binflation\b": "Inflation",
+        r"\binterest\s+rate\b": "Interest Rates",
+        r"\bGDP\b": "GDP Growth",
+        r"\bunemployment\b": "Unemployment",
+        r"\brecession\b": "Recession",
+        r"\btariff\b": "Tariffs",
+        r"\btrade\s+war\b": "Trade War",
+        r"\bsanction\b": "Sanctions",
+        r"\bIPO\b": "IPO",
+        r"\bmerger\b": "M&A",
+    }
+    matched_themes: set[str] = set()
+    for pattern, name in themes.items():
+        if re.search(pattern, text, re.IGNORECASE) and name not in matched_themes:
+            entities.append({"type": "theme", "name": name, "ticker": None, "sector": None, "exchange": None})
+            matched_themes.add(name)
+
+    return entities[:10]  # Cap at 10 entities
 
 
 # ── Content Relevance Filter ─────────────────────────────────────────
@@ -403,7 +479,7 @@ class RssAdapter(BaseAdapter):
 
         content_hash = hashlib.sha256(episode_body.encode("utf-8")).hexdigest()
         valid_at = valid_at_candidate
-        keywords = _extract_keywords(title)
+        keywords = _extract_keywords(title, episode_body)
 
         # Severity via rule-based enricher
         severity = rule_based_severity(episode_body)
@@ -425,6 +501,6 @@ class RssAdapter(BaseAdapter):
             content_hash=content_hash,
             severity=severity,
             keywords=keywords,
-            entities=[],
+            entities=_extract_entities(title, episode_body),
             metadata=metadata,
         )
