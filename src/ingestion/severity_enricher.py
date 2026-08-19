@@ -6,8 +6,8 @@ Graphiti EpisodicNode has no native severity property.
 Rule engine is preferred over LLM for Phase 1 (zero latency, zero API cost,
 predictable output). Phase 2 may replace with LLM-based classifier.
 
-Integration point: `IngestionScheduler._run_cycle()` in scheduler.py,
-called after pipeline completion and before briefing aggregation.
+Integration point: `IngestionScheduler._run_tier_cycle(1)` in scheduler.py,
+called after Tier 1 pipeline completion and before briefing aggregation.
 """
 
 from __future__ import annotations

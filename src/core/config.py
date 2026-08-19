@@ -10,7 +10,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from pydantic import Field, field_validator
+from pydantic import Field, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -116,7 +116,19 @@ class Settings(BaseSettings):
     # === 数据摄取 ===
     ingestion_interval_sec: int = Field(
         900,
-        description="数据源轮询间隔（秒）",
+        description="数据源轮询间隔（秒）。多 Tier 调度下为 Tier 1（实时/高频）间隔，默认 900 秒（15 分钟）",
+    )
+    ingestion_tier2_interval_sec: int = Field(
+        14400,
+        description="Tier 2（日频：CNInfo/Treasury/FRED）轮询间隔（秒），默认 14400 秒（4 小时）",
+    )
+    ingestion_tier3_interval_sec: int = Field(
+        43200,
+        description="Tier 3（周频：EIA/ACLED/Sanctions）轮询间隔（秒），默认 43200 秒（12 小时）",
+    )
+    ingestion_tier4_interval_sec: int = Field(
+        86400,
+        description="Tier 4（月/季频：BLS/ChinaMacro/EMResearch）轮询间隔（秒），默认 86400 秒（24 小时）",
     )
     
     # === GDELT ===
@@ -258,6 +270,19 @@ class Settings(BaseSettings):
         """Validate that min_cycle_gap_sec is not negative."""
         if v < 0:
             raise ValueError("min_cycle_gap_sec 必须 >= 0")
+        return v
+
+    @field_validator(
+        "ingestion_interval_sec",
+        "ingestion_tier2_interval_sec",
+        "ingestion_tier3_interval_sec",
+        "ingestion_tier4_interval_sec",
+    )
+    @classmethod
+    def validate_ingestion_intervals(cls, v: int, info: ValidationInfo) -> int:
+        """Validate that all ingestion cycle intervals are > 0."""
+        if v <= 0:
+            raise ValueError(f"{info.field_name} 必须 > 0")
         return v
 
     @field_validator("bailian_api_key")

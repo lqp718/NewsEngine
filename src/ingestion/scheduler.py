@@ -1,7 +1,9 @@
 """IngestionScheduler — multi-source ingestion scheduler.
 
-Orchestrates two pipelines (macro pipeline: GDELT & RSS, stock pipeline:
-AkShare) every 15 minutes, followed by SectorBriefingAggregator.aggregate_all().
+Orchestrates all data source adapters inside 4 independent tier loops
+(multi-tier-cycle): Tier 1 real-time sources run every 15 minutes, low-
+frequency tiers (daily/weekly/monthly) run on their own longer intervals.
+Tier 1 is followed by SectorBriefingAggregator.aggregate_all().
 
 V2.2: Macro/stock pipeline split:
 - Macro pipeline (GDELT): uses 19 core theme OR matching, not ticker whitelist
@@ -11,8 +13,8 @@ V2.2: Macro/stock pipeline split:
 
 Lifecycle:
     scheduler = IngestionScheduler(...)
-    await scheduler.start()   # starts the cycle loop
-    await scheduler.stop()    # graceful shutdown (waits for current cycle)
+    await scheduler.start()   # starts all tier loops
+    await scheduler.stop()    # graceful shutdown (cancels all tier loops)
 """
 
 from __future__ import annotations
@@ -47,6 +49,40 @@ _DEFAULT_RSS_FEEDS: list[str] = [
     "https://feeds.content.dowjones.io/public/rss/mw_topstories",
     "https://www.ft.com/content?format=rss",
 ]
+
+
+# ── Multi-tier scheduling (multi-tier-cycle) ──────────────────────────
+# Static adapter → tier mapping. Every adapter belongs to exactly one
+# tier; each tier runs on its own configurable cycle interval (see
+# config.py). Tier 1 keeps the legacy `ingestion_interval_sec` semantics.
+TIER_MAP: dict[int, tuple[str, ...]] = {
+    1: ("gdelt", "rss", "cls", "eastmoney", "akshare"),
+    2: ("cninfo", "treasury", "fred"),
+    3: ("eia", "acled", "sanctions"),
+    4: ("bls", "china_macro", "eastmoney_research"),
+}
+
+# Unit name -> (scheduler adapter attr, writer attr).
+# The CLS→EastMoney→AkShare fallback chain is handled as a composite
+# unit ("stock") and therefore not listed here.
+_ADAPTER_ATTRS: dict[str, tuple[str, str]] = {
+    "gdelt": ("_gdelt_adapter", "_macro_writer"),
+    "rss": ("_rss_adapter", "_macro_writer"),
+    "fred": ("_fred_adapter", "_macro_writer"),
+    "sanctions": ("_sanctions_adapter", "_macro_writer"),
+    "acled": ("_acled_adapter", "_macro_writer"),
+    "eia": ("_eia_adapter", "_macro_writer"),
+    "bls": ("_bls_adapter", "_macro_writer"),
+    "treasury": ("_treasury_adapter", "_macro_writer"),
+    "china_macro": ("_china_macro_adapter", "_macro_writer"),
+    "cninfo": ("_cninfo_adapter", "_symbol_writer"),
+    "eastmoney_research": ("_eastmoney_research_adapter", "_symbol_writer"),
+}
+
+# Units that need the ticker whitelist before running (stock family).
+_TICKER_AWARE_SOURCES: frozenset[str] = frozenset(
+    {"cls", "eastmoney", "akshare", "cninfo", "eastmoney_research"}
+)
 
 
 def get_ticker_whitelist(cache_path: str) -> list[dict[str, str]]:
@@ -114,8 +150,18 @@ def _extract_sector_names(tickers: list[dict[str, str]]) -> list[str]:
 class IngestionScheduler:
     """Multi-source ingestion scheduler.
 
-    Runs two pipelines (macro & stock) concurrently every ``interval_sec``
-    seconds, then calls SectorBriefingAggregator.
+    Runs every adapter inside 4 independent tier loops (one asyncio task
+    per tier), each on its own configurable interval:
+      - Tier 1 (real-time/high-frequency, default 15 min): GDELT, RSS,
+        CLS→EastMoney→AkShare fallback chain
+      - Tier 2 (daily, default 4 h): CNInfo, Treasury, FRED
+      - Tier 3 (weekly, default 12 h): EIA, ACLED, Sanctions
+      - Tier 4 (monthly/quarterly, default 24 h): BLS, China Macro,
+        EastMoney Research
+
+    Tier 1 also hosts TTL cleanup (daily guard), severity enrichment
+    and briefing aggregation after each cycle. Long-cycle tiers never
+    block short-cycle tiers: each tier gets its own task.
 
     V2.2:
     - Macro pipeline: GDELT (theme filter) + RSS (zero filter)
@@ -203,9 +249,11 @@ class IngestionScheduler:
         # ── Lazy-init guard ───────────────────────────────────────
         self._components_initialized: bool = False
 
-        # ── Lifecycle state ───────────────────────────────────────
+        # ── Lifecycle state (multi-tier: one task per tier) ────────
         self._running = False
-        self._task: asyncio.Task[None] | None = None
+        self._tasks: dict[int, asyncio.Task[None]] = {}
+        self._stop_event: asyncio.Event | None = None
+        self._tier_groups: dict[int, list[tuple[str, Any, Any]]] = {}
 
         logger.info(
             "IngestionScheduler initialized (interval=%ds, whitelist=%s, dry_run=%s, source_filter=%s)",
@@ -218,9 +266,10 @@ class IngestionScheduler:
     # ── Lifecycle ─────────────────────────────────────────────────────
 
     async def start(self) -> None:
-        """Start the ingestion cycle loop.
+        """Start the tiered ingestion cycle loops.
 
-        The first cycle runs immediately (no initial 15-minute wait).
+        One independent asyncio task is created per non-empty tier;
+        each tier's first cycle runs immediately (no initial wait).
         """
         if self._running:
             logger.warning("IngestionScheduler already running")
@@ -228,24 +277,41 @@ class IngestionScheduler:
 
         self._running = True
         self._lazy_init_components()
-        self._task = asyncio.create_task(self._cycle_loop())
-        logger.info("IngestionScheduler started")
+
+        self._stop_event = asyncio.Event()
+        self._tier_groups = self._build_tier_groups()
+        self._tasks = {
+            tier: asyncio.create_task(self._tier_loop(tier))
+            for tier in sorted(self._tier_groups)
+        }
+
+        topology = ", ".join(
+            "tier%d=[%s]@%ds"
+            % (
+                tier,
+                ",".join(name for name, _, _ in units),
+                self._tier_interval(tier),
+            )
+            for tier, units in self._tier_groups.items()
+        )
+        logger.info("IngestionScheduler started: %s", topology)
 
     async def stop(self) -> None:
         """Graceful shutdown.
 
-        Cancels the next scheduled cycle and waits for the current
-        cycle to complete if one is in progress.
+        Cancels all tier loop tasks and waits for them to finish — no
+        leftover scheduled coroutines.
         """
         self._running = False
+        if self._stop_event is not None:
+            self._stop_event.set()
 
-        if self._task is not None:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-            self._task = None
+        tasks = list(self._tasks.values())
+        self._tasks.clear()
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
         logger.info("IngestionScheduler stopped")
 
@@ -559,77 +625,249 @@ class IngestionScheduler:
             "yes" if self._china_macro_adapter else "no",
         )
 
-    # ── Internal: cycle loop ──────────────────────────────────────────
+    # ── Internal: tiered cycle loops (multi-tier-cycle) ──────────────────
 
-    async def _cycle_loop(self) -> None:
-        """Main cycle loop. Runs until ``self._running`` is False."""
+    async def _tier_loop(self, tier: int) -> None:
+        """Independent cycle loop for one tier.
+
+        Runs the tier's adapters every ``_tier_interval(tier)`` seconds.
+        Each tier runs in its own asyncio task, so a long-cycle tier
+        never blocks a short-cycle tier. Unexpected errors inside the
+        loop body are logged as critical and the loop continues to the
+        next cycle (crash self-healing).
+        """
+        interval = self._tier_interval(tier)
+        adapter_names = [name for name, _, _ in self._tier_groups.get(tier, [])]
+        logger.info(
+            "Tier %d loop started (interval=%ds, adapters=%s)",
+            tier,
+            interval,
+            ",".join(adapter_names),
+        )
+
         while self._running:
             cycle_start = time.monotonic()
-            logger.info("=== Ingestion cycle starting ===")
+            logger.info(
+                "=== Tier %d cycle starting (interval=%ds, adapters=%s) ===",
+                tier,
+                interval,
+                ",".join(adapter_names),
+            )
 
             try:
-                # V2.2: TTL cleanup at start of each cycle
-                await self._ttl_cleanup()
+                if tier == 1:
+                    # V2.2: TTL cleanup at start of each cycle (daily guard inside)
+                    await self._ttl_cleanup()
 
-                results = await self._run_cycle()
-                await self._log_cycle_summary(results, cycle_start)
+                results = await self._run_tier_cycle(tier)
+                await self._log_cycle_summary(tier, results, cycle_start)
             except asyncio.CancelledError:
-                logger.info("Ingestion cycle cancelled")
+                logger.info("Tier %d cycle cancelled", tier)
                 raise
             except Exception as exc:
                 logger.critical(
-                    "Ingestion cycle crashed: %s",
+                    "Tier %d cycle crashed: %s",
+                    tier,
                     exc,
                     exc_info=True,
                 )
 
-            # Sleep until next cycle (check running flag every second)
+            # Sleep until next cycle (wakes early on stop())
             elapsed = time.monotonic() - cycle_start
-            remaining = max(float(self._min_cycle_gap_sec), self._interval_sec - elapsed)
+            remaining = max(float(self._min_cycle_gap_sec), interval - elapsed)
             logger.info(
-                "=== Ingestion cycle complete (%.1fs, guard=%.1fs, next in %.1fs) ===",
+                "=== Tier %d cycle complete (%.1fs, guard=%.1fs, next in %.1fs) ===",
+                tier,
                 elapsed,
                 self._min_cycle_gap_sec,
                 remaining,
             )
+            await self._sleep_cancel_aware(remaining)
 
-            # Graceful cancel-aware sleep
-            for _ in range(int(remaining)):
-                if not self._running:
-                    break
-                await asyncio.sleep(1)
+    async def _sleep_cancel_aware(self, seconds: float) -> None:
+        """Sleep for ``seconds``, waking up early when ``stop()`` is called."""
+        event = self._stop_event
+        if event is None:
+            await asyncio.sleep(seconds)
+            return
+        try:
+            await asyncio.wait_for(event.wait(), timeout=seconds)
+        except asyncio.TimeoutError:
+            pass
 
-    async def _run_cycle(self) -> list[PipelineResult]:
-        """Execute one full ingestion cycle.
+    def _tier_interval(self, tier: int) -> int:
+        """Return the configured cycle interval (seconds) for a tier."""
+        settings = get_settings()
+        if tier == 1:
+            return self._interval_sec
+        if tier == 2:
+            return settings.ingestion_tier2_interval_sec
+        if tier == 3:
+            return settings.ingestion_tier3_interval_sec
+        if tier == 4:
+            return settings.ingestion_tier4_interval_sec
+        raise ValueError(f"Unknown tier: {tier}")
 
-        1. Read ticker whitelist (only for AkShare stock pipeline)
-        2. Run pipelines concurrently with error isolation
-        3. Call SectorBriefingAggregator
+    def _adapters_for_tier(
+        self, tier: int
+    ) -> list[tuple[str, Any, Any]]:
+        """Resolve initialized adapter instances belonging to a tier.
+
+        Returns a list of ``(unit_name, adapter, writer)`` tuples; units
+        whose adapter instance is None (filtered out / not initialized)
+        are skipped. The CLS→EastMoney→AkShare fallback chain is exposed
+        as a single composite unit named ``"stock"`` when at least one of
+        the three stock adapters is initialized.
         """
-        # ── Step 1: Read ticker whitelist — only for AkShare ────
-        tickers = get_ticker_whitelist(self._whitelist_path)
-        sector_names = _extract_sector_names(tickers)
-        logger.info(
-            "Cycle: %d tickers, %d sectors",
-            len(tickers),
-            len(sector_names),
+        units: list[tuple[str, Any, Any]] = []
+        for name in TIER_MAP.get(tier, ()):
+            if name in ("cls", "eastmoney", "akshare"):
+                if name == "cls" and any(
+                    getattr(self, attr) is not None
+                    for attr in ("_cls_adapter", "_eastmoney_adapter", "_akshare_adapter")
+                ):
+                    units.append(("stock", None, self._symbol_writer))
+                continue
+
+            attr, writer_attr = _ADAPTER_ATTRS[name]
+            adapter = getattr(self, attr)
+            if adapter is not None:
+                units.append((name, adapter, getattr(self, writer_attr)))
+        return units
+
+    def _build_tier_groups(self) -> dict[int, list[tuple[str, Any, Any]]]:
+        """Group initialized adapters by tier.
+
+        Returns:
+            Mapping of tier → list of ``(unit_name, adapter, writer)``
+            tuples, containing only tiers with at least one initialized
+            adapter (empty tiers get no loop).
+        """
+        groups: dict[int, list[tuple[str, Any, Any]]] = {}
+        for tier in sorted(TIER_MAP):
+            units = self._adapters_for_tier(tier)
+            if units:
+                groups[tier] = units
+        return groups
+
+    async def _run_tier_cycle(self, tier: int) -> list[PipelineResult]:
+        """Execute one cycle for a single tier's adapters.
+
+        Tier-internal adapters run concurrently with error isolation
+        (one failing adapter does not affect its tier-mates, and the
+        tier cycle itself never raises). Ticker whitelist IO happens
+        only for tiers containing stock-family adapters (Tier 1 stock
+        chain, CNInfo, EastMoney Research).
+
+        Tier 1 additionally runs severity enrichment and briefing
+        aggregation at the tail (equivalent of the legacy per-cycle
+        aggregation point).
+        """
+        units = self._tier_groups.get(tier, [])
+        if not units:
+            logger.warning("Tier %d: no adapters to run", tier)
+            return []
+
+        # ── Step 1: ticker whitelist — only for stock-family tiers ──
+        # Tier 1 exposes the CLS→EastMoney→AkShare chain as the composite
+        # unit "stock", which is ticker-aware too (design §1.4).
+        tickers: list[dict[str, str]] = []
+        sector_names: list[str] = []
+        if any(
+            name == "stock" or name in _TICKER_AWARE_SOURCES
+            for name, _, _ in units
+        ):
+            tickers = get_ticker_whitelist(self._whitelist_path)
+            sector_names = _extract_sector_names(tickers)
+            self._update_adapter_tickers(tickers)
+            logger.info(
+                "Tier %d: %d tickers, %d sectors",
+                tier,
+                len(tickers),
+                len(sector_names),
+            )
+
+        # ── Step 2: run tier's units concurrently (error-isolated) ──
+        named_coros: list[tuple[str, Any]] = []
+        for name, adapter, writer in units:
+            if name == "stock":
+                named_coros.append(("stock", self._stock_pipeline(tickers)))
+            else:
+                named_coros.append(
+                    (name, self._run_adapter_pipeline(adapter, writer, tickers))
+                )
+
+        completed = await asyncio.gather(
+            *[coro for _, coro in named_coros],
+            return_exceptions=True,
         )
 
-        # Update adapter ticker whitelists — only AkShare needs tickers
-        self._update_adapter_tickers(tickers)
-
-        # ── Step 2: Run pipelines concurrently ───────────────────
-        # Macro pipelines (GDELT, RSS) use MACRO_ENTITY_TYPES
-        # Stock pipeline (AkShare) uses SYMBOL_ENTITY_TYPES
         pipeline_results: list[PipelineResult] = []
+        for (name, _), result in zip(named_coros, completed):
+            if result is None:
+                continue
+            if isinstance(result, Exception):
+                logger.error(
+                    "Adapter pipeline [%s] threw unhandled exception: %s",
+                    name,
+                    result,
+                    exc_info=True,
+                )
+                pipeline_results.append(
+                    PipelineResult(
+                        source_type=name,
+                        success=False,
+                        error=result,
+                    )
+                )
+            else:
+                pipeline_results.append(result)
 
-        # ── Step 2a: Macro pipelines run concurrently ──────────────
-        async def _stock_pipeline() -> PipelineResult:
-            """Stock pipeline: CLS (primary) → EastMoney (fallback) → AkShare (fallback).
-            
-            V6.1: CLS telegraph replaces EastMoney as primary stock news source.
-            """
-            # V6.1: CLS telegraph as primary
+        # ── Step 3 (Tier 1 only): severity enrichment + briefing ──
+        if tier == 1:
+            try:
+                from .severity_enricher import enrich_severity_batch
+
+                enriched = await enrich_severity_batch(self._neo4j_driver)
+                if enriched:
+                    logger.info(
+                        "Severity enrichment: classified %d Episodic nodes",
+                        enriched,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Severity enrichment failed (non-critical): %s",
+                    exc,
+                    exc_info=True,
+                )
+
+            if sector_names and self._aggregator:
+                try:
+                    briefing_results = await self._aggregator.aggregate_all(sector_names)
+                    briefing_count = sum(
+                        1 for v in briefing_results.values() if v is not None
+                    )
+                    logger.info(
+                        "Briefing aggregation: %d/%d sectors updated",
+                        briefing_count,
+                        len(sector_names),
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "Briefing aggregation failed: %s",
+                        exc,
+                        exc_info=True,
+                    )
+
+        return pipeline_results
+
+    async def _stock_pipeline(self, tickers: list[dict[str, str]]) -> PipelineResult:
+        """Stock pipeline: CLS (primary) → EastMoney (fallback) → AkShare (fallback).
+
+        V6.1: CLS telegraph replaces EastMoney as primary stock news source.
+        Only initialized adapters participate; each step guards None.
+        """
+        if self._cls_adapter is not None:
             cls_result = await self._run_adapter_pipeline(
                 self._cls_adapter, self._symbol_writer, tickers
             )
@@ -639,11 +877,9 @@ class IngestionScheduler:
                     cls_result.episode_count,
                 )
                 return cls_result
+            logger.info("CLS returned 0 episodes, falling back to EastMoney")
 
-            # V6.1: EastMoney as fallback
-            logger.info(
-                "CLS returned 0 episodes, falling back to EastMoney"
-            )
+        if self._eastmoney_adapter is not None:
             em_result = await self._run_adapter_pipeline(
                 self._eastmoney_adapter, self._symbol_writer, tickers
             )
@@ -653,122 +889,18 @@ class IngestionScheduler:
                     em_result.episode_count,
                 )
                 return em_result
+            logger.info("EastMoney returned 0 episodes, falling back to AkShare")
 
-            # Fallback to AkShare
-            logger.info(
-                "EastMoney returned 0 episodes, falling back to AkShare"
-            )
+        if self._akshare_adapter is not None:
             return await self._run_adapter_pipeline(
                 self._akshare_adapter, self._symbol_writer, tickers
             )
-        
-        # V6.2/V6.3: CNInfo and EastMoney Research run in parallel with stock pipeline
-        async def _cninfo_pipeline() -> PipelineResult | None:
-            """CNInfo announcements pipeline (Phase 2)."""
-            if self._cninfo_adapter is None:
-                return None
-            return await self._run_adapter_pipeline(
-                self._cninfo_adapter, self._symbol_writer, tickers
-            )
-        
-        async def _eastmoney_research_pipeline() -> PipelineResult | None:
-            """EastMoney research reports pipeline (Phase 3)."""
-            if self._eastmoney_research_adapter is None:
-                return None
-            return await self._run_adapter_pipeline(
-                self._eastmoney_research_adapter, self._symbol_writer, tickers
-            )
 
-        macro_coros = [
-            self._run_adapter_pipeline(self._gdelt_adapter, self._macro_writer, tickers),
-            self._run_adapter_pipeline(self._rss_adapter, self._macro_writer, tickers),
-            # ── Phase 1 macro adapters (add-phase1-macro-adapters) ──
-            self._run_adapter_pipeline(self._fred_adapter, self._macro_writer, tickers),
-            self._run_adapter_pipeline(self._sanctions_adapter, self._macro_writer, tickers),
-            self._run_adapter_pipeline(self._acled_adapter, self._macro_writer, tickers),
-            self._run_adapter_pipeline(self._eia_adapter, self._macro_writer, tickers),
-            self._run_adapter_pipeline(self._bls_adapter, self._macro_writer, tickers),
-            self._run_adapter_pipeline(self._treasury_adapter, self._macro_writer, tickers),
-            self._run_adapter_pipeline(self._china_macro_adapter, self._macro_writer, tickers),
-        ]
-
-        # Run macro pipelines + stock pipeline + CNInfo + EastMoney Research concurrently
-        all_coros = [*macro_coros, _stock_pipeline(), _cninfo_pipeline(), _eastmoney_research_pipeline()]
-
-        completed = await asyncio.gather(*all_coros, return_exceptions=True)
-
-        source_names = [
-            "gdelt_csv",
-            "rss",
-            "fred",
-            "sanctions",
-            "acled",
-            "eia",
-            "bls",
-            "treasury",
-            "china_macro",
-            "stock",
-            "cninfo",
-            "eastmoney_research",
-        ]
-        for i, result in enumerate(completed):
-            # Skip None results (adapter not initialized)
-            if result is None:
-                continue
-            if isinstance(result, Exception):
-                logger.error(
-                    "Adapter pipeline [%s] threw unhandled exception: %s",
-                    source_names[i] if i < len(source_names) else f"adapter_{i}",
-                    result,
-                    exc_info=True,
-                )
-                pipeline_results.append(
-                    PipelineResult(
-                        source_type=source_names[i] if i < len(source_names) else f"adapter_{i}",
-                        success=False,
-                        error=result,
-                    )
-                )
-            else:
-                pipeline_results.append(result)
-
-        # ── Step 3: Severity enrichment (L-4 rule engine) ────────
-        try:
-            from .severity_enricher import enrich_severity_batch
-
-            enriched = await enrich_severity_batch(self._neo4j_driver)
-            if enriched:
-                logger.info(
-                    "Severity enrichment: classified %d Episodic nodes",
-                    enriched,
-                )
-        except Exception as exc:
-            logger.warning(
-                "Severity enrichment failed (non-critical): %s",
-                exc,
-                exc_info=True,
-            )
-
-        # ── Step 4: Briefing aggregation ─────────────────────────
-        if sector_names and self._aggregator:
-            try:
-                briefing_results = await self._aggregator.aggregate_all(sector_names)
-                briefing_count = sum(
-                    1 for v in briefing_results.values() if v is not None
-                )
-                logger.info(
-                    "Briefing aggregation: %d/%d sectors updated",
-                    briefing_count,
-                    len(sector_names),
-                )
-            except Exception as exc:
-                logger.error(
-                    "Briefing aggregation failed: %s",
-                    exc,
-                    exc_info=True,
-                )
-
-        return pipeline_results
+        return PipelineResult(
+            source_type="stock",
+            success=False,
+            error=RuntimeError("no stock adapter initialized"),
+        )
 
     async def _run_adapter_pipeline(
         self,
@@ -1115,10 +1247,14 @@ class IngestionScheduler:
 
     async def _log_cycle_summary(
         self,
+        tier: int,
         results: list[PipelineResult],
         cycle_start: float,
     ) -> None:
-        """Log a summary of the cycle's results."""
+        """Log a summary of one tier's cycle results."""
+        if not results:
+            logger.warning("Tier %d cycle: no adapter results", tier)
+            return
         total_time = time.monotonic() - cycle_start
         total_episodes = sum(r.episode_count for r in results)
         source_stats = ", ".join(
@@ -1129,7 +1265,8 @@ class IngestionScheduler:
         all_failed = all(not r.success for r in results)
         if all_failed:
             logger.critical(
-                "Cycle: ALL sources failed [%.1fs] %s",
+                "Tier %d cycle: ALL sources failed [%.1fs] %s",
+                tier,
                 total_time,
                 source_stats,
             )
@@ -1137,7 +1274,8 @@ class IngestionScheduler:
             failed = [r.source_type for r in results if not r.success]
             if failed:
                 logger.warning(
-                    "Cycle: partial failures [%.1fs] total=%dep, failed=[%s] %s",
+                    "Tier %d cycle: partial failures [%.1fs] total=%dep, failed=[%s] %s",
+                    tier,
                     total_time,
                     total_episodes,
                     ", ".join(failed),
@@ -1145,7 +1283,8 @@ class IngestionScheduler:
                 )
             else:
                 logger.info(
-                    "Cycle: all sources OK [%.1fs] total=%dep %s",
+                    "Tier %d cycle: all sources OK [%.1fs] total=%dep %s",
+                    tier,
                     total_time,
                     total_episodes,
                     source_stats,
