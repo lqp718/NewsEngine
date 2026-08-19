@@ -496,12 +496,16 @@ class ChinaMacroAdapter(BaseAdapter):
             EntityItem(type="country", name="China"),
         ]
 
+        # Use unique source_url per indicator/date to avoid dedup collision
+        # (all China macro data comes from AKShare but each indicator is distinct)
+        unique_url = f"https://akshare.akfamily.xyz/china_macro/{indicator}/{date_str}"
+
         return NormalizedEpisode(
             episode_body=episode_body,
             name=name,
             source_description=f"China {display_name}",
             source_type="china_macro",
-            source_url="https://akshare.akfamily.xyz/",
+            source_url=unique_url,
             valid_at=fetch_time,
             content_hash=content_hash,
             severity=severity,
