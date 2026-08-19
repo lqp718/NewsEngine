@@ -54,6 +54,9 @@ def translate_program(code: str) -> str:
 
     Returns:
         Human-readable description, or the original code if unknown.
+        For compound codes (e.g. ``"IRAN-EO13902"``), falls back to
+        prefix matching: if the prefix before ``-`` is in the codebook,
+        returns ``"{prefix_translation} ({full_code})"``.
 
     Examples::
 
@@ -61,10 +64,21 @@ def translate_program(code: str) -> str:
         'Specially Designated Global Terrorist'
         >>> translate_program("UKR")
         'Ukraine-Related Sanctions'
+        >>> translate_program("IRAN-EO13902")
+        'Iran Sanctions (IRAN-EO13902)'
         >>> translate_program("UNKNOWN_CODE")
         'UNKNOWN_CODE'
     """
     if not code:
         return code
     codebook = _load_codebook()
-    return codebook.get(code, code)
+    # 1. Exact match
+    if code in codebook:
+        return codebook[code]
+    # 2. Prefix fallback for compound codes (e.g. "IRAN-EO13902" → "IRAN")
+    if "-" in code:
+        prefix = code.split("-", 1)[0]
+        if prefix in codebook:
+            return f"{codebook[prefix]} ({code})"
+    # 3. No match — return original code
+    return code

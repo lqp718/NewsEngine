@@ -46,6 +46,8 @@ _OPEN_SANCTIONS_SEARCH_URL = "https://api.opensanctions.org/search/default"
 # OFAC SDN CSV moved to sanctionslistservice.ofac.treas.gov (2026-08).
 # The old treasury.gov URL 302-redirects here; use the canonical endpoint.
 _OFAC_SDN_CSV_URL = "https://sanctionslistservice.ofac.treas.gov/api/publicationpreview/exports/sdn.csv"
+# OFAC ADD.CSV (address table) — used to extract country info for SDN entries.
+_OFAC_ADD_CSV_URL = "https://sanctionslistservice.ofac.treas.gov/api/publicationpreview/exports/add.csv"
 
 # OFAC SDN CSV is sorted by entry number ascending; higher numbers are
 # more recently added entries. Cap the per-cycle records to bound the
@@ -106,11 +108,23 @@ def _build_sanctions_body(
     if country:
         lines.append(f"- Country: {country}")
     if sanction_program:
-        program_desc = translate_program(sanction_program)
-        if program_desc != sanction_program:
-            lines.append(f"- Sanction program: {sanction_program} — {program_desc}")
-        else:
-            lines.append(f"- Sanction program: {sanction_program}")
+        programs = _split_programs(sanction_program)
+        if len(programs) > 1:
+            translated_parts = []
+            for prog in programs:
+                desc = translate_program(prog)
+                if desc != prog:
+                    translated_parts.append(f"{prog} — {desc}")
+                else:
+                    translated_parts.append(prog)
+            lines.append(f"- Sanction program: {'; '.join(translated_parts)}")
+        elif len(programs) == 1:
+            prog = programs[0]
+            program_desc = translate_program(prog)
+            if program_desc != prog:
+                lines.append(f"- Sanction program: {prog} — {program_desc}")
+            else:
+                lines.append(f"- Sanction program: {prog}")
     if listing_date:
         lines.append(f"- Listing date: {listing_date}")
     lines.append(f"- Source: {source}")
@@ -129,6 +143,46 @@ def _parse_iso_date(date_str: str | None) -> datetime | None:
     except ValueError:
         logger.debug("Sanctions: unparseable date: %s", date_str)
         return None
+
+
+def _split_programs(raw: str) -> list[str]:
+    """Split an OFAC program field that may contain multiple programs.
+
+    OFAC SDN CSV uses ``'] ['`` as separator (e.g. ``'SDGT] [IFSR'``).
+    Returns a list of cleaned program codes.
+    """
+    if not raw:
+        return []
+    parts = raw.split("] [")
+    result: list[str] = []
+    for p in parts:
+        cleaned = p.strip().strip("[]").strip()
+        if cleaned and cleaned != "-0-":
+            result.append(cleaned)
+    return result
+
+
+def _parse_add_csv(text: str) -> dict[str, str]:
+    """Parse OFAC ADD.CSV and build ent_num → country mapping.
+
+    ADD.CSV format (no header, 12 columns):
+    - Column 0: ent_num (links to SDN.CSV ent_num)
+    - Column 4: country
+    Skip rows with missing/placeholder country (``'-0-'`` or empty).
+    First non-empty country wins for each ent_num.
+    """
+    mapping: dict[str, str] = {}
+    reader = csv.reader(io.StringIO(text))
+    for row in reader:
+        if len(row) < 5:
+            continue
+        ent_num = row[0].strip()
+        country = row[4].strip()
+        if not ent_num or not country or country == "-0-":
+            continue
+        if ent_num not in mapping:  # First non-empty country wins
+            mapping[ent_num] = country
+    return mapping
 
 
 # ── Adapter ────────────────────────────────────────────────────────────
@@ -282,6 +336,23 @@ class SanctionsAdapter(BaseAdapter):
             resp.raise_for_status()
             text = resp.text
 
+            # Fetch ADD.CSV for country info (fail-open)
+            country_map: dict[str, str] = {}
+            try:
+                add_resp = await client.get(_OFAC_ADD_CSV_URL)
+                add_resp.raise_for_status()
+                country_map = _parse_add_csv(add_resp.text)
+                if country_map:
+                    logger.info(
+                        "Sanctions: loaded %d country mappings from ADD.CSV",
+                        len(country_map),
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Sanctions: ADD.CSV fetch failed (%s), country info unavailable",
+                    exc,
+                )
+
         reader = csv.reader(io.StringIO(text))
         rows = [row for row in reader if row and row[0].strip().isdigit()]
         recent_rows = rows[-_OFAC_TAIL_SCAN:] if len(rows) > _OFAC_TAIL_SCAN else rows
@@ -305,7 +376,7 @@ class SanctionsAdapter(BaseAdapter):
                     {
                         "entity_name": name,
                         "target_type": _map_ofac_type(raw_type),
-                        "country": "",
+                        "country": country_map.get(ent_num, ""),
                         "sanction_program": program,
                         "listing_date": None,
                         "source_url": (
@@ -425,7 +496,10 @@ __all__ = [
     "_map_ofac_type",
     "_map_sanctions_severity",
     "_build_sanctions_body",
+    "_split_programs",
+    "_parse_add_csv",
     "_OFAC_SDN_CSV_URL",
+    "_OFAC_ADD_CSV_URL",
     "_OPEN_SANCTIONS_SEARCH_URL",
     "_OFAC_MAX_RECORDS",
 ]
