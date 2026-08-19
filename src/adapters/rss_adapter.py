@@ -148,7 +148,7 @@ def _extract_entities(title: str, body: str) -> list[dict]:
 
 # Keywords that indicate trading/market relevance (case-insensitive)
 RSS_RELEVANCE_KEYWORDS = [
-    # English
+    # ── English (original) ──
     "fed", "ecb", "rate", "inflation", "gdp", "oil", "gold", "copper",
     "tariff", "trade", "market", "stock", "bond", "forex", "currency",
     "central bank", "monetary policy", "interest rate", "treasury",
@@ -156,7 +156,26 @@ RSS_RELEVANCE_KEYWORDS = [
     "geopolitical", "sanction", "embargo", "war", "conflict",
     "earnings", "revenue", "profit", "loss", "ipo", "merger", "acquisition",
     "recession", "growth", "employment", "unemployment", "cpi", "ppi",
-    # Chinese
+    # ── 地缘热点 ──
+    "gaza", "israel", "ukraine", "taiwan", "south china sea", "red sea",
+    "iran", "russia", "nato", "summit",
+    # ── 宏观/政策 ──
+    "fiscal", "deficit", "debt", "budget", "stimulus",
+    "quantitative easing", "austerity",
+    # ── 供应链/产业 ──
+    "supply chain", "semiconductor", "chip", "shipping", "logistics",
+    "rare earth",
+    # ── 商业/公司 ──
+    "ceo", "layoff", "restructuring", "bankruptcy", "dividend", "buyback",
+    # ── 风险事件 ──
+    "crisis", "default", "contagion", "volatility", "correction",
+    # ── 能源转型 ──
+    "renewable", "solar", "ev", "battery", "lithium", "carbon",
+    # ── 综合商业 ──
+    "business", "economy", "industry", "company", "corporate",
+    "investment", "bank", "finance", "export", "import", "manufacturing",
+    "technology", "energy", "infrastructure",
+    # ── Chinese ──
     "央行", "利率", "通胀", "关税", "贸易", "股市", "债券", "汇率",
     "原油", "黄金", "白银", "铜", "天然气", "大宗商品",
     "地缘政治", "制裁", "禁运", "战争", "冲突",
@@ -165,11 +184,7 @@ RSS_RELEVANCE_KEYWORDS = [
 ]
 
 # Domains to exclude (too general, not trading-focused)
-RSS_BLACKLIST_DOMAINS = [
-    "bbc.com",
-    "bbc.co.uk",
-    "bbci.co.uk",  # BBC RSS feeds subdomain
-]
+RSS_BLACKLIST_DOMAINS = []  # 不再按域名封杀，信任 enabled 源
 
 
 def _is_trading_relevant(title: str, summary: str | None, feed_url: str) -> bool:
