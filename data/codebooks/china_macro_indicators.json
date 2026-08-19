@@ -1,0 +1,34 @@
+{
+  "indicators": {
+    "gdp": {
+      "name": "GDP（国内生产总值）",
+      "unit": "亿元",
+      "frequency": "季度",
+      "description": "衡量中国经济总体规模的核心指标"
+    },
+    "cpi": {
+      "name": "CPI（居民消费价格指数）",
+      "unit": "%",
+      "frequency": "月度",
+      "description": "衡量通胀水平的核心指标"
+    },
+    "ppi": {
+      "name": "PPI（工业生产者出厂价格指数）",
+      "unit": "%",
+      "frequency": "月度",
+      "description": "衡量工业品价格变化，反映上游成本压力"
+    },
+    "pmi": {
+      "name": "PMI（官方制造业采购经理指数）",
+      "unit": "",
+      "frequency": "月度",
+      "description": "50以上为扩张区间，以下为收缩区间"
+    },
+    "caixin_pmi": {
+      "name": "PMI（财新制造业采购经理指数）",
+      "unit": "",
+      "frequency": "月度",
+      "description": "偏向中小企业，与官方PMI互为补充"
+    }
+  }
+}

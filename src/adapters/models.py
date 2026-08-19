@@ -30,6 +30,7 @@ SourceType = Literal[
     "acled",
     "eia",
     "bls",
+    "china_macro",
 ]
 Severity = Literal["low", "medium", "high", "critical"]
 

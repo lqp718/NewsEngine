@@ -524,6 +524,7 @@ if __name__ == "__main__":
             "eia",
             "bls",
             "treasury",
+            "china_macro",
             "all",
         ],
         default="all",

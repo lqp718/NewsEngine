@@ -192,6 +192,7 @@ class IngestionScheduler:
         self._eia_adapter: Any = None
         self._bls_adapter: Any = None
         self._treasury_adapter: Any = None
+        self._china_macro_adapter: Any = None
 
         # ── Briefing Aggregator ───────────────────────────────────
         self._aggregator = SectorBriefingAggregator() if not dry_run else None
@@ -312,7 +313,7 @@ class IngestionScheduler:
 
         Returns:
             Set of source names ("gdelt", "rss", "stock", "fred",
-            "sanctions", "acled", "eia", "bls", "treasury").
+            "sanctions", "acled", "eia", "bls", "treasury", "china_macro").
         """
         source_filter = self._source_filter
         if source_filter is None or source_filter == "all":
@@ -327,6 +328,7 @@ class IngestionScheduler:
                 "eia",
                 "bls",
                 "treasury",
+                "china_macro",
             }
         return {source_filter}
 
@@ -479,6 +481,14 @@ class IngestionScheduler:
         else:
             logger.info("Dry-run: Treasury adapter skipped (source_filter=%s)", self._source_filter)
 
+        # ── China macro data (AKShare, no API key needed) ──
+        if "china_macro" in sources:
+            from src.adapters.china_macro_adapter import ChinaMacroAdapter
+
+            self._china_macro_adapter = ChinaMacroAdapter(dedup_cache=self._dedup_cache)
+        else:
+            logger.info("Dry-run: China macro adapter skipped (source_filter=%s)", self._source_filter)
+
         # ── Stock pipeline: CLS (primary) → EastMoney (fallback) → AkShare (fallback) ──
         # V6.1: CLS telegraph replaces EastMoney as primary stock news source
         # V6.2: CNInfo announcements (Phase 2)
@@ -539,13 +549,14 @@ class IngestionScheduler:
             " [dry-run mode]" if self._dry_run else ""
         )
         logger.info(
-            "Phase 1 macro adapters: FRED=%s, Sanctions=%s, ACLED=%s, EIA=%s, BLS=%s, Treasury=%s",
+            "Phase 1 macro adapters: FRED=%s, Sanctions=%s, ACLED=%s, EIA=%s, BLS=%s, Treasury=%s, ChinaMacro=%s",
             "yes" if self._fred_adapter else "no",
             "yes" if self._sanctions_adapter else "no",
             "yes" if self._acled_adapter else "no",
             "yes" if self._eia_adapter else "no",
             "yes" if self._bls_adapter else "no",
             "yes" if self._treasury_adapter else "no",
+            "yes" if self._china_macro_adapter else "no",
         )
 
     # ── Internal: cycle loop ──────────────────────────────────────────
@@ -678,6 +689,7 @@ class IngestionScheduler:
             self._run_adapter_pipeline(self._eia_adapter, self._macro_writer, tickers),
             self._run_adapter_pipeline(self._bls_adapter, self._macro_writer, tickers),
             self._run_adapter_pipeline(self._treasury_adapter, self._macro_writer, tickers),
+            self._run_adapter_pipeline(self._china_macro_adapter, self._macro_writer, tickers),
         ]
 
         # Run macro pipelines + stock pipeline + CNInfo + EastMoney Research concurrently
@@ -694,6 +706,7 @@ class IngestionScheduler:
             "eia",
             "bls",
             "treasury",
+            "china_macro",
             "stock",
             "cninfo",
             "eastmoney_research",
@@ -985,6 +998,8 @@ class IngestionScheduler:
             adapters_to_run.append((self._bls_adapter, "bls"))
         if self._treasury_adapter is not None:
             adapters_to_run.append((self._treasury_adapter, "treasury"))
+        if self._china_macro_adapter is not None:
+            adapters_to_run.append((self._china_macro_adapter, "china_macro"))
 
         # Stock pipeline: CLS (primary) → EastMoney (fallback) → AkShare (fallback)
         # V6.1: CLS telegraph replaces EastMoney as primary stock news source
