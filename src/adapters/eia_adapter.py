@@ -16,9 +16,11 @@ Contract: BaseAdapter (fetch → normalize → dedup).
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import urlencode
 
 import httpx
 
@@ -102,6 +104,22 @@ _EIA_SERIES: dict[str, dict[str, Any]] = {
 # How many observations to request per series (latest first, desc).
 _EIA_FETCH_LENGTH = 3
 
+# How far back the API-side ``start`` filter reaches. Deliberately wider
+# than ``_EIA_MAX_AGE_DAYS`` so the API-side filter is a loose efficiency
+# hint only; normalize() applies the authoritative freshness window.
+_EIA_FETCH_LOOKBACK_DAYS = _EIA_MAX_AGE_DAYS + 5
+
+# Retry policy. EIA docs: exceeding the per-second/per-hour request
+# tolerances suspends the key until a cool-down, so honor Retry-After
+# and back off exponentially on 429/5xx instead of hammering.
+_EIA_MAX_RETRIES = 2
+_EIA_RETRY_BACKOFF_BASE = 1.5  # seconds, doubled per attempt
+_EIA_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+# Inter-series delay keeps the request rate comfortably inside EIA's
+# per-second throttle (5 series ≈ 1.25s added per cycle).
+_EIA_REQUEST_DELAY_SEC = 0.25
+
 
 # ── Module-level helper functions ──────────────────────────────────────
 
@@ -174,6 +192,51 @@ def _build_eia_body(
     return "\n".join(lines)
 
 
+def _build_eia_source_url(series_id: str) -> str:
+    """Build a unique, traceable APIv2 URL for one EIA series.
+
+    The URL carries the route plus this series' facets as a query
+    string. Two series on the same route (WCRIMUS2 / WCREXUS2 both on
+    petroleum/sum/sndw) therefore get distinct ``source_url`` values
+    and survive the URL-based dedup in ``BaseAdapter.dedup()``.
+    """
+    cfg = _EIA_SERIES.get(series_id, {})
+    url = f"{_EIA_API_BASE}/{cfg.get('route', '')}/data/"
+    facets = cfg.get('facets', {})
+    if facets:
+        url += '?' + urlencode(
+            [(f'facets[{k}][]', v) for k, v in facets.items()]
+        )
+    return url
+
+
+def _eia_error_message(resp: httpx.Response) -> str:
+    """Extract a human-readable message from an EIA error/warning body."""
+    try:
+        payload = resp.json()
+    except ValueError:
+        return resp.text[:200] or resp.reason_phrase
+    error = payload.get('error')
+    if error:
+        return str(error)
+    warning = payload.get('warning')
+    if warning:
+        description = payload.get('description', '')
+        return f'{warning} — {description}' if description else str(warning)
+    return resp.reason_phrase or f'HTTP {resp.status_code}'
+
+
+def _parse_retry_after(resp: httpx.Response) -> float | None:
+    """Parse the ``Retry-After`` header (seconds) if present."""
+    header = resp.headers.get('Retry-After')
+    if not header:
+        return None
+    try:
+        return float(header)
+    except ValueError:
+        return None
+
+
 # ── Adapter ────────────────────────────────────────────────────────────
 
 
@@ -207,27 +270,52 @@ class EiaAdapter(BaseAdapter):
             return []
 
         records: list[dict] = []
-        timeout = settings.eia_timeout_sec
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        # APIv2 best practice: constrain with start/facets/length so each
+        # response carries only the rows this adapter needs.
+        start = (datetime.now(timezone.utc) - timedelta(
+            days=_EIA_FETCH_LOOKBACK_DAYS
+        )).strftime("%Y-%m-%d")
+
+        async with httpx.AsyncClient(timeout=settings.eia_timeout_sec) as client:
             for series_id, cfg in _EIA_SERIES.items():
                 try:
                     params: dict[str, Any] = {
                         "api_key": settings.eia_api_key,
                         "data[]": "value",
+                        "frequency": "weekly",
+                        "start": start,
                         "sort[0][column]": "period",
                         "sort[0][direction]": "desc",
                         "length": str(_EIA_FETCH_LENGTH),
                     }
-                    # Optional explicit frequency (weekly/monthly/annual)
-                    if cfg.get("frequency"):
-                        params["frequency"] = cfg["frequency"]
                     for facet, value in cfg["facets"].items():
                         params[f"facets[{facet}][]"] = value
 
                     url = f"{_EIA_API_BASE}/{cfg['route']}/data/"
-                    resp = await client.get(url, params=params)
-                    resp.raise_for_status()
+                    resp = await self._get_with_retry(
+                        client, url, params, series_id
+                    )
+                    if resp is None:
+                        continue
+                    if resp.status_code != 200:
+                        logger.warning(
+                            "EIA: series %s failed — HTTP %d: %s",
+                            series_id,
+                            resp.status_code,
+                            _eia_error_message(resp),
+                        )
+                        continue
+
                     payload = resp.json()
+                    warning = payload.get("warning")
+                    if warning:
+                        description = payload.get("description", "")
+                        logger.warning(
+                            "EIA: series %s response warning: %s%s",
+                            series_id,
+                            warning,
+                            f" — {description}" if description else "",
+                        )
                     data = (
                         (payload.get("response") or {}).get("data") or []
                     )
@@ -249,14 +337,82 @@ class EiaAdapter(BaseAdapter):
                             "context": cfg.get("context", ""),
                         }
                     )
+                    logger.debug(
+                        "EIA: %s period=%s value=%s",
+                        series_id,
+                        latest.get("period"),
+                        latest.get("value"),
+                    )
                 except (httpx.HTTPError, ValueError) as exc:
                     logger.warning(
                         "EIA fetch failed for series %s: %s", series_id, exc
                     )
+                # Polite pacing between series (EIA rate-limit guidance).
+                await asyncio.sleep(_EIA_REQUEST_DELAY_SEC)
 
         self._pre_filter_count = len(records)
         logger.info("EIA: fetched %d series snapshots", len(records))
         return records
+
+    async def _get_with_retry(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        params: dict[str, Any],
+        series_id: str,
+    ) -> httpx.Response | None:
+        """GET ``url``, retrying transient failures (EIA rate limits / 5xx).
+
+        Retries up to ``_EIA_MAX_RETRIES`` times with exponential backoff,
+        honoring a ``Retry-After`` header when present. Returns the last
+        response, or ``None`` when the connection itself keeps failing
+        (already logged).
+        """
+        resp: httpx.Response | None = None
+        for attempt in range(_EIA_MAX_RETRIES + 1):
+            try:
+                resp = await client.get(url, params=params)
+            except httpx.HTTPError as exc:
+                if attempt >= _EIA_MAX_RETRIES:
+                    logger.warning(
+                        "EIA: request failed for series %s after %d attempts: %s",
+                        series_id,
+                        _EIA_MAX_RETRIES + 1,
+                        exc,
+                    )
+                    return None
+                delay = _EIA_RETRY_BACKOFF_BASE * (2 ** attempt)
+                logger.warning(
+                    "EIA: request error for series %s (attempt %d/%d): %s"
+                    " — retrying in %.1fs",
+                    series_id, attempt + 1, _EIA_MAX_RETRIES, exc, delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            if resp.status_code not in _EIA_RETRYABLE_STATUS:
+                return resp
+            if attempt >= _EIA_MAX_RETRIES:
+                return resp
+
+            retry_after = _parse_retry_after(resp)
+            delay = (
+                retry_after
+                if retry_after is not None
+                else _EIA_RETRY_BACKOFF_BASE * (2 ** attempt)
+            )
+            logger.warning(
+                "EIA: HTTP %d for series %s (attempt %d/%d): %s"
+                " — retrying in %.1fs",
+                resp.status_code,
+                series_id,
+                attempt + 1,
+                _EIA_MAX_RETRIES,
+                _eia_error_message(resp),
+                delay,
+            )
+            await asyncio.sleep(delay)
+        return resp
 
     async def normalize(self, record: dict) -> NormalizedEpisode | None:
         """Convert one EIA series snapshot to a NormalizedEpisode.
@@ -320,7 +476,9 @@ class EiaAdapter(BaseAdapter):
             name=ep_name,
             source_description="EIA (US Energy Information Administration)",
             source_type="eia",
-            source_url=f"{_EIA_API_BASE}/{_EIA_SERIES.get(series_id, {}).get('route', '')}/data/",
+            # Unique per-series source URL (route + facets) so same-route
+            # series survive URL-based dedup — see _build_eia_source_url().
+            source_url=_build_eia_source_url(series_id),
             valid_at=valid_at,
             content_hash=content_hash,
             severity=severity,
@@ -339,6 +497,10 @@ class EiaAdapter(BaseAdapter):
 __all__ = [
     "EiaAdapter",
     "_EIA_SERIES",
+    "_EIA_MAX_AGE_DAYS",
+    "_EIA_FETCH_LENGTH",
+    "_build_eia_source_url",
+    "_eia_error_message",
     "_map_eia_severity",
     "_build_eia_body",
 ]

@@ -53,7 +53,12 @@ _OFAC_SDN_CSV_URL = "https://sanctionslistservice.ofac.treas.gov/api/publication
 _OFAC_MAX_RECORDS = 200
 
 # How many trailing (most recent) OFAC entries to scan before capping.
-_OFAC_TAIL_SCAN = 500
+# The window must be wide enough to cover recent designations across
+# ALL major programs: OFAC's newest batches (entries 58xxx) are Cuba/
+# Iran, while the newest Russia (entry 56996) and Ukraine (entry 52727)
+# designations sit BELOW them. A narrow tail (500) would exclude every
+# Russia/Ukraine entry, so use 3000 rows to bring them into the scan.
+_OFAC_TAIL_SCAN = 3000
 
 
 # ── Module-level helper functions ──────────────────────────────────────
@@ -250,11 +255,19 @@ class SanctionsAdapter(BaseAdapter):
         return records
 
     async def _fetch_ofac_sdn(self, settings: Any) -> list[dict]:
-        """Fetch the OFAC SDN consolidated CSV and parse recent entries.
+        """Fetch the OFAC SDN consolidated CSV and parse a recent, diverse sample.
 
         The CSV is sorted by entry number ascending; higher numbers are
         more recently added. We scan the trailing ``_OFAC_TAIL_SCAN``
-        rows and keep up to ``_OFAC_MAX_RECORDS`` of them.
+        rows (wide enough to include the most recent Russia/Ukraine
+        designations that sit below the newest Cuba/Iran batch) and
+        select up to ``_OFAC_MAX_RECORDS`` with a two-pass strategy:
+
+        1. Newest entry of every distinct sanction program in the
+           window — guarantees program diversity (e.g. Russia/Ukraine
+           coverage instead of a single old-list block), then
+        2. Fill the remaining slots newest-first — preserves recency
+           (largest entry numbers).
 
         OFAC entries carry no listing date (standing list), so they are
         not date-window filtered; ``listing_date`` stays ``None`` and
@@ -273,10 +286,10 @@ class SanctionsAdapter(BaseAdapter):
         rows = [row for row in reader if row and row[0].strip().isdigit()]
         recent_rows = rows[-_OFAC_TAIL_SCAN:] if len(rows) > _OFAC_TAIL_SCAN else rows
 
-        records: list[dict] = []
+        # Pre-parse the window (skip rows without a name), newest first.
+        # Each entry: (ent_num, program, record).
+        parsed: list[tuple[str, str, dict]] = []
         for row in reversed(recent_rows):
-            if len(records) >= _OFAC_MAX_RECORDS:
-                break
             ent_num = row[0].strip()
             name = row[1].strip() if len(row) > 1 else ""
             if not name:
@@ -285,19 +298,47 @@ class SanctionsAdapter(BaseAdapter):
             program = row[3].strip() if len(row) > 3 else ""
             if program == "-0-":
                 program = ""
-            records.append(
-                {
-                    "entity_name": name,
-                    "target_type": _map_ofac_type(raw_type),
-                    "country": "",
-                    "sanction_program": program,
-                    "listing_date": None,
-                    "source_url": (
-                        f"https://sanctionssearch.ofac.treas.gov/Details.aspx?id={ent_num}"
-                    ),
-                    "source": "ofac",
-                }
+            parsed.append(
+                (
+                    ent_num,
+                    program,
+                    {
+                        "entity_name": name,
+                        "target_type": _map_ofac_type(raw_type),
+                        "country": "",
+                        "sanction_program": program,
+                        "listing_date": None,
+                        "source_url": (
+                            f"https://sanctionssearch.ofac.treas.gov/Details.aspx?id={ent_num}"
+                        ),
+                        "source": "ofac",
+                    },
+                )
             )
+
+        records: list[dict] = []
+        seen_programs: set[str] = set()
+        seen_entry_numbers: set[str] = set()
+
+        # Pass 1 — newest entry of every distinct program (diversity).
+        for ent_num, program, record in parsed:
+            if len(records) >= _OFAC_MAX_RECORDS:
+                break
+            if program in seen_programs:
+                continue
+            seen_programs.add(program)
+            seen_entry_numbers.add(ent_num)
+            records.append(record)
+
+        # Pass 2 — fill remaining slots newest-first (recency).
+        for ent_num, program, record in parsed:
+            if len(records) >= _OFAC_MAX_RECORDS:
+                break
+            if ent_num in seen_entry_numbers:
+                continue
+            seen_entry_numbers.add(ent_num)
+            records.append(record)
+
         return records
 
     async def normalize(self, record: dict) -> NormalizedEpisode | None:
