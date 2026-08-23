@@ -156,13 +156,11 @@ class SectorBriefingAggregator:
         """
         query = """
         MATCH (sector_ent:Entity)
-        WHERE (sector_ent.name = $sector_name
-               OR sector_ent.entity_name = $sector_name)
+        WHERE (sector_ent.name = $sector_name)
           AND 'Sector' IN sector_ent.labels
         OPTIONAL MATCH (stock:Entity)
         WHERE stock.ticker IS NOT NULL
-          AND (stock.sector = sector_ent.name
-               OR stock.sector = sector_ent.entity_name)
+          AND (stock.sector = sector_ent.name)
         OPTIONAL MATCH (stock)-[rel:RELATES_TO]-(other:Entity)
         OPTIONAL MATCH (ep:Episodic)
         WHERE rel.uuid IN ep.entity_edges

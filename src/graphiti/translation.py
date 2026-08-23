@@ -50,6 +50,10 @@ LABEL_TYPE_MAP: dict[str, str] = {
     "STOCK": "stock",
     "COUNTRY": "country",
     "POLICY": "policy",
+    "TOPIC": "topic",
+    "ORGANIZATION": "organization",
+    "EVENT": "event",
+    "PERSON": "person",
 }
 """Mapping from uppercase Entity label → business entity type string."""
 
@@ -62,7 +66,8 @@ def entity_type_from_labels(labels: list[str], ticker: str | None) -> str:
         ticker: Optional stock ticker (used as fallback hint)
 
     Returns:
-        One of: 'stock', 'sector', 'country', 'policy', 'unknown'
+        One of: 'stock', 'sector', 'country', 'policy', 'topic',
+        'organization', 'event', 'person', 'unknown'
     """
     label_set = {l.upper() for l in labels}
     for label, entity_type in LABEL_TYPE_MAP.items():
@@ -119,7 +124,7 @@ def translate_episode_to_event(
         elif found_title:
             rest_lines.append(line)
     if not title:
-        title = e.get("name", str(e.get("entity_name", "Untitled Event")))
+        title = e.get("name", "Untitled Event")
     if len(title) > 200:
         title = title[:200]
 
@@ -192,7 +197,7 @@ def _translate_entity_to_item_dict(entity_node: dict[str, Any]) -> dict[str, Any
     Returns a dict suitable for ``EventEntityItem(**result)``.
     """
     en_labels: list = entity_node.get("labels") or []
-    en_name: str = entity_node.get("entity_name") or entity_node.get("name", "")
+    en_name: str = entity_node.get("name", "")
     ticker: str | None = entity_node.get("ticker") or None
     ent_type: str = entity_type_from_labels(en_labels, ticker)
 
@@ -271,7 +276,7 @@ def translate_episode_to_briefing_input(
             title = stripped
             found_title = True
     if not title:
-        title = e.get("name", str(e.get("entity_name", "Untitled Event")))
+        title = e.get("name", "Untitled Event")
     if len(title) > 200:
         title = title[:200]
 
@@ -304,7 +309,7 @@ def translate_episode_to_briefing_input(
             ticker = en.get("ticker")
             if ticker:
                 affected_tickers.append(str(ticker))
-            name = en.get("entity_name") or en.get("name", "")
+            name = en.get("name", "")
             if name:
                 affected_stocks.append(name)
 

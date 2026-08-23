@@ -1,4 +1,8 @@
-"""单元测试: entity_types — 金融实体类型定义（双注册表）。"""
+"""单元测试: entity_types — 金融实体类型定义（双注册表）。
+
+注意: 实体 name 由 graphiti-core 原生提取（EntityNode.name），
+entity_types 模型只承载补充属性字段，不包含名称字段。
+"""
 
 from __future__ import annotations
 
@@ -21,63 +25,53 @@ from src.graphiti.entity_types import (
 
 class TestStockEntity:
     def test_valid(self):
-        s = StockEntity(ticker="0700.HK", entity_name="腾讯控股", sector="互联网平台", exchange="HKEX")
+        s = StockEntity(ticker="0700.HK", sector="互联网平台", exchange="HKEX")
         assert s.ticker == "0700.HK"
-        assert s.entity_name == "腾讯控股"
         assert s.sector == "互联网平台"
         assert s.exchange == "HKEX"
 
-    def test_missing_ticker_raises(self):
-        with pytest.raises(ValidationError):
-            StockEntity(entity_name="腾讯控股", sector="互联网平台", exchange="HKEX")
+    def test_missing_ticker_allowed(self):
+        """ticker is optional (auto-grounded by post-write normalizer)."""
+        s = StockEntity(sector="互联网平台", exchange="HKEX")
+        assert s.ticker is None
 
-    def test_missing_name_raises(self):
+    def test_missing_required_fields_raises(self):
+        """sector 和 exchange 为必填字段（name 由 Graphiti 原生提取，无需提供）。"""
         with pytest.raises(ValidationError):
-            StockEntity(ticker="0700.HK", sector="互联网平台", exchange="HKEX")
+            StockEntity(ticker="0700.HK")
 
 
 class TestSectorEntity:
-    def test_valid(self):
-        s = SectorEntity(entity_name="互联网平台")
-        assert s.entity_name == "互联网平台"
-
-    def test_missing_name_raises(self):
-        with pytest.raises(ValidationError):
-            SectorEntity()
+    def test_empty_model_valid(self):
+        """SectorEntity 为空模型 — name 由 Graphiti 原生提取，无需任何字段。"""
+        s = SectorEntity()
+        assert isinstance(s, SectorEntity)
 
 
 class TestCountryEntity:
-    def test_valid(self):
-        c = CountryEntity(entity_name="中国")
-        assert c.entity_name == "中国"
-
-    def test_missing_name_raises(self):
-        with pytest.raises(ValidationError):
-            CountryEntity()
+    def test_empty_model_valid(self):
+        """CountryEntity 为空模型 — name 由 Graphiti 原生提取，无需任何字段。"""
+        c = CountryEntity()
+        assert isinstance(c, CountryEntity)
 
 
 class TestPolicyEntity:
     def test_valid(self):
-        p = PolicyEntity(entity_name="降息", type="monetary", status="rumor")
-        assert p.entity_name == "降息"
+        p = PolicyEntity(type="monetary", status="rumor")
         assert p.type == "monetary"
         assert p.status == "rumor"
 
-    def test_missing_name_raises(self):
-        with pytest.raises(ValidationError):
-            PolicyEntity(type="monetary", status="rumor")
-
     def test_missing_type_raises(self):
         with pytest.raises(ValidationError):
-            PolicyEntity(entity_name="测试", status="rumor")
+            PolicyEntity(status="rumor")
 
 
 class TestMacroEntityTypes:
-    def test_has_six_keys(self):
-        assert len(MACRO_ENTITY_TYPES) == 6
+    def test_has_seven_keys(self):
+        assert len(MACRO_ENTITY_TYPES) == 7
 
     def test_keys_match(self):
-        expected = {"Organization", "Country", "Topic", "Policy", "Sector", "Event"}
+        expected = {"Organization", "Country", "Topic", "Policy", "Sector", "Event", "Person"}
         assert set(MACRO_ENTITY_TYPES.keys()) == expected
 
     def test_values_are_base_model_subclasses(self):
@@ -86,11 +80,11 @@ class TestMacroEntityTypes:
 
 
 class TestSymbolEntityTypes:
-    def test_has_six_keys(self):
-        assert len(SYMBOL_ENTITY_TYPES) == 6
+    def test_has_seven_keys(self):
+        assert len(SYMBOL_ENTITY_TYPES) == 7
 
     def test_keys_match(self):
-        expected = {"Stock", "Sector", "Organization", "Country", "Policy", "Event"}
+        expected = {"Stock", "Sector", "Organization", "Country", "Policy", "Event", "Person"}
         assert set(SYMBOL_ENTITY_TYPES.keys()) == expected
 
     def test_values_are_base_model_subclasses(self):

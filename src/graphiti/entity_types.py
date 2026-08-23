@@ -5,10 +5,10 @@ graphiti-core 通过 model_json_schema() 使用这些 Pydantic 模型生成 LLM
 提取的实体属性通过 EntityNode.attributes (dict) 存储为 Neo4j 节点属性。
 
 两套 entity_types:
-- MACRO_ENTITY_TYPES: 宏观管线（GDELT、RSS）使用。包含 Country, Policy, Organization, Topic, Sector, Event
-- SYMBOL_ENTITY_TYPES: 个股管线（AkShare）使用。包含 Stock, Sector, Organization, Country, Policy, Event
+- MACRO_ENTITY_TYPES: 宏观管线（GDELT、RSS）使用。包含 Country, Policy, Organization, Topic, Sector, Event, Person
+- SYMBOL_ENTITY_TYPES: 个股管线（AkShare）使用。包含 Stock, Sector, Organization, Country, Policy, Event, Person
 
-StockEntity.sector 与 SectorEntity.entity_name 统一使用中文行业名（如 "互联网平台"），保持语义一致。
+StockEntity.sector 与 SectorEntity.name 统一使用中文行业名（如 "互联网平台"），保持语义一致。
 """
 
 from __future__ import annotations
@@ -24,26 +24,31 @@ __all__ = [
     "TopicEntity",
     "EventEntity",
     "SymbolEventEntity",
+    "PersonEntity",
     "MACRO_ENTITY_TYPES",
     "SYMBOL_ENTITY_TYPES",
 ]
 
 
 class StockEntity(BaseModel):
-    """股票实体 — 在新闻中出现的可交易标的。
+    """股票实体 — 在新闻中出现的可交易标的（个股/ETF）。
+
+    注意：上市公司 = Stock，不是 Organization。
+    指数（沪深300、标普500、恒生指数）不是股票，不要给它们填 ticker。
 
     属性映射到 EntityNode.attributes，可通过 Neo4j Cypher 查询:
         MATCH (n:Stock) WHERE n.ticker = '0700.HK' RETURN n
     Neo4j 节点标签: Entity:Stock
     """
 
-    ticker: str = Field(
-        ...,
-        description="股票代码，格式: {biz_code}.{exchange}，例如 0700.HK, BABA.US, 600000.SS",
-    )
-    entity_name: str = Field(
-        ...,
-        description="股票名称，使用中文原名，例如 '腾讯控股', '阿里巴巴'",
+    ticker: str | None = Field(
+        default=None,
+        description=(
+            "股票代码，格式: {biz_code}.{exchange}。"
+            "⚠️ 仅当新闻原文中明确出现代码时才填写；"
+            "禁止根据公司名猜测或记忆生成代码。不确定时留空（系统会自动补全）。"
+            "指数没有股票代码，请勿为指数填写此字段。"
+        ),
     )
     sector: str = Field(
         ...,
@@ -73,11 +78,6 @@ class SectorEntity(BaseModel):
     Neo4j 节点标签: Entity:Sector
     """
 
-    entity_name: str = Field(
-        ...,
-        description="行业名称，使用中文，例如 '互联网平台', '新能源', '房地产'",
-    )
-
 
 class CountryEntity(BaseModel):
     """国家/地区实体 — 新闻中涉及的国家或地区。
@@ -85,11 +85,6 @@ class CountryEntity(BaseModel):
     示例: "中国", "美国", "日本", "欧盟"
     Neo4j 节点标签: Entity:Country
     """
-
-    entity_name: str = Field(
-        ...,
-        description="国家/地区名称，使用中文，例如 '中国', '美国', '欧盟'",
-    )
 
 
 class PolicyEntity(BaseModel):
@@ -102,10 +97,6 @@ class PolicyEntity(BaseModel):
     Neo4j 节点标签: Entity:Policy
     """
 
-    entity_name: str = Field(
-        ...,
-        description="政策名称/描述，例如 '反垄断调查', '降息', '新能源汽车补贴'",
-    )
     type: str = Field(
         ...,
         description=(
@@ -129,10 +120,6 @@ class OrganizationEntity(BaseModel):
     示例: "腾讯控股", "美联储", "证监会", "世界卫生组织"
     Neo4j 节点标签: Entity:Organization
     """
-    entity_name: str = Field(
-        ...,
-        description="组织/机构/公司名称，使用中文原名",
-    )
 
 
 class TopicEntity(BaseModel):
@@ -141,10 +128,6 @@ class TopicEntity(BaseModel):
     示例: "加息", "贸易战", "芯片出口管制", "新冠"
     Neo4j 节点标签: Entity:Topic
     """
-    entity_name: str = Field(
-        ...,
-        description="主题/事件/概念名称",
-    )
     category: str | None = Field(
         default=None,
         description="主题分类: 货币政策/贸易/科技/地缘政治/公共卫生 等。"
@@ -159,7 +142,7 @@ class EventEntity(BaseModel):
     用于建立 "事件→国家"、"事件→行业"、"事件→股票" 的因果关系网络。
 
     字段说明:
-    - entity_name: 事件描述，使用中文，一句话概括事件内容
+    - name: 事件描述，使用中文，一句话概括事件内容
     - actor1: 发起方名称，翻译后的中文名（如 "中国"）
     - actor2: 接收方名称，翻译后的中文名（如 "美国"）
     - cameo_code: CAMEO 事件代码，如 "141"、"173"
@@ -170,10 +153,6 @@ class EventEntity(BaseModel):
     Neo4j 节点标签: Entity:Event
     """
 
-    entity_name: str = Field(
-        ...,
-        description="事件描述，使用中文，一句话概括事件内容，例如 '中国对美国加征关税'",
-    )
     actor1: str | None = Field(
         default=None,
         description="Actor1 名称（发起方），翻译后的中文名，例如 '中国'",
@@ -209,7 +188,7 @@ class SymbolEventEntity(BaseModel):
     简化版减少 LLM token 消耗且降低噪音。
 
     字段说明:
-    - entity_name: 事件描述，使用中文
+    - name: 事件描述，使用中文
     - actor1: 发起方名称
     - actor2: 接收方名称
     - event_date: 事件发生日期，格式 YYYY-MM-DD
@@ -217,10 +196,6 @@ class SymbolEventEntity(BaseModel):
     Neo4j 节点标签: Entity:Event
     """
 
-    entity_name: str = Field(
-        ...,
-        description="事件描述，使用中文，例如 '腾讯被纳入恒生科技指数'",
-    )
     actor1: str | None = Field(
         default=None,
         description="Actor1 名称（发起方），翻译后的中文名",
@@ -235,6 +210,22 @@ class SymbolEventEntity(BaseModel):
     )
 
 
+class PersonEntity(BaseModel):
+    """自然人实体 — 新闻中涉及的个人。
+
+    示例: "鲍威尔", "易纲", "马斯克"
+    Neo4j 节点标签: Entity:Person
+    """
+    title: str | None = Field(
+        default=None,
+        description="职务/头衔，例如 '美联储主席', '财政部部长'",
+    )
+    nationality: str | None = Field(
+        default=None,
+        description="国籍，例如 '美国', '中国'",
+    )
+
+
 # ── 实体类型注册表（两套） ─────────────────────────────────────────────
 
 MACRO_ENTITY_TYPES: dict[str, type[BaseModel]] = {
@@ -244,10 +235,11 @@ MACRO_ENTITY_TYPES: dict[str, type[BaseModel]] = {
     "Policy": PolicyEntity,
     "Sector": SectorEntity,
     "Event": EventEntity,
+    "Person": PersonEntity,
 }
 """宏观管线使用的实体类型（GDELT、RSS）。
 
-包含: Organization, Country, Topic, Policy, Sector, Event
+包含: Organization, Country, Topic, Policy, Sector, Event, Person
 
 宏观新闻中提到的行业概念（如 "互联网平台监管"、"新能源补贴退坡"）提取为 SectorEntity。
 """
@@ -259,8 +251,9 @@ SYMBOL_ENTITY_TYPES: dict[str, type[BaseModel]] = {
     "Country": CountryEntity,
     "Policy": PolicyEntity,
     "Event": SymbolEventEntity,
+    "Person": PersonEntity,
 }
 """个股管线使用的实体类型（AkShare）。
 
-包含: Stock, Sector, Organization, Country, Policy, Event
+包含: Stock, Sector, Organization, Country, Policy, Event, Person
 """

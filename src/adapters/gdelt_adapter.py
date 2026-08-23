@@ -1497,6 +1497,19 @@ class GdeltAdapter(BaseAdapter):
                 for r in records
             ],
         )
+
+        # Cap episodes per cycle: after a DB rebuild GDELT can return hundreds
+        # of episodes (~7.7s/ep processing ≈ 40+ min), far exceeding the ~900s
+        # scheduler cycle. Truncate BEFORE dedup so truncated episodes are not
+        # marked as seen and will be re-processed in the next cycle.
+        MAX_EPISODES_PER_CYCLE = 80
+        if len(episodes) > MAX_EPISODES_PER_CYCLE:
+            logger.warning(
+                "GDELT returned %d episodes, truncating to %d (rest will be processed in next cycle)",
+                len(episodes), MAX_EPISODES_PER_CYCLE,
+            )
+            episodes = episodes[:MAX_EPISODES_PER_CYCLE]
+
         episodes = self.dedup(list(episodes))
 
         # Tag episodes originated from degraded fallback

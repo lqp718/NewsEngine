@@ -240,11 +240,11 @@ def _build_active_events_query() -> str:
         OPTIONAL MATCH (src:Entity)-[rel:RELATES_TO]-(tgt:Entity)
         WHERE rel.uuid IN e.entity_edges
         WITH e, collect(DISTINCT src) + collect(DISTINCT tgt) AS entities
+        WITH e, [n IN entities | n{.*, labels: labels(n)}] AS entities
         WHERE ($sector IS NULL
                OR ANY(ent IN entities
                       WHERE (ent.sector IS NOT NULL AND ent.sector CONTAINS $sector)
-                         OR (ent.name CONTAINS $sector)
-                         OR (ent.entity_name CONTAINS $sector)))
+                         OR (ent.name CONTAINS $sector)))
         RETURN e, entities
         ORDER BY e.valid_at DESC, e.created_at DESC
         LIMIT $limit
@@ -265,7 +265,9 @@ def _build_entity_events_query() -> str:
           AND ep.created_at > datetime() - duration({days: 3})
         OPTIONAL MATCH (ep)-[other_rel:RELATES_TO]-(other_entity2:Entity)
         WHERE ep IS NOT NULL AND other_rel.uuid IN ep.entity_edges
-        RETURN ep, collect(DISTINCT other_entity) + collect(DISTINCT other_entity2) AS entities
+        RETURN ep,
+               [n IN (collect(DISTINCT other_entity) + collect(DISTINCT other_entity2))
+                | n{.*, labels: labels(n)}] AS entities
     """
 
 
@@ -357,17 +359,16 @@ def _build_sector_events_query() -> str:
     return """
         MATCH (sector_ent:Entity)
         WHERE sector_ent.name = $sector_name
-           OR sector_ent.entity_name = $sector_name
         OPTIONAL MATCH (stock:Entity)
         WHERE stock.sector = sector_ent.name
-           OR stock.sector = sector_ent.entity_name
         OPTIONAL MATCH (stock)-[rel:RELATES_TO]-(other:Entity)
         OPTIONAL MATCH (ep:Episodic)
         WHERE rel.uuid IN ep.entity_edges
           AND ep.created_at > datetime() - duration({days: 7})
         OPTIONAL MATCH (ep)-[other_rel:RELATES_TO]-(all_ents:Entity)
         WHERE ep IS NOT NULL AND other_rel.uuid IN ep.entity_edges
-        WITH ep, collect(DISTINCT all_ents) AS entities,
+        WITH ep,
+             [n IN collect(DISTINCT all_ents) | n{.*, labels: labels(n)}] AS entities,
              count(DISTINCT stock) AS ticker_count
         WHERE ep IS NOT NULL
         RETURN ep, entities, ticker_count
@@ -383,7 +384,9 @@ def _build_high_risk_query() -> str:
           AND e.created_at > datetime() - duration({days: 14})
         OPTIONAL MATCH (src:Entity)-[rel:RELATES_TO]-(tgt:Entity)
         WHERE rel.uuid IN e.entity_edges
-        RETURN e, collect(DISTINCT src) + collect(DISTINCT tgt) AS entities
+        WITH e, collect(DISTINCT src) + collect(DISTINCT tgt) AS entities
+        WITH e, [n IN entities | n{.*, labels: labels(n)}] AS entities
+        RETURN e, entities
         ORDER BY e.created_at DESC
         LIMIT 10
     """

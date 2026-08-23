@@ -76,8 +76,10 @@ async def run_pipeline(
     """Run a full pipeline cycle for one adapter.
 
     Stages:
-        1. adapter.run(tickers=tickers) → fetch → normalize → dedup
-        2. EpisodeWriter.write_batch(episodes) if any episodes (skipped in dry-run)
+        1. adapter.run(tickers=tickers) → fetch → normalize → dedup (filter-only)
+        2. EpisodeWriter.write_batch(episodes) if any episodes (skipped in dry-run);
+           only successfully-written episodes are registered into the adapter's
+           dedup_cache (P0-1: failed writes are retried next cycle)
         3. Update health metadata (skipped in dry-run)
 
     Args:
@@ -128,6 +130,28 @@ async def run_pipeline(
         elif episodes:
             write_result = await writer.write_batch(episodes)
             episode_count = write_result.ok
+            # P0-1 去重时序修复: dedup() 只过滤不登记。写入成功（ok）或
+            # writer 判定已处理（skipped_duplicate，内容已在本轮写入）的
+            # episode 才登记进 dedup_cache；失败的（error）不登记，
+            # 下个 cycle 会重新尝试，避免写入失败被误标记为已处理而静默丢失。
+            if len(write_result.results) == len(episodes):
+                _mark_written(
+                    adapter,
+                    [
+                        ep
+                        for ep, wr in zip(episodes, write_result.results)
+                        if wr.status in ("ok", "skipped_duplicate")
+                    ],
+                )
+            else:
+                logger.warning(
+                    "pipeline [%s]: write_batch results length mismatch "
+                    "(%d vs %d episodes) — skipping dedup_cache marking "
+                    "to avoid marking unwritten episodes as processed",
+                    source_type,
+                    len(write_result.results),
+                    len(episodes),
+                )
             logger.info(
                 "pipeline [%s]: wrote %d / %d episodes "
                 "(skipped=%d, errors=%d)",
@@ -218,6 +242,10 @@ async def run_pipeline_single(
                 wr = await writer.write_one(ep)
                 if wr.status == "ok":
                     episode_count += 1
+                # P0-1: 写入成功（ok）或判定已处理（skipped_duplicate）
+                # 才登记 dedup_cache；失败（error）不登记，下个 cycle 重试。
+                if wr.status in ("ok", "skipped_duplicate"):
+                    _mark_written(adapter, [ep])
             except Exception as exc:
                 logger.warning(
                     "pipeline_single [%s]: write_one failed for '%s': %s",
@@ -257,6 +285,33 @@ async def run_pipeline_single(
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────
+
+
+def _mark_written(adapter: Any, episodes: list) -> None:
+    """Register successfully-written episodes into the adapter's dedup_cache.
+
+    P0-1: 只登记写入成功的 episode。adapter 可能没有 mark_written 方法
+    （例如测试替身或未来自定义 adapter），此时降级为不登记并告警。
+    """
+    if not episodes:
+        return
+    mark = getattr(adapter, "mark_written", None)
+    if callable(mark):
+        try:
+            mark(episodes)
+        except Exception as exc:
+            logger.warning(
+                "mark_written failed (%d episodes): %s",
+                len(episodes),
+                exc,
+            )
+    else:
+        logger.warning(
+            "adapter %r has no mark_written() — dedup_cache not updated "
+            "for %d written episodes (next cycle will reprocess them)",
+            type(adapter).__name__,
+            len(episodes),
+        )
 
 
 def _resolve_source_type(adapter: Any) -> str:

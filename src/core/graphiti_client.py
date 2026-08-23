@@ -44,7 +44,14 @@ def create_graphiti(graph_driver: GraphDriver | None = None) -> Graphiti:
             config=LLMConfig(
                 api_key=settings.gemini_api_key,
                 model=settings.gemini_model,
+                # small_model 路由 extraction 等小任务：强制用配置的 gemini_model，
+                # 避免回落 Graphiti 默认的 gemini-2.5-flash-lite（已知有 bug）
+                small_model=settings.gemini_model,
             ),
+            # gemini-3.5-flash-lite 不在 graphiti 的 GEMINI_MODEL_MAX_TOKENS 映射表，
+            # 兜底为 8192 tokens，大 episode 输出会被硬截断导致 JSON 解析失败。
+            # 显式指定 32K output tokens 避免截断。
+            max_tokens=32768,
         )
     else:  # openai (百炼)
         from .bailian_llm_client import BailianOpenAIClient
