@@ -76,7 +76,7 @@ class TestEiaNormalize:
         entity_types = {e.type for e in episode.entities}
         assert "country" in entity_types
         assert "theme" in entity_types
-        assert any(e.name == "United States" for e in episode.entities)
+        assert any(e.name == "美国" for e in episode.entities)
 
         # Episode body: latest value + change vs previous period
         assert "430500" in episode.episode_body

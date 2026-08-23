@@ -29,6 +29,7 @@ from neo4j import Driver
 
 from src.core.config import get_settings
 from src.core.neo4j_client import get_neo4j_driver
+from src.utils.entity_canonical import canonical_name
 from src.utils.logging_config import get_logger
 from src.utils.time_utils import now_hkt
 
@@ -441,10 +442,15 @@ class IngestionScheduler:
                 entity_types=MACRO_ENTITY_TYPES,
             )
 
+            # 个股管线的 ticker 白名单：用于写入后确定性 ticker 接地
+            # （不信任 LLM 填写的 ticker，白名单内的 SET，白名单外的 REMOVE）
+            symbol_tickers = get_ticker_whitelist(self._whitelist_path)
+
             self._symbol_writer = EpisodeWriter(
                 graphiti=self._graphiti,
                 neo4j_driver=self._neo4j_driver,
                 entity_types=SYMBOL_ENTITY_TYPES,
+                whitelist=symbol_tickers,
             )
         else:
             logger.info("Dry-run mode: skipping Graphiti/EpisodeWriter/Neo4j initialization")
@@ -647,7 +653,9 @@ class IngestionScheduler:
 
         while self._running:
             cycle_start = time.monotonic()
-            logger.info(
+            # Cycle boundary logs use WARNING: with LOG_LEVEL=WARNING in .env,
+            # INFO logs are filtered out — cycle start/end/summary must stay visible.
+            logger.warning(
                 "=== Tier %d cycle starting (interval=%ds, adapters=%s) ===",
                 tier,
                 interval,
@@ -675,7 +683,7 @@ class IngestionScheduler:
             # Sleep until next cycle (wakes early on stop())
             elapsed = time.monotonic() - cycle_start
             remaining = max(float(self._min_cycle_gap_sec), interval - elapsed)
-            logger.info(
+            logger.warning(
                 "=== Tier %d cycle complete (%.1fs, guard=%.1fs, next in %.1fs) ===",
                 tier,
                 elapsed,
@@ -780,6 +788,9 @@ class IngestionScheduler:
             tickers = get_ticker_whitelist(self._whitelist_path)
             sector_names = _extract_sector_names(tickers)
             self._update_adapter_tickers(tickers)
+            # 同步白名单到 symbol writer（写入后 ticker 接地）
+            if self._symbol_writer is not None:
+                self._symbol_writer.set_whitelist(tickers)
             logger.info(
                 "Tier %d: %d tickers, %d sectors",
                 tier,
@@ -858,6 +869,19 @@ class IngestionScheduler:
                         exc,
                         exc_info=True,
                     )
+
+        # ── Step 4 (Tier 1 only): 存量节点 ticker 扫除（cycle 尾部）──────
+        # 保证最终状态不变量：ticker ⟺ 白名单名称。写入时接地负责新写入，
+        # cycle 尾部扫除负责清理 LLM 重新引入的错填（如合并节点的英文名变体）。
+        if tier == 1:
+            try:
+                self._sweep_ticker_grounding(tickers)
+            except Exception as exc:
+                logger.warning(
+                    "Ticker grounding sweep failed (non-critical): %s",
+                    exc,
+                    exc_info=True,
+                )
 
         return pipeline_results
 
@@ -997,6 +1021,69 @@ class IngestionScheduler:
                     self._eastmoney_research_adapter._symbol_map[symbol] = entry
                 if name:
                     self._eastmoney_research_adapter._name_map[name] = entry
+
+    def _sweep_ticker_grounding(self, tickers: list[dict[str, str]]) -> None:
+        """存量节点确定性 ticker 接地扫除（幂等，每个 cycle 尾部执行）。
+
+        与写入时接地同规则：仅白名单名称（或其 canonical/biz_code/别名）
+        对应的 Entity 节点允许持有 ticker，否则 REMOVE。
+
+        解决历史遗留数据问题：指数/ETF 节点被错误填上白名单股票的
+        ticker（张冠李戴），以及合并/分类导致的 ticker 丢失/错填。
+
+        每 cycle 都执行以保证最终状态不变量（ticker ⟺ 白名单名称），
+        即使 LLM 在写入时重新引入了错填值，下个 cycle 尾部也会被清理。
+        白名单为空时跳过（避免误删全部 ticker）。
+        """
+        if not tickers or self._neo4j_driver is None:
+            return
+
+        # 构建 name -> ticker 映射（含 canonical/biz_code/别名），与写入时接地一致
+        name_to_ticker: dict[str, str] = {}
+        for entry in tickers:
+            name = entry.get("name", "").strip()
+            ticker = entry.get("ticker", "").strip()
+            biz_code = entry.get("biz_code", "").strip()
+            if name and ticker:
+                name_to_ticker[name] = ticker
+                canonical = canonical_name(name, "stock")
+                if canonical != name:
+                    name_to_ticker[canonical] = ticker
+            if biz_code and ticker:
+                name_to_ticker[biz_code] = ticker
+
+        if not name_to_ticker:
+            return
+
+        try:
+            with self._neo4j_driver.session() as session:
+                wl_names = list(name_to_ticker.keys())
+
+                # SET pass: 白名单名称节点 → 确保持有正确 ticker
+                for name, ticker in name_to_ticker.items():
+                    session.run(
+                        "MATCH (n:Entity) WHERE n.name = $name "
+                        "AND (n.ticker IS NULL OR n.ticker <> $ticker) "
+                        "SET n.ticker = $ticker",
+                        name=name,
+                        ticker=ticker,
+                    )
+
+                # REMOVE pass: 非白名单名称节点 → 清理遗留错填 ticker
+                removed = session.run(
+                    "MATCH (n:Entity) WHERE n.ticker IS NOT NULL "
+                    "AND NOT n.name IN $wl_names REMOVE n.ticker "
+                    "RETURN count(n) AS cleaned",
+                    wl_names=wl_names,
+                ).single()
+                cleaned = removed["cleaned"] if removed else 0
+                if cleaned > 0:
+                    logger.info(
+                        "Ticker sweep: removed ticker from %d non-whitelist entity node(s)",
+                        cleaned,
+                    )
+        except Exception as exc:
+            logger.warning("Ticker sweep failed (non-critical): %s", exc, exc_info=True)
 
     # ── TTL Cleanup (V2.2 Layer 2) ─────────────────────────────────────
 
@@ -1156,7 +1243,7 @@ class IngestionScheduler:
             logger.warning("Dry-run: no adapters to run (all skipped by source_filter)")
             return results
 
-        logger.info(
+        logger.warning(
             "=== Dry-run cycle starting: %d adapter(s) ===",
             len(adapters_to_run),
         )
@@ -1235,7 +1322,7 @@ class IngestionScheduler:
                     logger.info("EastMoney threw exception, falling back to AkShare")
                     adapters_to_run.append((self._akshare_adapter, "akshare"))
 
-        logger.info(
+        logger.warning(
             "=== Dry-run cycle complete: %d/%d adapters successful ===",
             sum(1 for r in results if r.success),
             len(results),
@@ -1282,7 +1369,8 @@ class IngestionScheduler:
                     source_stats,
                 )
             else:
-                logger.info(
+                # Cycle summary at WARNING level so it is visible under LOG_LEVEL=WARNING
+                logger.warning(
                     "Tier %d cycle: all sources OK [%.1fs] total=%dep %s",
                     tier,
                     total_time,

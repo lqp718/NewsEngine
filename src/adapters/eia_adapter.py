@@ -486,6 +486,7 @@ class EiaAdapter(BaseAdapter):
             entities=entities,
             metadata={
                 "_structured": True,
+                "content_scope": "MACRO",
                 "series_id": series_id,
                 "value": value,
                 "previous_value": previous_value,

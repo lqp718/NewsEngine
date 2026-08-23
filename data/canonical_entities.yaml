@@ -1,0 +1,340 @@
+# canonical_entities.yaml — High-frequency entity canonical name mapping
+#
+# Format: canonical_name: [alias1, alias2, ...]
+#
+# This file defines the canonical (preferred) name for each entity and lists
+# all known aliases/variations that should map to it.
+#
+# Used by entity_canonical.py for normalization to reduce duplicate entities
+# in the knowledge graph (e.g., "Tencent" / "Tencent Holdings" / "腾讯控股"
+# all map to the canonical name "腾讯控股").
+#
+# Maintenance:
+#   - Add new entities as they are discovered in the corpus
+#   - Keep aliases exhaustive to maximize deduplication
+#   - Canonical names should be the most commonly used form in Chinese media
+#   - Top 50 high-frequency entities (expand as needed)
+
+# ── Tech Giants ──────────────────────────────────────────────────────────────
+
+腾讯控股:
+  - Tencent
+  - Tencent Holdings
+  - Tencent Holdings Ltd
+  - Tencent Holdings Ltd.
+  - 0700.HK
+  - 腾讯
+
+阿里巴巴:
+  - Alibaba
+  - Alibaba Group
+  - Alibaba Group Holding
+  - 9988.HK
+  - BABA
+  - 阿里
+
+苹果:
+  - Apple
+  - Apple Inc
+  - Apple Inc.
+  - AAPL
+  - 苹果公司
+
+微软:
+  - Microsoft
+  - Microsoft Corp
+  - Microsoft Corporation
+  - MSFT
+  - 微软公司
+
+谷歌:
+  - Google
+  - Alphabet
+  - Alphabet Inc
+  - GOOGL
+  - GOOG
+
+亚马逊:
+  - Amazon
+  - Amazon.com
+  - Amazon.com Inc
+  - AMZN
+
+特斯拉:
+  - Tesla
+  - Tesla Inc
+  - TSLA
+  - 特斯拉汽车
+
+英伟达:
+  - NVIDIA
+  - Nvidia
+  - Nvidia Corp
+  - NVDA
+  - 英伟达公司
+
+英特尔:
+  - Intel
+  - Intel Corp
+  - Intel Corporation
+  - INTC
+
+超威半导体:
+  - AMD
+  - Advanced Micro Devices
+  - Advanced Micro Devices Inc
+
+高通:
+  - Qualcomm
+  - Qualcomm Inc
+  - QCOM
+
+博通:
+  - Broadcom
+  - Broadcom Corp
+  - AVGO
+
+德州仪器:
+  - Texas Instruments
+  - TXN
+
+三星:
+  - Samsung
+  - Samsung Electronics
+  - 005930.KS
+
+# ── Chinese Financial Institutions ───────────────────────────────────────────
+
+中国平安:
+  - Ping An
+  - Ping An Insurance
+  - 601318.SH
+  - 2318.HK
+  - 平安
+
+中国移动:
+  - China Mobile
+  - 0941.HK
+  - CHL
+
+中国联通:
+  - China Unicom
+  - 0762.HK
+  - CHU
+
+中国电信:
+  - China Telecom
+  - 0728.HK
+  - CHT
+
+中国银行:
+  - Bank of China
+  - 601988.SH
+  - 3988.HK
+  - BOC
+
+工商银行:
+  - ICBC
+  - Industrial and Commercial Bank of China
+  - 601398.SH
+  - 1398.HK
+
+建设银行:
+  - CCBC
+  - China Construction Bank
+  - 601939.SH
+  - 0939.HK
+
+农业银行:
+  - Agricultural Bank of China
+  - 601288.SH
+  - 1288.HK
+  - ABC
+
+交通银行:
+  - Bank of Communications
+  - 601328.SH
+  - 3328.HK
+
+招商银行:
+  - China Merchants Bank
+  - 600036.SH
+  - 3968.HK
+  - CMB
+
+中信证券:
+  - CITIC
+  - CITIC Securities
+  - 600030.SH
+  - 6030.HK
+
+国泰君安:
+  - Guotai Junan
+  - Guotai Junan Securities
+  - 601211.SH
+  - 2611.HK
+
+华泰证券:
+  - Huatai Securities
+  - 601688.SH
+  - 6886.HK
+
+中信建投:
+  - China Securities
+  - China Securities Co
+  - 601066.SH
+  - 0688.HK
+
+# ── Industrial / Manufacturing ───────────────────────────────────────────────
+
+博世:
+  - Bosch
+  - Robert Bosch
+  - Robert Bosch GmbH
+
+西门子:
+  - Siemens
+  - Siemens AG
+  - SIE
+
+# ── Countries / Regions ──────────────────────────────────────────────────────
+
+美国:
+  - United States
+  - USA
+  - U.S.
+  - U.S.A.
+  - America
+
+中国:
+  - China
+  - People's Republic of China
+  - PRC
+  - 中国大陆
+
+香港:
+  - Hong Kong
+  - HK
+  - 香港特别行政区
+
+日本:
+  - Japan
+  - JP
+
+韩国:
+  - Korea
+  - South Korea
+  - KR
+
+德国:
+  - Germany
+  - DE
+
+法国:
+  - France
+  - FR
+
+英国:
+  - United Kingdom
+  - UK
+  - GB
+
+欧洲:
+  - Europe
+  - EU
+  - European Union
+
+# ── Commodities / Indices ────────────────────────────────────────────────────
+
+黄金:
+  - Gold
+  - XAU
+
+白银:
+  - Silver
+  - XAG
+
+原油:
+  - Oil
+  - Crude Oil
+  - Crude
+
+布伦特原油:
+  - Brent
+  - Brent Crude
+
+WTI原油:
+  - WTI
+  - West Texas Intermediate
+
+天然气:
+  - Natural Gas
+
+铜:
+  - Copper
+
+铁矿石:
+  - Iron Ore
+
+锂:
+  - Lithium
+
+比特币:
+  - Bitcoin
+  - BTC
+
+以太坊:
+  - Ethereum
+  - ETH
+
+# ── Central Banks / Policy ───────────────────────────────────────────────────
+
+美联储:
+  - Fed
+  - Federal Reserve
+  - Federal Reserve System
+  - FOMC
+
+欧洲央行:
+  - ECB
+  - European Central Bank
+
+中国人民银行:
+  - PBO
+  - People's Bank of China
+  - 央行
+  - 人民银行
+
+日本央行:
+  - BOJ
+  - Bank of Japan
+
+# ── Sectors / Themes ─────────────────────────────────────────────────────────
+
+半导体:
+  - Semiconductor
+  - Semiconductors
+  - Chip
+  - Chips
+
+人工智能:
+  - Artificial Intelligence
+  - AI
+
+电动汽车:
+  - Electric Vehicle
+  - EV
+  - EVs
+
+可再生能源:
+  - Renewable Energy
+  - Clean Energy
+
+太阳能:
+  - Solar
+  - Solar Energy
+  - Photovoltaic
+
+风电:
+  - Wind Power
+  - Wind Energy

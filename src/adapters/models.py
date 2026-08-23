@@ -14,6 +14,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from src.utils.entity_canonical import canonical_name
+
 SourceType = Literal[
     "gdelt_csv",
     "gdelt_events",
@@ -64,6 +66,12 @@ class EntityItem(BaseModel):
             "Only present for stock entities."
         ),
     )
+
+    def __init__(self, **data):
+        """Initialize and normalize entity name to canonical form."""
+        super().__init__(**data)
+        # Normalize entity name to canonical form to reduce duplicates
+        self.name = canonical_name(self.name, self.type)
 
 
 def build_entity_suffix(entities: list[EntityItem]) -> str:

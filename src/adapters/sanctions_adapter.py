@@ -484,6 +484,7 @@ class SanctionsAdapter(BaseAdapter):
             entities=entities,
             metadata={
                 "_structured": True,
+                "content_scope": "MACRO",
                 "target_type": target_type,
                 "sanction_program": sanction_program,
                 "source": source,

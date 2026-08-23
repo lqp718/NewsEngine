@@ -449,7 +449,7 @@ class NewsSpider(Spider):
                     "Invalidated pooled cookies for %s (chrome146) after continued block",
                     url,
                 )
-            logger.warning(
+            logger.debug(
                 "Tier 1 (chrome146) blocked for %s (status=%d) — queued for Tier 1.5/2 retry",
                 url,
                 response.status,
@@ -546,7 +546,7 @@ class NewsSpider(Spider):
                     # Verify it's actually a challenge page, not just a normal page mentioning CF
                     if len(html) < 50000 or "challenge-platform" in html.lower() or "just a moment" in html.lower():
                         error = "CloakBrowser returned anti-bot challenge page"
-                        logger.warning("%s: %s", url, error)
+                        logger.info("%s: %s", url, error)
                         return "", error
                 
                 # V7.0: harvest cookies for the cookie pool
@@ -579,11 +579,11 @@ class NewsSpider(Spider):
                 return html or "", None
             except asyncio.TimeoutError:
                 error = f"CloakBrowser timeout after {CLOAK_TIMEOUT_MS}ms"
-                logger.warning("%s: %s", url, error)
+                logger.info("%s: %s", url, error)
                 return "", error
             except Exception as e:
                 error = f"CloakBrowser error: {e}"
-                logger.warning("%s: %s", url, error)
+                logger.info("%s: %s", url, error)
                 return "", error
             finally:
                 # Safe close — suppress errors
@@ -675,7 +675,7 @@ class NewsSpider(Spider):
             still_failed: list[tuple[int, SpiderResult]] = []
             for idx, result, response, err in outcomes:
                 if err is not None:
-                    logger.warning(
+                    logger.debug(
                         "Tier 1.5 (%s) connection failed for %s: %s",
                         fp,
                         result.url,
@@ -691,7 +691,7 @@ class NewsSpider(Spider):
                 # cookies for this fingerprint and keep retrying.
                 if response.status in BLOCKED_STATUS_CODES and self._has_cloudflare_challenge(html):
                     await pool_invalidate(domain, fp)
-                    logger.warning(
+                    logger.debug(
                         "Tier 1.5 (%s) blocked for %s (status=%d) — invalidated pooled cookies",
                         fp,
                         result.url,
@@ -849,7 +849,7 @@ class NewsSpider(Spider):
                     if "cf_clearance" in cookie_dict:
                         await pool_put(domain, CAMOUFOX_FINGERPRINT, cookie_dict)
 
-                    logger.warning(
+                    logger.info(
                         "Tier 3 Camoufox succeeded for %s (%d chars, article_tag=%s, text_chars=%d)",
                         url,
                         len(html),
@@ -865,7 +865,7 @@ class NewsSpider(Spider):
                         fetch_tier="3",
                     )
             except _PlaywrightTimeoutError:
-                logger.warning(
+                logger.info(
                     "Tier 3 Camoufox timeout for %s after %ds", url, timeout
                 )
                 return SpiderResult(
@@ -912,7 +912,7 @@ class NewsSpider(Spider):
         html = str(response.html_content or "")
         if not html:
             # Blocked status with no HTML — treat as blocked
-            logger.warning(
+            logger.debug(
                 "Tier 1 blocked for %s (status=%d, no HTML) — falling back to CloakBrowser",
                 response.url,
                 response.status,
@@ -920,7 +920,7 @@ class NewsSpider(Spider):
             return True
 
         if self._has_cloudflare_challenge(html):
-            logger.warning(
+            logger.debug(
                 "Tier 1 blocked for %s (status=%d, CF challenge detected, html_len=%d) — falling back to CloakBrowser",
                 response.url,
                 response.status,
@@ -1185,7 +1185,7 @@ async def fetch_urls_with_spider(
         if r.error and not r.html_content
     ]
     if tier3_urls:
-        logger.warning(
+        logger.info(
             "Tier 3: %d URLs failed Tier 2 — starting Camoufox fallback",
             len(tier3_urls),
         )
@@ -1196,13 +1196,13 @@ async def fetch_urls_with_spider(
             )
             if tier3_result.html_content:
                 results[idx] = tier3_result
-                logger.warning(
+                logger.info(
                     "Tier 3 Camoufox recovered %s (%d chars)",
                     result.url,
                     len(tier3_result.html_content),
                 )
             else:
-                logger.warning(
+                logger.info(
                     "Tier 3 Camoufox failed for %s: %s",
                     result.url,
                     tier3_result.error,

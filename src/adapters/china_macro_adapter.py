@@ -511,7 +511,7 @@ class ChinaMacroAdapter(BaseAdapter):
             severity=severity,
             keywords=["china", "macro", indicator, "economic data"],
             entities=entities,
-            metadata={"_structured": True, "indicator": indicator},
+            metadata={"_structured": True, "content_scope": "MACRO", "indicator": indicator},
         )
 
     def _build_episode_body(

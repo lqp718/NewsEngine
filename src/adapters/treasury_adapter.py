@@ -409,7 +409,7 @@ class TreasuryAdapter(BaseAdapter):
             severity=severity,
             keywords=["treasury", "yield curve", "UST", "interest rates"],
             entities=entities,
-            metadata={"_structured": True},
+            metadata={"_structured": True, "content_scope": "MACRO"},
         )
 
 

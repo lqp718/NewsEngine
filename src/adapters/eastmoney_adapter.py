@@ -26,6 +26,7 @@ from src.adapters.models import EntityItem, NormalizedEpisode
 from src.core.config import get_settings
 from src.ingestion.severity_enricher import rule_based_severity
 from src.utils.content_fetcher import ContentResult
+from src.utils.entity_canonical import canonical_name
 from src.utils.logging_config import get_logger
 from src.utils.time_utils import now_hkt
 from src.utils.yaml_parser import strip_yaml_front_matter
@@ -395,7 +396,7 @@ class EastMoneyAdapter(BaseAdapter):
         if ticker_full:
             kwargs: dict[str, Any] = {
                 "type": "stock",
-                "name": ticker_name or symbol,
+                "name": canonical_name(ticker_name or symbol, "stock"),
                 "ticker": ticker_full,
             }
             if ticker_sector:

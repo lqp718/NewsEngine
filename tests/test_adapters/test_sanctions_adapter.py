@@ -195,7 +195,7 @@ class TestSanctionsNormalize:
 
         # Entities: organization for legal entity + country
         assert episode.entities[0].type == "organization"
-        assert episode.entities[0].name == "Example Corp"
+        assert episode.entities[0].name == "Example"
         assert any(e.type == "country" and e.name == "Russia" for e in episode.entities)
 
         # Episode body

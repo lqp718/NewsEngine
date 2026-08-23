@@ -109,7 +109,7 @@ class TestChinaMacroAdapterNormalize:
         assert episode is not None
         assert episode.source_type == "china_macro"
         assert "CPI" in episode.source_description
-        assert any(e.name == "China" for e in episode.entities)
+        assert any(e.name == "中国" for e in episode.entities)
 
     @pytest.mark.asyncio
     async def test_normalize_missing_time(self):

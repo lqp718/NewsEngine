@@ -98,6 +98,12 @@ def setup_logging(level: str = "INFO", log_file: str = "") -> None:
             # Fallback to console-only logging if file creation fails
             logging.warning(f"Could not create log file {log_file}: {e}. Continuing with console logging only.")
     
+    # Suppress noisy third-party loggers
+    logging.getLogger("scrapling").setLevel(logging.WARNING)
+    logging.getLogger("neo4j.notifications").setLevel(logging.ERROR)
+    logging.getLogger("trafilatura").setLevel(logging.ERROR)
+    logging.getLogger("cloakbrowser").setLevel(logging.ERROR)
+
     logging.info(
         "Logging configured: level=%s, output=%s",
         level.upper(),

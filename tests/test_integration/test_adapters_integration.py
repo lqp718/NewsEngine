@@ -107,12 +107,17 @@ class TestAkShareRealHttp:
 
 
 @pytest.mark.integration
-class TestTreasurySkeleton:
-    """Treasury adapter Phase 1 skeleton always returns empty."""
+class TestTreasuryAdapter:
+    """Treasury adapter fetches real yield curve data from US Treasury."""
 
-    async def test_fetch_returns_empty(self):
+    async def test_fetch_returns_records(self):
         from src.adapters.treasury_adapter import TreasuryAdapter
 
         adapter = TreasuryAdapter()
         records = await adapter.fetch()
-        assert records == []
+        assert len(records) > 0
+        # Each record should contain fetch_time and term_rates
+        rec = records[0]
+        assert "fetch_time" in rec
+        assert "term_rates" in rec
+        assert isinstance(rec["term_rates"], dict)

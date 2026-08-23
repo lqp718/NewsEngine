@@ -21,6 +21,7 @@ from src.adapters.base import BaseAdapter
 from src.adapters.models import EntityItem, NormalizedEpisode
 from src.core.config import get_settings
 from src.ingestion.severity_enricher import rule_based_severity
+from src.utils.entity_canonical import canonical_name
 from src.utils.logging_config import get_logger
 from src.utils.yaml_parser import strip_yaml_front_matter
 
@@ -256,7 +257,7 @@ class CLSAdapter(BaseAdapter):
 
             kwargs: dict[str, Any] = {
                 "type": "stock",
-                "name": name,
+                "name": canonical_name(name, "stock"),
                 "ticker": stock_id.upper(),  # e.g., "SH603986"
             }
             if exchange:

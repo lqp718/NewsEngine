@@ -218,8 +218,8 @@ class TestNormalizeEventRecord:
         # Verify entities
         assert len(episode.entities) > 0
         entity_names = {e.name for e in episode.entities}
-        assert "United States" in entity_names
-        assert "China" in entity_names
+        assert "美国" in entity_names
+        assert "中国" in entity_names
 
         # Verify content_hash
         assert len(episode.content_hash) == 64
@@ -255,8 +255,8 @@ class TestNormalizeEventRecord:
         episode = await adapter._normalize_event_record(record_dict)
 
         entity_names = {e.name for e in episode.entities}
-        assert "United States" in entity_names
-        assert "China" not in entity_names
+        assert "美国" in entity_names
+        assert "中国" not in entity_names
 
     @pytest.mark.asyncio
     async def test_normalize_event_no_entities_for_untranslated_codes(self):

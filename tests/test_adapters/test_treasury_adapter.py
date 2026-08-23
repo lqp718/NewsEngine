@@ -227,7 +227,7 @@ class TestTreasuryAdapterNormalize:
         assert episode.source_type == "treasury"
         assert episode.severity == "low"  # normal curve
         assert "treasury" in episode.keywords
-        assert any(e.name == "United States" for e in episode.entities)
+        assert any(e.name == "美国" for e in episode.entities)
 
     @pytest.mark.asyncio
     async def test_normalize_inverted(self):

@@ -84,6 +84,32 @@ _JSONLD_ARTICLE_TYPES: frozenset[str] = frozenset(
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _WS_RE = re.compile(r"\s+")
 
+
+def _clean_extracted_text(text: str) -> str:
+    """Clean HTML artifacts and control characters from extracted text.
+
+    Removes HTML entities, tag remnants, tabs, and other control characters
+    that cause issues when feeding text to LLM structured output.
+    Preserves ``\\n`` for paragraph breaks.
+
+    Args:
+        text: Raw extracted text potentially containing HTML/control artifacts.
+
+    Returns:
+        Cleaned text with artifacts removed and whitespace normalized.
+    """
+    # Remove HTML entity remnants
+    text = re.sub(r'&(nbsp|amp|lt|gt|quot|#\d+);', ' ', text)
+    # Remove HTML tag remnants
+    text = re.sub(r'<[^>]+>', '', text)
+    # Replace tabs with single space
+    text = re.sub(r'[\t]+', ' ', text)
+    # Collapse multiple spaces into one
+    text = re.sub(r' {2,}', ' ', text)
+    # Remove other control characters (keep \n for paragraph breaks)
+    text = ''.join(c for c in text if ord(c) >= 32 or c == '\n')
+    return text.strip()
+
 DOMAIN_RATE_LIMIT_SEC: float = 2.0
 """Minimum gap (seconds) between requests to the same domain."""
 
@@ -576,6 +602,7 @@ class ContentFetcher:
         # Tier 0a: __NEXT_DATA__ static extraction (before Trafilatura)
         text = extract_next_data(html_content)
         if text:
+            text = _clean_extracted_text(text)
             logger.debug(
                 "Tier 0 (__NEXT_DATA__) extracted %d chars from %s",
                 len(text),
@@ -583,7 +610,7 @@ class ContentFetcher:
             )
             return ContentResult(
                 url=url,
-                text=text.strip(),
+                text=text,
                 success=True,
                 engine="tier0_next_data",
             )
@@ -591,6 +618,7 @@ class ContentFetcher:
         # Tier 0b: JSON-LD static extraction (before Trafilatura)
         text = extract_json_ld(html_content)
         if text:
+            text = _clean_extracted_text(text)
             logger.debug(
                 "Tier 0 (JSON-LD) extracted %d chars from %s",
                 len(text),
@@ -598,7 +626,7 @@ class ContentFetcher:
             )
             return ContentResult(
                 url=url,
-                text=text.strip(),
+                text=text,
                 success=True,
                 engine="tier0_jsonld",
             )
@@ -607,7 +635,7 @@ class ContentFetcher:
         extracted = self._extract_content(html_content, url)
         if extracted and extracted.strip():
             engine = "news_spider+trafilatura"
-            text = extracted.strip()
+            text = _clean_extracted_text(extracted)
                         
             logger.debug(
                 "Extracted %d chars from %s%s",
@@ -659,7 +687,7 @@ class ContentFetcher:
             # Fallback: if precision mode failed, try with favor_precision=False
             # This helps when Camoufox got real content but trafilatura is too strict
             if not text or not text.strip():
-                logger.warning(
+                logger.debug(
                     "Trafilatura precision mode failed for %s, trying fallback",
                     url,
                 )

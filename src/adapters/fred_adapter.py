@@ -35,6 +35,7 @@ import httpx
 from src.adapters.base import BaseAdapter
 from src.adapters.models import EntityItem, NormalizedEpisode, Severity
 from src.core.config import get_settings
+from src.utils.entity_canonical import canonical_name
 from src.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -444,8 +445,8 @@ class FredAdapter(BaseAdapter):
         )
 
         entities = [
-            EntityItem(type="country", name="United States"),
-            EntityItem(type="theme", name=topic),
+            EntityItem(type="country", name=canonical_name("United States", "country")),
+            EntityItem(type="theme", name=canonical_name(topic, "theme")),
         ]
 
         return NormalizedEpisode(
@@ -461,6 +462,7 @@ class FredAdapter(BaseAdapter):
             entities=entities,
             metadata={
                 "_structured": True,
+                "content_scope": "MACRO",
                 "series_id": series_id,
                 "value": value,
                 "previous_value": previous_value,

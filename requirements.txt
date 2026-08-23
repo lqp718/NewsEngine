@@ -1,4 +1,4 @@
-graphiti-core>=0.29.2,<1.0
+graphiti-core[google-genai]>=0.29.2,<1.0
 sentence-transformers>=3.0.0,<4.0
 neo4j>=5.26.0,<6.0
 openai>=1.91.0,<2.0

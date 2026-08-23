@@ -458,6 +458,7 @@ class AcledAdapter(BaseAdapter):
             entities=entities,
             metadata={
                 "_structured": True,
+                "content_scope": "MACRO",
                 "event_type": event_type,
                 "country": country,
                 "fatalities": fatalities,
