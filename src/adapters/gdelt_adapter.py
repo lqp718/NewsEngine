@@ -521,6 +521,8 @@ class GdeltAdapter(BaseAdapter):
         # ── REMOVED: domain_whitelist, enable_domain_filter ──
         max_retries: int = 3,
         backoff_base: float = 1.0,
+        csv_download_timeout: float = 200.0,
+        total_download_timeout: float = 300.0,
         dedup_cache: set[str] | None = None,
         content_fetcher: Any | None = None,
         events_filter_config_path: str = "data/gdelt_events_filter.json",
@@ -530,6 +532,13 @@ class GdeltAdapter(BaseAdapter):
         self._cameo_whitelist = cameo_event_codes_whitelist if cameo_event_codes_whitelist is not None else CAMEO_EVENT_CODES_WHITELIST
         self.max_retries = max_retries
         self.backoff_base = backoff_base
+        # Async download timeout guards (see download_all_csvs). requests.get(
+        # timeout=60) can hang indefinitely when the connection stalls through a
+        # local proxy, so we backstop it at the asyncio layer: per-CSV wall and
+        # an overall wall across all three concurrent downloads. On timeout the
+        # affected source(s) are skipped — the capture cycle never blocks.
+        self.csv_download_timeout = csv_download_timeout
+        self.total_download_timeout = total_download_timeout
         self._last_records: list[dict] = []
         self._lastupdate_url = LASTUPDATE_URL
         self._content_fetcher = content_fetcher
@@ -678,22 +687,54 @@ class GdeltAdapter(BaseAdapter):
         _tmp_dirs: list[tempfile.TemporaryDirectory] = []
 
         async def _do_one(label: str, url: str) -> tuple[str, tempfile.TemporaryDirectory] | None:
-            """Download one CSV zip and return (csv_path, tmp_dir), or None on failure."""
+            """Download one CSV zip and return (csv_path, tmp_dir), or None on failure.
+
+            The executor call is wrapped in ``asyncio.wait_for`` because
+            ``requests.get(timeout=60)`` may never fire through a hung local
+            proxy — the asyncio wall is the reliable backstop. On timeout the
+            source is skipped (returns None) instead of blocking forever. The
+            orphaned executor thread keeps running in the background until the
+            process exits; it cannot stall the event loop.
+            """
             try:
-                csv_path, _tmp = await asyncio.get_event_loop().run_in_executor(
-                    None, self._download_single_csv, url, label
+                csv_path, _tmp = await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(
+                        None, self._download_single_csv, url, label
+                    ),
+                    timeout=self.csv_download_timeout,
                 )
                 return csv_path, _tmp
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Timed out downloading %s CSV after %.0fs "
+                    "(csv_download_timeout); skipping source",
+                    label, self.csv_download_timeout,
+                )
+                return None
             except GdeltDownloadError as exc:
                 logger.warning("Failed to download %s CSV: %s", label, exc)
                 return None
 
-        # Download all three concurrently
-        gkg_result, events_result, mentions_result = await asyncio.gather(
-            _do_one("gkg", gkg_url),
-            _do_one("events", events_url),
-            _do_one("mentions", mentions_url),
-        )
+        # Download all three concurrently, bounded by an overall timeout so a
+        # hung proxy can never stall the whole capture cycle. Per-CSV walls
+        # above already skip individual sources; this wall is the final safety
+        # net (e.g. executor starvation). On timeout we degrade to empty data.
+        try:
+            gkg_result, events_result, mentions_result = await asyncio.wait_for(
+                asyncio.gather(
+                    _do_one("gkg", gkg_url),
+                    _do_one("events", events_url),
+                    _do_one("mentions", mentions_url),
+                ),
+                timeout=self.total_download_timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Overall GDELT CSV download timed out after %.0fs "
+                "(total_download_timeout); skipping all CSV sources",
+                self.total_download_timeout,
+            )
+            return [], {}, []
 
         gkg_path = gkg_result[0] if gkg_result else None
         events_path = events_result[0] if events_result else None
