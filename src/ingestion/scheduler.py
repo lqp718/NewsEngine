@@ -181,6 +181,10 @@ class IngestionScheduler:
         dry_run: bool = False,
         source_filter: str | None = None,
         fetch_content: bool = False,
+        landing_enabled: bool | None = None,
+        capture_only: bool = False,
+        ingest_only: bool = False,
+        ingest_watch: bool = False,
     ) -> None:
         """Initialize scheduler and create all sub-components.
 
@@ -194,12 +198,35 @@ class IngestionScheduler:
             dry_run: When True, skip Graphiti/EpisodeWriter/Neo4j initialization.
             source_filter: Filter adapters ("gdelt", "rss", "akshare", "fred", "sanctions", "acled", "eia", "bls", None for all).
             fetch_content: When True, enable ContentFetcher for RSS (dry-run mode).
+            landing_enabled: JSON 持久化层开关（设计 json-persistence-layer.md）。
+                None 时取 settings.landing_enabled；capture_only/ingest_only 模式强制 True。
+            capture_only: --fetch-only 模式 — 只跑 Stage A（capture），不创建
+                graphiti/EpisodeWriter/IngestWorker（dry_run=False）。
+            ingest_only: --ingest-only 模式 — 只跑 Stage B（IngestWorker），
+                不创建 capture 适配器、不启动 Tier 循环。
+            ingest_watch: --ingest-only --watch — 只入库 + 常驻监听；False 时
+                drain 所有 pending 后退出（配合 drain_ingest()）。
         """
         self._dry_run = dry_run
         self._source_filter = source_filter
         self._fetch_content = fetch_content
+        self._capture_only = capture_only
+        self._ingest_only = ingest_only
+        self._ingest_watch = ingest_watch
 
         settings = get_settings()
+
+        # ── JSON 持久化层（landing zone）开关 ─────────────────────
+        if landing_enabled is not None:
+            self._landing_enabled = landing_enabled
+        elif capture_only or ingest_only:
+            self._landing_enabled = True
+        else:
+            self._landing_enabled = bool(getattr(settings, "landing_enabled", False))
+        self._landing_store: Any = None
+        self._ingest_worker: Any = None
+        self._ingest_task: asyncio.Task[None] | None = None
+        self._last_retention_date: str | None = None
 
         self._neo4j_driver = neo4j_driver
         self._graphiti = graphiti
@@ -271,20 +298,45 @@ class IngestionScheduler:
 
         One independent asyncio task is created per non-empty tier;
         each tier's first cycle runs immediately (no initial wait).
+
+        landing 开启时额外启动: 启动恢复（lease 复位 + 孤儿文件扫描，在
+        _lazy_init_components 内完成）+ 常驻 IngestWorker 任务（Stage B）。
+        ingest_only 模式不启动 Tier 循环（capture 禁用）。
         """
         if self._running:
             logger.warning("IngestionScheduler already running")
             return
 
         self._running = True
-        self._lazy_init_components()
-
         self._stop_event = asyncio.Event()
+        self._lazy_init_components()
+        if self._ingest_worker is not None:
+            self._ingest_worker.stop_event = self._stop_event
+
+        if self._ingest_only:
+            # ── Stage B only: 不建 Tier 循环 ────────────────────
+            if self._ingest_watch and self._ingest_worker is not None:
+                self._ingest_task = asyncio.create_task(self._ingest_worker.run())
+                logger.info("IngestWorker resident task started (--ingest-only --watch)")
+            else:
+                logger.info("Ingest-only mode: drain-once (call drain_ingest())")
+            logger.info("IngestionScheduler started: ingest-only mode (capture disabled)")
+            return
+
         self._tier_groups = self._build_tier_groups()
         self._tasks = {
             tier: asyncio.create_task(self._tier_loop(tier))
             for tier in sorted(self._tier_groups)
         }
+
+        # ── Stage B 常驻 ingest 任务（landing 开启时，设计 §2.1）──
+        if (
+            not self._dry_run
+            and not self._capture_only
+            and self._ingest_worker is not None
+        ):
+            self._ingest_task = asyncio.create_task(self._ingest_worker.run())
+            logger.info("IngestWorker resident task started (Stage B)")
 
         topology = ", ".join(
             "tier%d=[%s]@%ds"
@@ -301,7 +353,9 @@ class IngestionScheduler:
         """Graceful shutdown.
 
         Cancels all tier loop tasks and waits for them to finish — no
-        leftover scheduled coroutines.
+        leftover scheduled coroutines. 常驻 IngestWorker 任务先给优雅退出
+        机会（stop_event 置位，完成当前批），超时后强制取消 — 未完成的
+        行保持 processing，靠 lease 超时在下次启动恢复（设计 §4.4）。
         """
         self._running = False
         if self._stop_event is not None:
@@ -314,7 +368,31 @@ class IngestionScheduler:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
+        # ── IngestWorker 常驻任务 ────────────────────────────────
+        ingest = self._ingest_task
+        self._ingest_task = None
+        if ingest is not None and not ingest.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(ingest), timeout=5)
+            except asyncio.TimeoutError:
+                ingest.cancel()
+                try:
+                    await ingest
+                except asyncio.CancelledError:
+                    pass
+
         logger.info("IngestionScheduler stopped")
+
+    async def drain_ingest(self) -> None:
+        """--ingest-only（非 watch）: drain 所有 pending 后返回。
+
+        每轮循环体与常驻 run() 相同（含 lease 恢复 + failed 到期重试），
+        队列清空（无 pending、无到期可重试 failed）后退出。
+        """
+        if self._ingest_worker is None:
+            logger.warning("drain_ingest: IngestWorker not initialized")
+            return
+        await self._ingest_worker.drain()
 
     # ── Internal: RSS feed loading ─────────────────────────────────────
 
@@ -421,10 +499,15 @@ class IngestionScheduler:
         from src.adapters.akshare_adapter import AkShareAdapter
 
         # ── Resolve which sources to instantiate ───────────────────
-        sources = self._resolve_sources()
+        if self._ingest_only:
+            # ingest-only: 不创建任何 capture 适配器，只建 writer + landing
+            sources: set[str] = set()
+        else:
+            sources = self._resolve_sources()
 
-        # ── In normal mode, create Graphiti + EpisodeWriter ────────
-        if not self._dry_run:
+        # ── In ingest-only mode, create Graphiti + EpisodeWriter ──
+        # (fetch-only 模式不建 writer — capture 不需要 graphiti)
+        if not self._dry_run and not self._capture_only:
             from src.graphiti.episode_writer import EpisodeWriter
             from src.graphiti.entity_types import MACRO_ENTITY_TYPES, SYMBOL_ENTITY_TYPES
             from src.core.graphiti_client import create_graphiti
@@ -477,6 +560,62 @@ class IngestionScheduler:
                 batch_cooldown=5.0,
             )
             logger.info("ContentFetcher enabled for GDELT and RSS (network_idle=False)")
+
+        # ── JSON 持久化层（landing zone）: LandingStore + IngestWorker ──
+        if self._landing_enabled and not self._dry_run and not self._capture_only:
+            from src.persistence.ingest_worker import IngestWorker
+            from src.persistence.landing_store import LandingStore
+
+            lsettings = get_settings()
+            self._landing_store = LandingStore(
+                landing_dir=getattr(lsettings, "landing_dir", "data/landing"),
+            )
+            # ── 启动恢复（设计 §8.2/§8.3）: lease 复位 + 孤儿文件补登记 + .tmp 清理 ──
+            try:
+                recovered = self._landing_store.recover_leases()
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("landing recover_leases failed: %s", exc)
+                recovered = 0
+            try:
+                orphans = self._landing_store.scan_orphan_files()
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("landing scan_orphan_files failed: %s", exc)
+                orphans = 0
+            try:
+                tmp_count = self._landing_store.cleanup_tmp_files()
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("landing cleanup_tmp_files failed: %s", exc)
+                tmp_count = 0
+            if recovered or orphans or tmp_count:
+                logger.warning(
+                    "landing recovery: leases_reset=%d orphan_rows=%d tmp_files=%d",
+                    recovered,
+                    orphans,
+                    tmp_count,
+                )
+
+            self._ingest_worker = IngestWorker(
+                store=self._landing_store,
+                writer_resolver=self._resolve_writer,
+                batch_size=getattr(lsettings, "ingest_batch_size", 20),
+                poll_interval_sec=getattr(lsettings, "ingest_poll_interval_sec", 30),
+                lease_sec=getattr(lsettings, "ingest_lease_sec", 900),
+                max_attempts=getattr(lsettings, "ingest_max_attempts", 3),
+                pending_high_water=getattr(lsettings, "ingest_pending_high_water", 3000),
+            )
+            logger.info(
+                "Landing zone enabled: dir=%s store=%s worker=%s",
+                getattr(lsettings, "landing_dir", "data/landing"),
+                type(self._landing_store).__name__,
+                type(self._ingest_worker).__name__,
+            )
+        else:
+            logger.debug(
+                "Landing zone disabled (landing_enabled=%s, dry_run=%s, capture_only=%s)",
+                self._landing_enabled,
+                self._dry_run,
+                self._capture_only,
+            )
 
         # ── Macro pipeline: GDELT uses macro theme keywords (not tickers) ──
         if "gdelt" in sources:
@@ -666,6 +805,9 @@ class IngestionScheduler:
                 if tier == 1:
                     # V2.2: TTL cleanup at start of each cycle (daily guard inside)
                     await self._ttl_cleanup()
+                elif tier == 4:
+                    # json-persistence-layer §5.1: landing 保留期清理（每日一次，内部 date guard）
+                    await self._retention_sweep()
 
                 results = await self._run_tier_cycle(tier)
                 await self._log_cycle_summary(tier, results, cycle_start)
@@ -1176,27 +1318,65 @@ class IngestionScheduler:
         )
         return results
 
-    # ── Dry-run cycle (one-shot) ──────────────────────────────────────────
+    # ── Landing zone: writer resolver / retention (json-persistence-layer) ──
 
-    async def run_dry_cycle(self) -> list[PipelineResult]:
-        """Execute one-shot dry-run pipeline.
+    # 个股管线（SYMBOL_ENTITY_TYPES）源类型集合；其余（宏/宏观管线）走 macro writer。
+    _SYMBOL_WRITER_SOURCES: frozenset[str] = frozenset(
+        {
+            "akshare",
+            "eastmoney",
+            "cls_telegraph",
+            "cninfo_announcement",
+            "eastmoney_research",
+        }
+    )
 
-        Runs all instantiated adapters sequentially (not concurrently for
-        simplicity), skips TTL cleanup, severity enrichment, and briefing
-        aggregation.
+    def _resolve_writer(self, source_type: str) -> Any:
+        """按 source_type 返回 EpisodeWriter（宏/个股管线使用不同 entity_types）。
 
-        Returns:
-            List of PipelineResult with episodes populated.
+        IngestWorker 的 writer_resolver：landed_episodes.source_type 来自
+        NormalizedEpisode.source_type（如 gdelt_csv / rss / cls_telegraph），
+        个体股链路的 episode 走 symbol writer，其余走 macro writer。
         """
-        self._lazy_init_components()
+        if source_type in self._SYMBOL_WRITER_SOURCES:
+            return self._symbol_writer
+        return self._macro_writer
 
-        # Load ticker whitelist for EastMoney & AkShare (same as normal cycle)
-        tickers = get_ticker_whitelist(self._whitelist_path)
-        if tickers:
-            self._update_adapter_tickers(tickers)
-            logger.info("Dry-run: loaded %d tickers", len(tickers))
+    async def _retention_sweep(self) -> int:
+        """Landing 保留期清理（每日一次，挂靠 Tier 4 周期循环，设计 §5.1）。
 
-        results: list[PipelineResult] = []
+        只删除过期 done/skipped/dead 行 + 对应 JSONL；pending/processing/failed
+        永不自动清理（未入库数据不丢）。返回删除的行数。
+        """
+        if self._landing_store is None:
+            return 0
+        settings = get_settings()
+        today = now_hkt().strftime("%Y-%m-%d")
+        if self._last_retention_date == today:
+            return 0
+        self._last_retention_date = today
+        retention_days = getattr(settings, "landing_retention_days", 14)
+        try:
+            deleted = self._landing_store.retention_sweep(retention_days=retention_days)
+            if deleted:
+                logger.info(
+                    "Retention sweep: removed %d done/skipped/dead row(s) older than %d days",
+                    deleted,
+                    retention_days,
+                )
+            return deleted
+        except Exception as exc:
+            logger.warning("Retention sweep failed (non-critical): %s", exc, exc_info=True)
+            return 0
+
+    # ── Dry-run / fetch-only cycle (one-shot) ──────────────────────────
+
+    def _collect_run_units(self) -> list[tuple[Any, str]]:
+        """收集一次性 cycle（dry-run / fetch-only capture）要跑的 adapter 单元。
+
+        返回 ``(adapter, source_name)`` 列表；source_name 用于 ticker 门控与
+        CLS→EastMoney→AkShare 回退链决策（与 run_dry_cycle 原有逻辑一致）。
+        """
         adapters_to_run: list[tuple[Any, str]] = []
 
         if self._gdelt_adapter is not None:
@@ -1230,42 +1410,71 @@ class IngestionScheduler:
         elif self._akshare_adapter is not None:
             # Neither CLS nor EastMoney configured, use AkShare
             adapters_to_run.append((self._akshare_adapter, "akshare"))
-        
+
         # V6.2: CNInfo announcements (Phase 2) - supplementary source
         if self._cninfo_adapter is not None:
             adapters_to_run.append((self._cninfo_adapter, "cninfo"))
-        
+
         # V6.3: EastMoney research reports (Phase 3) - supplementary source
         if self._eastmoney_research_adapter is not None:
             adapters_to_run.append((self._eastmoney_research_adapter, "eastmoney_research"))
 
-        if not adapters_to_run:
-            logger.warning("Dry-run: no adapters to run (all skipped by source_filter)")
+        return adapters_to_run
+
+    async def _run_units_sequential(
+        self,
+        units: list[tuple[Any, str]],
+        tickers: list[dict[str, str]],
+        *,
+        mode: str,
+    ) -> list[PipelineResult]:
+        """串行跑一次性 cycle 的 adapter 列表（dry-run / fetch-only 共用）。
+
+        包含原有 CLS→EastMoney→AkShare 动态回退逻辑：CLS 失败时追加 EastMoney，
+        EastMoney 失败时追加 AkShare；CLS/EastMoney 成功时跳过回退链。
+
+        Args:
+            units: ``(adapter, source_name)`` 列表。
+            tickers: ticker 白名单（个股链路传入）。
+            mode: "dry_run" 或 "capture"（fetch-only，Stage A 落盘 landing）。
+        """
+        dry_run = mode == "dry_run"
+        results: list[PipelineResult] = []
+
+        if not units:
+            logger.warning("%s: no adapters to run (all skipped by source_filter)", mode)
             return results
 
         logger.warning(
-            "=== Dry-run cycle starting: %d adapter(s) ===",
-            len(adapters_to_run),
+            "=== %s cycle starting: %d adapter(s) ===",
+            mode,
+            len(units),
         )
 
         # Use index-based loop to support dynamic fallback (appending AkShare if EastMoney fails)
         idx = 0
-        while idx < len(adapters_to_run):
-            adapter, source_name = adapters_to_run[idx]
+        while idx < len(units):
+            adapter, source_name = units[idx]
             idx += 1
             source_type = getattr(adapter, "SOURCE_TYPE", source_name)
-            logger.info("Dry-run: running %s...", source_type)
+            logger.info("%s: running %s...", mode, source_type)
             try:
                 result = await run_pipeline(
                     adapter=adapter,
                     writer=None,
-                    tickers=tickers if source_name in ("akshare", "eastmoney", "cls", "cninfo", "eastmoney_research") else None,
-                    dry_run=True,
+                    tickers=(
+                        tickers
+                        if source_name in ("akshare", "eastmoney", "cls", "cninfo", "eastmoney_research")
+                        else None
+                    ),
+                    dry_run=dry_run,
+                    landing_store=None if dry_run else self._landing_store,
                 )
                 results.append(result)
                 if result.success:
                     logger.info(
-                        "Dry-run [%s]: %d episodes in %.1fs",
+                        "%s [%s]: %d episodes in %.1fs",
+                        mode,
                         source_type,
                         result.episode_count,
                         result.elapsed_seconds,
@@ -1275,18 +1484,19 @@ class IngestionScheduler:
                     if source_name == "cls" and result.episode_count > 0:
                         logger.info("CLS returned %d episodes, skipping EastMoney/AkShare fallback", result.episode_count)
                         # Skip only the fallback chain, not supplementary sources
-                        while idx < len(adapters_to_run) and adapters_to_run[idx][1] in ("eastmoney", "akshare"):
+                        while idx < len(units) and units[idx][1] in ("eastmoney", "akshare"):
                             idx += 1
                         continue  # Continue to run CNInfo and EastMoney Research
                     if source_name == "eastmoney" and result.episode_count > 0:
                         logger.info("EastMoney returned %d episodes, skipping AkShare fallback", result.episode_count)
                         # Skip only AkShare fallback
-                        while idx < len(adapters_to_run) and adapters_to_run[idx][1] == "akshare":
+                        while idx < len(units) and units[idx][1] == "akshare":
                             idx += 1
                         continue
                 else:
                     logger.error(
-                        "Dry-run [%s]: FAILED after %.1fs: %s",
+                        "%s [%s]: FAILED after %.1fs: %s",
+                        mode,
                         source_type,
                         result.elapsed_seconds,
                         result.error,
@@ -1294,14 +1504,15 @@ class IngestionScheduler:
                     # CLS failed, try EastMoney fallback
                     if source_name == "cls" and self._eastmoney_adapter is not None:
                         logger.info("CLS failed, falling back to EastMoney")
-                        adapters_to_run.append((self._eastmoney_adapter, "eastmoney"))
+                        units.append((self._eastmoney_adapter, "eastmoney"))
                     # EastMoney failed, try AkShare fallback
                     elif source_name == "eastmoney" and self._akshare_adapter is not None:
                         logger.info("EastMoney failed, falling back to AkShare")
-                        adapters_to_run.append((self._akshare_adapter, "akshare"))
+                        units.append((self._akshare_adapter, "akshare"))
             except Exception as exc:
                 logger.error(
-                    "Dry-run [%s] threw unhandled exception: %s",
+                    "%s [%s] threw unhandled exception: %s",
+                    mode,
                     source_type,
                     exc,
                     exc_info=True,
@@ -1316,19 +1527,73 @@ class IngestionScheduler:
                 # CLS threw exception, try EastMoney fallback
                 if source_name == "cls" and self._eastmoney_adapter is not None:
                     logger.info("CLS threw exception, falling back to EastMoney")
-                    adapters_to_run.append((self._eastmoney_adapter, "eastmoney"))
+                    units.append((self._eastmoney_adapter, "eastmoney"))
                 # EastMoney threw exception, try AkShare fallback
                 elif source_name == "eastmoney" and self._akshare_adapter is not None:
                     logger.info("EastMoney threw exception, falling back to AkShare")
-                    adapters_to_run.append((self._akshare_adapter, "akshare"))
+                    units.append((self._akshare_adapter, "akshare"))
 
         logger.warning(
-            "=== Dry-run cycle complete: %d/%d adapters successful ===",
+            "=== %s cycle complete: %d/%d adapters successful ===",
+            mode,
             sum(1 for r in results if r.success),
             len(results),
         )
 
         return results
+
+    async def run_dry_cycle(self) -> list[PipelineResult]:
+        """Execute one-shot dry-run pipeline.
+
+        Runs all instantiated adapters sequentially (not concurrently for
+        simplicity), skips TTL cleanup, severity enrichment, and briefing
+        aggregation.
+
+        Returns:
+            List of PipelineResult with episodes populated.
+        """
+        self._lazy_init_components()
+
+        # Load ticker whitelist for EastMoney & AkShare (same as normal cycle)
+        tickers = get_ticker_whitelist(self._whitelist_path)
+        if tickers:
+            self._update_adapter_tickers(tickers)
+            logger.info("Dry-run: loaded %d tickers", len(tickers))
+
+        return await self._run_units_sequential(
+            self._collect_run_units(),
+            tickers,
+            mode="dry_run",
+        )
+
+    async def run_capture_cycle(self) -> list[PipelineResult]:
+        """Execute one-shot Stage A capture (--fetch-only).
+
+        与 run_dry_cycle 相同的 adapter 编排（含 CLS→EastMoney→AkShare 回退
+        链），但 Stage 2 走 ``landing_store.capture_batch``（写 JSONL + 登记
+        pending）。不初始化 graphiti/Neo4j、不启动 IngestWorker（scheduler
+        以 capture_only 模式构造，_landing_store 已就绪）。
+
+        Returns:
+            List of PipelineResult（episode_count = 落盘 episode 数）。
+        """
+        self._lazy_init_components()
+
+        if self._landing_store is None:
+            logger.error("capture cycle: landing store not initialized (mode error)")
+            return []
+
+        # Load ticker whitelist for EastMoney & AkShare (same as normal cycle)
+        tickers = get_ticker_whitelist(self._whitelist_path)
+        if tickers:
+            self._update_adapter_tickers(tickers)
+            logger.info("Fetch-only: loaded %d tickers", len(tickers))
+
+        return await self._run_units_sequential(
+            self._collect_run_units(),
+            tickers,
+            mode="capture",
+        )
 
     # ── Logging ─────────────────────────────────────────────────────────
 

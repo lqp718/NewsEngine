@@ -257,6 +257,44 @@ class Settings(BaseSettings):
         description="相邻 ingestion cycle 之间的最小冷却间隔（秒）。默认 60 秒，设为 0 可禁用。",
     )
 
+    # === JSON 持久化层 (json-persistence-layer) ===
+    landing_enabled: bool = Field(
+        True,
+        description=(
+            "JSON 持久化层总开关（Phase 3 默认开启）。True 时 Stage2 走 "
+            "landing_store.capture_batch（先落盘 JSONL + 登记 pending），"
+            "由 IngestWorker 异步入库；False 时回退旧 write_batch 直写路径。"
+        ),
+    )
+    landing_dir: str = Field(
+        "data/landing",
+        description="landing 根目录（JSONL 按日分区 + state.db 状态库）。",
+    )
+    landing_retention_days: int = Field(
+        14,
+        description="JSONL + done/skipped/dead 行保留天数（pending/failed 永不自动清理）。",
+    )
+    ingest_batch_size: int = Field(
+        20,
+        description="IngestWorker 每轮认领行数。",
+    )
+    ingest_poll_interval_sec: int = Field(
+        30,
+        description="IngestWorker 队列空时的轮询间隔（秒）。",
+    )
+    ingest_lease_sec: int = Field(
+        900,
+        description="IngestWorker 认领 lease 超时（秒），须 > write_one 最坏耗时（429 退避）。",
+    )
+    ingest_max_attempts: int = Field(
+        3,
+        description="失败重试上限，超限转 dead（人工介入 --retry-dead）。",
+    )
+    ingest_pending_high_water: int = Field(
+        3000,
+        description="pending 高水位告警阈值。",
+    )
+
     model_config = SettingsConfigDict(
         env_file=str(PROJECT_ROOT / ".env"),
         env_file_encoding="utf-8",
@@ -281,6 +319,21 @@ class Settings(BaseSettings):
     @classmethod
     def validate_ingestion_intervals(cls, v: int, info: ValidationInfo) -> int:
         """Validate that all ingestion cycle intervals are > 0."""
+        if v <= 0:
+            raise ValueError(f"{info.field_name} 必须 > 0")
+        return v
+
+    @field_validator(
+        "landing_retention_days",
+        "ingest_batch_size",
+        "ingest_poll_interval_sec",
+        "ingest_lease_sec",
+        "ingest_max_attempts",
+        "ingest_pending_high_water",
+    )
+    @classmethod
+    def validate_landing_settings(cls, v: int, info: ValidationInfo) -> int:
+        """Validate that landing/ingest settings are positive."""
         if v <= 0:
             raise ValueError(f"{info.field_name} 必须 > 0")
         return v

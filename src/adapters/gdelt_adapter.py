@@ -1498,17 +1498,11 @@ class GdeltAdapter(BaseAdapter):
             ],
         )
 
-        # Cap episodes per cycle: after a DB rebuild GDELT can return hundreds
-        # of episodes (~7.7s/ep processing ≈ 40+ min), far exceeding the ~900s
-        # scheduler cycle. Truncate BEFORE dedup so truncated episodes are not
-        # marked as seen and will be re-processed in the next cycle.
-        MAX_EPISODES_PER_CYCLE = 80
-        if len(episodes) > MAX_EPISODES_PER_CYCLE:
-            logger.warning(
-                "GDELT returned %d episodes, truncating to %d (rest will be processed in next cycle)",
-                len(episodes), MAX_EPISODES_PER_CYCLE,
-            )
-            episodes = episodes[:MAX_EPISODES_PER_CYCLE]
+        # Phase 3 (json-persistence-layer): 不再截断 episode。
+        # 设计 §2.3: capture 阶段把所有 episode 落盘（LandingStore 写 JSONL +
+        # 登记 pending），入库由独立 IngestWorker 后台消化（~7.7s/ep 串行），
+        # 截断的历史假设（下个 cycle 会重试被截断的 episode）对 GDELT 窗口式
+        # 源不成立 — 旧数据已随 15 分钟窗口滑走，截断即永久丢弃。
 
         episodes = self.dedup(list(episodes))
 

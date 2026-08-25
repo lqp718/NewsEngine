@@ -72,21 +72,26 @@ async def run_pipeline(
     writer: Any,
     tickers: list[dict[str, str]] | None = None,
     dry_run: bool = False,
+    landing_store: Any = None,
 ) -> PipelineResult:
     """Run a full pipeline cycle for one adapter.
 
     Stages:
         1. adapter.run(tickers=tickers) → fetch → normalize → dedup (filter-only)
-        2. EpisodeWriter.write_batch(episodes) if any episodes (skipped in dry-run);
-           only successfully-written episodes are registered into the adapter's
-           dedup_cache (P0-1: failed writes are retried next cycle)
+        2. Landing zone 开启时（landing_store 非 None）: Stage 2 改为
+           ``landing_store.capture_batch``（Stage A: 写 JSONL + 登记 pending，
+           设计文档 json-persistence-layer.md §2.3）；否则保持
+           ``EpisodeWriter.write_batch`` 直写路径。只有实际落盘/写入的
+           episode 才登记进 adapter 的 dedup_cache（P0-1: 失败写入下个 cycle 重试）。
         3. Update health metadata (skipped in dry-run)
 
     Args:
         adapter: Data source adapter instance.
-        writer: EpisodeWriter instance (None in dry-run mode).
+        writer: EpisodeWriter instance (None in dry-run mode / landing mode).
         tickers: Optional ticker whitelist.
         dry_run: When True, skip write_batch and health tracking, return episodes.
+        landing_store: LandingStore instance（JSON 持久化层）；非 None 时
+            Stage 2 走 capture_batch（Stage A），writer 被忽略。
 
     Returns:
         PipelineResult with outcome, health (None in dry-run), and episodes (dry-run).
@@ -126,6 +131,24 @@ async def run_pipeline(
                 episode_count,
                 pre_filter,
                 result.filtered_count,
+            )
+        elif landing_store is not None:
+            # Stage A（JSON 持久化层）: 写 JSONL（原子 tmp+rename）+ 登记
+            # SQLite pending。INSERT OR IGNORE（content_hash PK）是权威去重，
+            # 内存 dedup_cache 降级为 capture 阶段快速路径（设计 §2.3）。
+            record = landing_store.capture_batch(episodes, source_type)
+            episode_count = record.total
+            if record.new_rows + record.dup_rows > 0:
+                # 已落盘（含跨 cycle 去重命中的重复行）→ 登记内存去重缓存，
+                # 避免下个 cycle 重复抓取/重复写文件；INSERT OR IGNORE 兜底。
+                _mark_written(adapter, episodes)
+            logger.info(
+                "pipeline [%s]: landed %d episodes (new=%d, dup=%d, file=%s)",
+                source_type,
+                record.total,
+                record.new_rows,
+                record.dup_rows,
+                record.batch_file,
             )
         elif episodes:
             write_result = await writer.write_batch(episodes)

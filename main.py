@@ -464,6 +464,159 @@ async def main_dry_run(args: argparse.Namespace) -> None:
     sys.exit(0)
 
 
+async def main_fetch_only(args: argparse.Namespace) -> None:
+    """Stage A only: fetch → normalize → dedup → write JSONL + register pending."""
+    try:
+        settings = get_settings()
+    except Exception as exc:
+        print(f"CRITICAL: Config loading failed: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    setup_logging(level=settings.log_level, log_file=settings.log_file)
+    logger = get_logger(__name__)
+    logger.info("=== NewsEngine fetch-only mode (Stage A capture) ===")
+
+    scheduler = IngestionScheduler(
+        dry_run=False,
+        source_filter=args.source,
+        fetch_content=args.fetch_content,
+        capture_only=True,
+    )
+
+    try:
+        results = await scheduler.run_capture_cycle()
+    finally:
+        if scheduler._landing_store is not None:
+            scheduler._landing_store.close()
+
+    # Print summary
+    print()
+    print("=== FETCH-ONLY SUMMARY (Stage A capture) ===")
+    print(f"{'Source':<12} {'Fetched':<9} {'Landed':<9} {'Time':<6}")
+    total_landed = 0
+    total_time = 0.0
+    for r in results:
+        elapsed = r.elapsed_seconds
+        total_time += elapsed
+        landed = r.episode_count if r.success else 0
+        total_landed += landed
+        status = "OK" if r.success else "ERROR"
+        print(f"{r.source_type:<12} {r.fetch_count or r.episode_count:<9} {landed:<9} {elapsed:.1f}s [{status}]")
+    print(f"{'---':<12} {'---':<9} {'---':<9} {'---':<6}")
+    print(f"{'TOTAL':<12} {'':<9} {total_landed:<9} {total_time:.1f}s")
+    print()
+
+    logger.info("=== Fetch-only complete ===")
+    sys.exit(0)
+
+
+async def main_ingest_only(args: argparse.Namespace) -> None:
+    """Stage B only: consume pending → write_one → Neo4j."""
+    try:
+        settings = get_settings()
+    except Exception as exc:
+        print(f"CRITICAL: Config loading failed: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    setup_logging(level=settings.log_level, log_file=settings.log_file)
+    logger = get_logger(__name__)
+    logger.info("=== NewsEngine ingest-only mode (Stage B) ===")
+
+    from src.core.neo4j_client import get_neo4j_driver
+    driver = get_neo4j_driver()
+
+    scheduler = IngestionScheduler(
+        neo4j_driver=driver,
+        ingest_only=True,
+        ingest_watch=args.watch,
+    )
+    await scheduler.start()
+
+    if args.watch:
+        # Resident mode: wait for signal
+        import signal
+        loop = asyncio.get_running_loop()
+        def _on_signal(sig):
+            logger.warning("Received %s — stopping ingest watch", signal.Signals(sig).name)
+            asyncio.ensure_future(scheduler.stop())
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, lambda s=sig: _on_signal(s))
+            except (NotImplementedError, ValueError):
+                pass
+        # Wait for ingest task
+        if scheduler._ingest_task is not None:
+            try:
+                await scheduler._ingest_task
+            except asyncio.CancelledError:
+                pass
+        await scheduler.stop()
+    else:
+        # Drain mode: consume all pending then exit
+        await scheduler.drain_ingest()
+        await scheduler.stop()
+
+    logger.info("=== Ingest-only complete ===")
+    sys.exit(0)
+
+
+async def main_replay(args: argparse.Namespace) -> None:
+    """Reset done/skipped to pending for re-ingestion."""
+    from src.core.config import get_settings
+    from src.persistence.landing_store import LandingStore
+    settings = get_settings()
+    store = LandingStore(landing_dir=settings.landing_dir)
+    try:
+        if args.replay_all:
+            count = store.replay()  # No filters = all done/skipped
+        else:
+            source = args.source if args.source != "all" else None
+            count = store.replay(since=args.since, until=args.until, source_type=source)
+        print(f"Replay: {count} episode(s) reset to pending")
+    finally:
+        store.close()
+
+
+async def main_retry_dead(args: argparse.Namespace) -> None:
+    """Reset dead → pending with attempts=0."""
+    from src.core.config import get_settings
+    from src.persistence.landing_store import LandingStore
+    settings = get_settings()
+    store = LandingStore(landing_dir=settings.landing_dir)
+    try:
+        count = store.retry_dead()
+        print(f"Retry-dead: {count} episode(s) reset to pending")
+    finally:
+        store.close()
+
+
+async def main_stats(args: argparse.Namespace) -> None:
+    """Print landing zone statistics."""
+    import json
+    from src.core.config import get_settings
+    from src.persistence.landing_store import LandingStore
+    settings = get_settings()
+    store = LandingStore(landing_dir=settings.landing_dir)
+    try:
+        stats = store.stats()
+        print(json.dumps(stats, indent=2, ensure_ascii=False))
+    finally:
+        store.close()
+
+
+async def main_rebuild_index(args: argparse.Namespace) -> None:
+    """Rebuild SQLite index from JSONL files."""
+    from src.core.config import get_settings
+    from src.persistence.landing_store import LandingStore
+    settings = get_settings()
+    store = LandingStore(landing_dir=settings.landing_dir)
+    try:
+        result = store.rebuild_index()
+        print(f"Rebuild-index: {result}")
+    finally:
+        store.close()
+
+
 def _print_dry_run_summary(
     results: list[PipelineResult],
     output_path: str,
@@ -536,9 +689,78 @@ if __name__ == "__main__":
         help="Enable ContentFetcher for RSS article body enrichment (dry-run mode)",
     )
 
+    # ── JSON 持久化层 CLI（设计文档 json-persistence-layer.md §6）──
+    parser.add_argument(
+        "--fetch-only",
+        action="store_true",
+        help="只跑 Stage A（capture）: 抓取 → 写 JSONL + 登记 pending，不初始化 graphiti/Neo4j/IngestWorker",
+    )
+    parser.add_argument(
+        "--ingest-only",
+        action="store_true",
+        help="只跑 Stage B（ingest）: 消费 pending 写入 Neo4j；不带 --watch 时 drain 后退出",
+    )
+    parser.add_argument(
+        "--watch",
+        action="store_true",
+        help="常驻监听（与 --ingest-only 搭配: 只入库 + 持续消费新 pending）",
+    )
+    parser.add_argument(
+        "--replay",
+        action="store_true",
+        help="把指定范围 done/skipped 复位为 pending 重新入库（配 --source/--since/--until）",
+    )
+    parser.add_argument(
+        "--replay-all",
+        action="store_true",
+        help="全部复位重放（清库重建场景，忽略 --source/--since/--until）",
+    )
+    parser.add_argument(
+        "--retry-dead",
+        action="store_true",
+        help="dead → pending 且 attempts=0（人工确认后恢复）",
+    )
+    parser.add_argument(
+        "--stats",
+        action="store_true",
+        help="打印按 status/source/日期分组的计数（审计）",
+    )
+    parser.add_argument(
+        "--rebuild-index",
+        action="store_true",
+        help="扫描所有 JSONL 重建 SQLite 索引（DB 损坏恢复，--stats 前建议先跑）",
+    )
+    parser.add_argument(
+        "--since",
+        default=None,
+        help="--replay 起始时间（YYYY-MM-DD 或 ISO 8601，UTC）",
+    )
+    parser.add_argument(
+        "--until",
+        default=None,
+        help="--replay 截止时间（YYYY-MM-DD 或 ISO 8601，UTC，不含当日）",
+    )
+
     parsed_args = parser.parse_args()
 
-    if parsed_args.dry_run:
+    # ── 模式优先级: 持久化层运维 > 采集/入库 > dry-run > 常驻 ──
+    if parsed_args.fetch_only:
+        if parsed_args.watch:
+            parser.error("--watch 仅与 --ingest-only 搭配")
+        asyncio.run(main_fetch_only(parsed_args))
+    elif parsed_args.ingest_only:
+        asyncio.run(main_ingest_only(parsed_args))
+    elif parsed_args.replay or parsed_args.replay_all:
+        if parsed_args.replay_all and (parsed_args.since or parsed_args.until or parsed_args.source != "all"):
+            print("WARNING: --replay-all 忽略 --source/--since/--until（全部复位）", file=sys.stderr)
+        asyncio.run(main_replay(parsed_args))
+    elif parsed_args.retry_dead:
+        asyncio.run(main_retry_dead(parsed_args))
+    elif parsed_args.stats:
+        asyncio.run(main_stats(parsed_args))
+    elif parsed_args.rebuild_index:
+        asyncio.run(main_rebuild_index(parsed_args))
+    elif parsed_args.dry_run:
         asyncio.run(main_dry_run(parsed_args))
     else:
         asyncio.run(main())
