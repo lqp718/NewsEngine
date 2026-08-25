@@ -383,6 +383,25 @@ class IngestionScheduler:
 
         logger.info("IngestionScheduler stopped")
 
+        # CR P2-5: 任务全部结束后释放落地资源（LandingStore SQLite 连接）
+        await self.close()
+
+    async def close(self) -> None:
+        """释放落地资源（LandingStore SQLite 连接等），幂等。
+
+        stop() 负责取消任务；close() 负责关闭资源。--fetch-only /
+        --ingest-only 退出路径应显式调用（main_fetch_only / main_ingest_only），
+        stop() 末尾也会调用一次（重复调用安全）。
+        """
+        if self._landing_store is None:
+            return
+        store, self._landing_store = self._landing_store, None
+        try:
+            store.close()
+            logger.info("LandingStore closed")
+        except Exception as exc:
+            logger.warning("LandingStore close failed: %s", exc)
+
     async def drain_ingest(self) -> None:
         """--ingest-only（非 watch）: drain 所有 pending 后返回。
 
@@ -813,8 +832,9 @@ class IngestionScheduler:
                 if tier == 1:
                     # V2.2: TTL cleanup at start of each cycle (daily guard inside)
                     await self._ttl_cleanup()
-                elif tier == 4:
-                    # json-persistence-layer §5.1: landing 保留期清理（每日一次，内部 date guard）
+                    # json-persistence-layer §5.1: landing 保留期清理（每日一次，
+                    # 内部 date guard）。CR P2-3: 挂靠 Tier 1 而非 Tier 4 ——
+                    # Tier 4 可能因无适配器/source_filter 而无循环，永远不执行。
                     await self._retention_sweep()
 
                 results = await self._run_tier_cycle(tier)
@@ -1351,8 +1371,10 @@ class IngestionScheduler:
         return self._macro_writer
 
     async def _retention_sweep(self) -> int:
-        """Landing 保留期清理（每日一次，挂靠 Tier 4 周期循环，设计 §5.1）。
+        """Landing 保留期清理（每日一次，挂靠 Tier 1 周期循环，设计 §5.1）。
 
+        CR P2-3: 原挂靠 Tier 4 —— 部分配置（source_filter / 适配器缺失）下
+        Tier 4 无循环，retention 永不执行。Tier 1 在所有正常配置下都存在。
         只删除过期 done/skipped/dead 行 + 对应 JSONL；pending/processing/failed
         永不自动清理（未入库数据不丢）。返回删除的行数。
         """

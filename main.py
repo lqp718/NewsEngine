@@ -486,8 +486,8 @@ async def main_fetch_only(args: argparse.Namespace) -> None:
     try:
         results = await scheduler.run_capture_cycle()
     finally:
-        if scheduler._landing_store is not None:
-            scheduler._landing_store.close()
+        # CR P2-5: 通过 scheduler.close() 关闭 LandingStore，而非直取私有属性
+        await scheduler.close()
 
     # Print summary
     print()
@@ -555,6 +555,9 @@ async def main_ingest_only(args: argparse.Namespace) -> None:
         # Drain mode: consume all pending then exit
         await scheduler.drain_ingest()
         await scheduler.stop()
+
+    # CR P2-5: 显式释放落地资源（stop() 末尾也会调用，幂等）
+    await scheduler.close()
 
     logger.info("=== Ingest-only complete ===")
     sys.exit(0)
@@ -743,10 +746,16 @@ if __name__ == "__main__":
 
     parsed_args = parser.parse_args()
 
+    # ── CLI 互斥/依赖校验（CR P2-4）──────────────────────────────────
+    if parsed_args.fetch_only and parsed_args.ingest_only:
+        parser.error("--fetch-only and --ingest-only are mutually exclusive")
+    if parsed_args.watch and not parsed_args.ingest_only:
+        parser.error("--watch requires --ingest-only")
+    if parsed_args.replay and parsed_args.replay_all:
+        parser.error("--replay and --replay-all are mutually exclusive")
+
     # ── 模式优先级: 持久化层运维 > 采集/入库 > dry-run > 常驻 ──
     if parsed_args.fetch_only:
-        if parsed_args.watch:
-            parser.error("--watch 仅与 --ingest-only 搭配")
         asyncio.run(main_fetch_only(parsed_args))
     elif parsed_args.ingest_only:
         asyncio.run(main_ingest_only(parsed_args))

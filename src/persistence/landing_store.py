@@ -160,6 +160,13 @@ class LandingStore:
             self._lease_owner,
         )
 
+    # ── identity ─────────────────────────────────────────────────────
+
+    @property
+    def lease_owner(self) -> str:
+        """本进程认领者标识（claim 时写入 lease_owner，状态机回写时校验归属）。"""
+        return self._lease_owner
+
     # ── schema ────────────────────────────────────────────────────────
 
     def _init_schema(self) -> None:
@@ -273,7 +280,10 @@ class LandingStore:
                     (
                         ep.content_hash,
                         ep.name,
-                        source_type,
+                        # CR P2-6: 按行取 NormalizedEpisode.source_type
+                        # （如 gdelt_csv / gdelt_events），而非统一标 batch 级
+                        # source_type——孤儿扫描/写入路由都按行口径消费。
+                        ep.source_type or source_type,
                         rel_path,
                         line_no,
                         _to_iso(ep.valid_at),
@@ -394,54 +404,89 @@ class LandingStore:
             for r in rows
         ]
 
-    def complete(self, content_hash: str, ingested_at: datetime | None = None) -> None:
-        """processing → done（write_one 返回 ok）。"""
+    def complete(
+        self,
+        content_hash: str,
+        lease_owner: str,
+        ingested_at: datetime | None = None,
+    ) -> int:
+        """processing → done（write_one 返回 ok）。
+
+        CR P1-2: 回写必须校验 lease 归属（WHERE lease_owner=? AND
+        status='processing'），防止并发进程/租约复位后把已被接管的行误标成功。
+
+        Returns:
+            受影响行数；0 = 归属不匹配或行已不处于 processing（调用方应记
+            warning 且不继续处理）。
+        """
         now = _to_iso(ingested_at or _now_utc())
-        self._conn.execute(
+        cur = self._conn.execute(
             """
             UPDATE landed_episodes
             SET status='done', ingested_at=?, last_error=NULL,
                 lease_owner=NULL, lease_expires=NULL, updated_at=?
-            WHERE content_hash=?
+            WHERE content_hash=? AND lease_owner=? AND status='processing'
             """,
-            (now, now, content_hash),
+            (now, now, content_hash, lease_owner),
         )
+        return cur.rowcount
 
-    def skip(self, content_hash: str, ingested_at: datetime | None = None) -> None:
-        """processing → skipped（write_one 返回 skipped_duplicate），视同完成。"""
+    def skip(
+        self,
+        content_hash: str,
+        lease_owner: str,
+        ingested_at: datetime | None = None,
+    ) -> int:
+        """processing → skipped（write_one 返回 skipped_duplicate），视同完成。
+
+        CR P1-2: 同 complete()，带 lease 归属校验，防止并发双写。
+
+        Returns:
+            受影响行数；0 = 归属不匹配或行已不处于 processing。
+        """
         now = _to_iso(ingested_at or _now_utc())
-        self._conn.execute(
+        cur = self._conn.execute(
             """
             UPDATE landed_episodes
             SET status='skipped', ingested_at=?, last_error=NULL,
                 lease_owner=NULL, lease_expires=NULL, updated_at=?
-            WHERE content_hash=?
+            WHERE content_hash=? AND lease_owner=? AND status='processing'
             """,
-            (now, now, content_hash),
+            (now, now, content_hash, lease_owner),
         )
+        return cur.rowcount
 
     def fail(
         self,
         content_hash: str,
+        lease_owner: str,
         error: str | None = None,
         max_attempts: int = 3,
-    ) -> None:
+    ) -> int:
         """processing → failed（attempts++）；attempts >= max → dead。
 
         设计 §4.4: write_one 内部重试保持（429 退避/熔断）；本方法只处理
         「write_one 最终仍失败」的情况。行级重试由 ``retry_failed`` 按退避
         周期移回 pending。
+
+        CR P1-2: 带 lease 归属校验（WHERE lease_owner=? AND
+        status='processing'），归属不匹配时返回 0 且不推进 attempts/dead。
+
+        Returns:
+            受影响行数；0 = 归属不匹配（调用方应记 warning 不处理）。
         """
         now = _now_iso()
-        self._conn.execute(
+        cur = self._conn.execute(
             """
             UPDATE landed_episodes
             SET status='failed', attempts=attempts+1, last_error=?,
                 lease_owner=NULL, lease_expires=NULL, updated_at=?
-            WHERE content_hash=?
+            WHERE content_hash=? AND lease_owner=? AND status='processing'
             """,
-            (error, now, content_hash),
+            (error, now, content_hash, lease_owner),
         )
+        if cur.rowcount == 0:
+            return 0
         row = self._conn.execute(
             "SELECT attempts FROM landed_episodes WHERE content_hash=?", (content_hash,)
         ).fetchone()
@@ -456,6 +501,7 @@ class LandingStore:
                 row[0],
                 max_attempts,
             )
+        return cur.rowcount
 
     # ── recovery ──────────────────────────────────────────────────────
 
@@ -547,8 +593,16 @@ class LandingStore:
 
     @staticmethod
     def _write_jsonl_atomic(abs_path: Path, lines: list[str]) -> None:
-        """写入 JSONL 的原子操作: tmp → fsync → os.replace（设计 §3.4）。"""
-        tmp_path = abs_path.with_suffix(abs_path.suffix + ".tmp")
+        """写入 JSONL 的原子操作: tmp → fsync → os.replace → 父目录 fsync（设计 §3.4）。
+
+        CR P2-2/P2-7:
+        - tmp 文件名带 uuid 后缀（``{cycle_id}_{source_type}_{uuid8}.jsonl.tmp`` 的
+          同目录变体），避免并发写同一 batch 路径时互相截断；
+        - os.replace 后 fsync 父目录，确保 rename 元数据落盘（掉电/崩溃后文件不丢）。
+        """
+        tmp_path = abs_path.parent / (
+            f"{abs_path.stem}_{uuid.uuid4().hex[:8]}{abs_path.suffix}.tmp"
+        )
         with open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
             for line in lines:
                 f.write(line)
@@ -556,6 +610,12 @@ class LandingStore:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, abs_path)
+        # 父目录 fsync: 确保 rename 元数据持久化（P2-2）
+        dir_fd = os.open(str(abs_path.parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
 
     # ── orphan scan / rebuild ─────────────────────────────────────────
 

@@ -112,7 +112,18 @@ class IngestWorker:
         )
         try:
             while not self._stop_event.is_set():
-                worked = await self._cycle()
+                worked = False
+                try:
+                    worked = await self._cycle()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    # CR P1-1: 任何未预期异常都不能杀死常驻循环——记日志后
+                    # 休眠一圈继续；未完成行保持 processing，lease 超时后由
+                    # recover_leases 复位重试（断点续传兜底）。
+                    logger.error(
+                        "IngestWorker cycle crashed: %s", exc, exc_info=True
+                    )
                 if not worked:
                     if self._stop_event.is_set():
                         break
@@ -175,7 +186,17 @@ class IngestWorker:
             return False
 
         if batch:
-            await self._process_batch(batch)
+            try:
+                await self._process_batch(batch)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # CR P1-1: 批处理异常不杀死循环；未完成行保持 processing，
+                # lease 超时后由 recover_leases 复位重试。
+                logger.error(
+                    "IngestWorker batch processing failed: %s", exc, exc_info=True
+                )
+                return False
             return True
 
         # 3) 队列空 → failed 重试扫描（不阻塞 pending 正常消费）
@@ -236,6 +257,70 @@ class IngestWorker:
             failed,
         )
 
+    # ── 状态机回写（P1-2: lease 归属校验 + P1-1: 异常不穿透）──────────
+
+    def _complete_row(self, row: ClaimedEpisode) -> None:
+        """complete() 回写：异常/归属不匹配只记日志，不穿透。"""
+        try:
+            affected = self._store.complete(row.content_hash, self._store.lease_owner)
+        except Exception as exc:
+            logger.error(
+                "store.complete failed for %s…: %s",
+                row.content_hash[:12],
+                exc,
+                exc_info=True,
+            )
+            return
+        if affected == 0:
+            logger.warning(
+                "store.complete: lease 归属不匹配或行已不处于 processing "
+                "(%s…, affected=0) — 不处理",
+                row.content_hash[:12],
+            )
+
+    def _skip_row(self, row: ClaimedEpisode) -> None:
+        """skip() 回写：异常/归属不匹配只记日志，不穿透。"""
+        try:
+            affected = self._store.skip(row.content_hash, self._store.lease_owner)
+        except Exception as exc:
+            logger.error(
+                "store.skip failed for %s…: %s",
+                row.content_hash[:12],
+                exc,
+                exc_info=True,
+            )
+            return
+        if affected == 0:
+            logger.warning(
+                "store.skip: lease 归属不匹配或行已不处于 processing "
+                "(%s…, affected=0) — 不处理",
+                row.content_hash[:12],
+            )
+
+    def _fail_row(self, row: ClaimedEpisode, error: str) -> None:
+        """fail() 回写（attempts++）：异常/归属不匹配只记日志，不穿透。"""
+        try:
+            affected = self._store.fail(
+                row.content_hash,
+                self._store.lease_owner,
+                error,
+                self._max_attempts,
+            )
+        except Exception as exc:
+            logger.error(
+                "store.fail failed for %s…: %s",
+                row.content_hash[:12],
+                exc,
+                exc_info=True,
+            )
+            return
+        if affected == 0:
+            logger.warning(
+                "store.fail: lease 归属不匹配或行已不处于 processing "
+                "(%s…, affected=0) — 不处理",
+                row.content_hash[:12],
+            )
+
     async def _process_one(self, row: ClaimedEpisode) -> str:
         """处理单行: 读 JSONL → write_one → 更新状态。
 
@@ -250,21 +335,16 @@ class IngestWorker:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            store.fail(
-                row.content_hash,
+            self._fail_row(
+                row,
                 f"read error ({row.batch_file}:{row.line_no}): {exc}",
-                self._max_attempts,
             )
             return _OUTCOME_FAILED
 
         # 2) 解析 writer（按源类型；宏/个股管线使用不同 entity_types）
         writer = self._writer_resolver(row.source_type)
         if writer is None:
-            store.fail(
-                row.content_hash,
-                f"no writer for source_type={row.source_type}",
-                self._max_attempts,
-            )
+            self._fail_row(row, f"no writer for source_type={row.source_type}")
             return _OUTCOME_FAILED
 
         # 3) write_one（writer 内部保留 429 退避 / 熔断 / 全局信号量）
@@ -273,21 +353,17 @@ class IngestWorker:
         except asyncio.CancelledError:
             raise  # 行保持 processing，lease 超时后自动复位
         except Exception as exc:
-            store.fail(
-                row.content_hash,
-                f"{type(exc).__name__}: {exc}",
-                self._max_attempts,
-            )
+            self._fail_row(row, f"{type(exc).__name__}: {exc}")
             return _OUTCOME_FAILED
 
-        # 4) 结果 → 状态机
+        # 4) 结果 → 状态机（回写带 lease 归属校验，异常不穿透）
         if wr.status == "ok":
-            store.complete(row.content_hash)
+            self._complete_row(row)
             return _OUTCOME_DONE
         if wr.status == "skipped_duplicate":
-            store.skip(row.content_hash)
+            self._skip_row(row)
             return _OUTCOME_SKIPPED
-        store.fail(row.content_hash, wr.error or "write_one error", self._max_attempts)
+        self._fail_row(row, wr.error or "write_one error")
         return _OUTCOME_FAILED
 
     async def _sleep(self, seconds: float) -> None:

@@ -26,6 +26,8 @@ Thumbs.db
 # data/neo4j/ 和 data/logs/ 是 Docker 挂载的数据卷，包含运行时状态，不可提交
 data/neo4j/
 data/logs/
+# landing zone（JSONL 快照 + state.db 状态库）为运行时数据（CR P2-1），不可提交
+data/landing/
 
 # 运行时缓存文件（TickerSync、数据摄取等生成）
 data/*.json
