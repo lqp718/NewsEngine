@@ -562,8 +562,7 @@ class IngestionScheduler:
             logger.info("ContentFetcher enabled for GDELT and RSS (network_idle=False)")
 
         # ── JSON 持久化层（landing zone）: LandingStore + IngestWorker ──
-        if self._landing_enabled and not self._dry_run and not self._capture_only:
-            from src.persistence.ingest_worker import IngestWorker
+        if self._landing_enabled and not self._dry_run:
             from src.persistence.landing_store import LandingStore
 
             lsettings = get_settings()
@@ -594,27 +593,36 @@ class IngestionScheduler:
                     tmp_count,
                 )
 
-            self._ingest_worker = IngestWorker(
-                store=self._landing_store,
-                writer_resolver=self._resolve_writer,
-                batch_size=getattr(lsettings, "ingest_batch_size", 20),
-                poll_interval_sec=getattr(lsettings, "ingest_poll_interval_sec", 30),
-                lease_sec=getattr(lsettings, "ingest_lease_sec", 900),
-                max_attempts=getattr(lsettings, "ingest_max_attempts", 3),
-                pending_high_water=getattr(lsettings, "ingest_pending_high_water", 3000),
-            )
-            logger.info(
-                "Landing zone enabled: dir=%s store=%s worker=%s",
-                getattr(lsettings, "landing_dir", "data/landing"),
-                type(self._landing_store).__name__,
-                type(self._ingest_worker).__name__,
-            )
+            # IngestWorker only needed for ingest modes (not capture_only)
+            if not self._capture_only:
+                from src.persistence.ingest_worker import IngestWorker
+
+                self._ingest_worker = IngestWorker(
+                    store=self._landing_store,
+                    writer_resolver=self._resolve_writer,
+                    batch_size=getattr(lsettings, "ingest_batch_size", 20),
+                    poll_interval_sec=getattr(lsettings, "ingest_poll_interval_sec", 30),
+                    lease_sec=getattr(lsettings, "ingest_lease_sec", 900),
+                    max_attempts=getattr(lsettings, "ingest_max_attempts", 3),
+                    pending_high_water=getattr(lsettings, "ingest_pending_high_water", 3000),
+                )
+                logger.info(
+                    "Landing zone enabled: dir=%s store=%s worker=%s",
+                    getattr(lsettings, "landing_dir", "data/landing"),
+                    type(self._landing_store).__name__,
+                    type(self._ingest_worker).__name__,
+                )
+            else:
+                logger.info(
+                    "Landing zone enabled (capture-only): dir=%s store=%s",
+                    getattr(lsettings, "landing_dir", "data/landing"),
+                    type(self._landing_store).__name__,
+                )
         else:
             logger.debug(
-                "Landing zone disabled (landing_enabled=%s, dry_run=%s, capture_only=%s)",
+                "Landing zone disabled (landing_enabled=%s, dry_run=%s)",
                 self._landing_enabled,
                 self._dry_run,
-                self._capture_only,
             )
 
         # ── Macro pipeline: GDELT uses macro theme keywords (not tickers) ──
