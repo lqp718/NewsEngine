@@ -21,16 +21,16 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 class Settings(BaseSettings):
     """Application settings loaded from .env file and environment variables."""
     
-    # === 阿里百炼 API (LLM + Embedding) ===
-    bailian_api_key: str = Field(
+    # === OpenAI 兼容接口 (LLM + Embedding, 百炼 / 本地通用) ===
+    openai_api_key: str = Field(
         ...,
-        description="阿里百炼 API Key - 必填字段，无默认值",
+        description="OpenAI 兼容接口 API Key（百炼 DashScope 或本地 llama-server）",
     )
 
     # === Graphiti LLM Provider ===
     graphiti_llm_provider: str = Field(
-        "openai",
-        description="Graphiti LLM provider: 'gemini' or 'openai' (百炼)",
+        "gemini",
+        description="Graphiti LLM provider: 'gemini', 'openai' (百炼), or 'local' (llama-server)",
     )
 
     # === Google Gemini API ===
@@ -48,11 +48,47 @@ class Settings(BaseSettings):
     )
     embedding_model: str = Field(
         "text-embedding-v4",
-        description="百炼 Embedding 模型名",
+        description="Embedding 模型名（OpenAI 兼容接口）",
     )
     llm_model: str = Field(
         "qwen3.7-plus",
-        description="百炼 LLM 模型名",
+        description="LLM 模型名（OpenAI 兼容接口）",
+    )
+
+    # === Graphiti 并发控制 ===
+    # Episode 级并发（_LLM_SEMAPHORE，同时处理的 episode 数）
+    #   Gemini/百炼 API 推荐 3-5，Local 模型推荐 1（llama-server --parallel 1 串行）
+    episode_semaphore: int = Field(
+        3,
+        ge=1,
+        description="Episode 级并发数。API 推荐 3-5，Local 模型推荐 1",
+    )
+    # graphiti-core 内部并发（单 episode 内多步 LLM 调用）
+    # 经 create_graphiti(max_coroutines=...) 显式传入，避免依赖进程环境变量
+    semaphore_limit: int = Field(
+        3,
+        ge=1,
+        description="graphiti-core 内部并发。Gemini 免费档 1-3，百炼/本地 3-10",
+    )
+
+    # === 429 退避/熔断参数（可配置化） ===
+    # 连续 N 次 429 触发熔断。Gemini 推荐 3；Local 模型不触发 429，无需调整
+    circuit_max_consecutive_429: int = Field(
+        3,
+        ge=1,
+        description="连续 429 次数触发熔断。Gemini 推荐 3，Local 无需调整",
+    )
+    # 熔断冷却时间（秒）。Gemini 推荐 60
+    circuit_cooldown_sec: float = Field(
+        60.0,
+        ge=0.0,
+        description="熔断冷却时间（秒）。Gemini 推荐 60，Local 无需调整",
+    )
+    # 429 退避下限（秒）。Gemini 官方 retryDelay 下限 37s
+    min_429_backoff_sec: float = Field(
+        37.0,
+        ge=0.0,
+        description="429 退避下限（秒）。Gemini 官方 retryDelay 下限 37s",
     )
 
     # === DeepSeek API (LLM) ===
@@ -338,17 +374,17 @@ class Settings(BaseSettings):
             raise ValueError(f"{info.field_name} 必须 > 0")
         return v
 
-    @field_validator("bailian_api_key")
+    @field_validator("openai_api_key")
     @classmethod
-    def validate_bailian_api_key(cls, v: str) -> str:
-        """Validate that bailian_api_key is not a placeholder value."""
+    def validate_openai_api_key(cls, v: str) -> str:
+        """Validate that openai_api_key is not a placeholder value."""
         if not v:
-            raise ValueError("BAILIAN_API_KEY 必须设置为真实的百炼 API Key，不可为空")
+            raise ValueError("OPENAI_API_KEY 必须设置为真实的 API Key，不可为空")
         
         # Check for common placeholder values
-        placeholder_values = ["***", "sk-***", "your-api-key", "YOUR_API_KEY", "your_api_key", "sk-your-api-key"]
+        placeholder_values = ["***", "sk-***", "your-api-key", "YOUR_API_KEY", "your_api_key", "sk-your-api-key", "sk-test-key"]
         if v.strip() in placeholder_values:
-            raise ValueError("BAILIAN_API_KEY 必须设置为真实的百炼 API Key，不可使用占位符")
+            raise ValueError("OPENAI_API_KEY 必须设置为真实的 API Key，不可使用占位符")
         
         return v
     

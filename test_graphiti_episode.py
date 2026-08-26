@@ -8,9 +8,9 @@ Graphiti Episode 测试脚本 — 百炼 API 版
     pip install graphiti-core openai numpy python-dotenv
 
 配置:
-    从 .env 文件读取 (BAILIAN_API_KEY, OPENAI_BASE_URL, EMBEDDING_MODEL, LLM_MODEL)
+    从 .env 文件读取 (OPENAI_API_KEY, OPENAI_BASE_URL, EMBEDDING_MODEL, LLM_MODEL)
     或通过环境变量覆盖:
-        LLM_API_KEY         (默认: BAILIAN_API_KEY 的值)
+        LLM_API_KEY         (默认: OPENAI_API_KEY 的值)
         LLM_BASE_URL        (默认: OPENAI_BASE_URL 的值)
         EMBEDDING_API_KEY   (默认同 LLM_API_KEY)
         EMBEDDING_BASE_URL  (默认同 LLM_BASE_URL)
@@ -49,12 +49,12 @@ logging.getLogger("openai").setLevel(logging.WARNING)
 logger = logging.getLogger("graphiti-test")
 
 # ---------- config: 优先读取 .env 中的 百炼 配置 ----------
-# LLM: 从 BAILIAN_API_KEY + OPENAI_BASE_URL + LLM_MODEL
-BAILIAN_KEY = os.getenv("BAILIAN_API_KEY", "")
-BAILIAN_BASE = os.getenv("OPENAI_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+# LLM: 从 OPENAI_API_KEY + OPENAI_BASE_URL + LLM_MODEL
+OPENAI_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_BASE = os.getenv("OPENAI_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
 
-LLM_API_KEY = os.getenv("LLM_API_KEY", BAILIAN_KEY)
-LLM_BASE_URL = os.getenv("LLM_BASE_URL", BAILIAN_BASE)
+LLM_API_KEY = os.getenv("LLM_API_KEY", OPENAI_KEY)
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", OPENAI_BASE)
 LLM_MODEL = os.getenv("LLM_MODEL", "qwen-plus")
 
 # Embedding: 默认同 LLM 配置
@@ -104,10 +104,10 @@ async def main():
     logger.info("Neo4j:   %s  |  user=%s", NEO4J_URI, NEO4J_USER)
     logger.info("")
 
-    if not BAILIAN_KEY:
-        logger.warning("⚠️  BAILIAN_API_KEY 未设置，将使用 RandomEmbedder fallback")
+    if not OPENAI_KEY:
+        logger.warning("⚠️  OPENAI_API_KEY 未设置，将使用 RandomEmbedder fallback")
     else:
-        logger.info("✅ BAILIAN_API_KEY 已配置")
+        logger.info("✅ OPENAI_API_KEY 已配置")
 
     # ---- 1. LLM Client ----
     from graphiti_core.llm_client import LLMConfig

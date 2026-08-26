@@ -63,7 +63,7 @@ class SectorBriefingAggregator:
         settings = get_settings()
         self._cache: dict[str, BriefingCacheEntry] = {}
         self._llm_client = AsyncOpenAI(
-            api_key=settings.bailian_api_key,
+            api_key=settings.openai_api_key,
             base_url=settings.openai_base_url,
         )
         self._llm_model = "qwen-plus"

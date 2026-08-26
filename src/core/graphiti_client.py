@@ -38,7 +38,9 @@ def create_graphiti(graph_driver: GraphDriver | None = None) -> Graphiti:
     # LLM: 根据 graphiti_llm_provider 配置选择
     # - "gemini": 原生 Gemini API（免费但不稳定，偶发 503/JSON 解析失败）
     # - "openai": 百炼 OpenAI 兼容接口（稳定，收费）
-    if settings.graphiti_llm_provider == "gemini":
+    # - "local": 本地 llama-server（OpenAI 兼容，零成本，吞吐受限）
+    provider = settings.graphiti_llm_provider
+    if provider == "gemini":
         from graphiti_core.llm_client.gemini_client import GeminiClient
         llm_client = GeminiClient(
             config=LLMConfig(
@@ -53,20 +55,39 @@ def create_graphiti(graph_driver: GraphDriver | None = None) -> Graphiti:
             # 显式指定 32K output tokens 避免截断。
             max_tokens=32768,
         )
-    else:  # openai (百炼)
+    elif provider == "openai":
+        # OpenAI 兼容接口（百炼 DashScope）
         from .bailian_llm_client import BailianOpenAIClient
         llm_client = BailianOpenAIClient(
             config=LLMConfig(
-                api_key=settings.bailian_api_key,
+                api_key=settings.openai_api_key,
                 model=settings.llm_model,
                 base_url=settings.openai_base_url,
             ),
             structured_output_mode='json_object',  # 百炼不支持 json_schema
         )
+    elif provider == "local":
+        # 本地 llama-server（OpenAI 兼容）
+        # 复用 OPENAI_BASE_URL / OPENAI_API_KEY / LLM_MODEL（.env 切到 localhost 即可）
+        from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
+        llm_client = OpenAIGenericClient(
+            config=LLMConfig(
+                api_key=settings.openai_api_key,  # llama-server 不校验，但仍需非空
+                model=settings.llm_model,  # .env 设 LLM_MODEL=gemma4-12b
+                base_url=settings.openai_base_url,  # .env 切到 http://127.0.0.1:8080/v1
+            ),
+            max_tokens=8192,  # 本地 ctx 32K，留余量
+            structured_output_mode='json_schema',  # llama.cpp 支持约束解码
+        )
+    else:
+        raise ValueError(
+            f"Unknown graphiti_llm_provider: {provider}. "
+            "Expected 'gemini', 'openai', or 'local'"
+        )
 
     # Embedder: 百炼 text-embedding-v4 (keep existing Bailian Embedder with 10-item batch limit)
     embedder_client = BailianEmbedder(
-        api_key=settings.bailian_api_key,
+        api_key=settings.openai_api_key,
         base_url=settings.openai_base_url,
         model=settings.embedding_model,
         embedding_dim=1024,
@@ -85,6 +106,7 @@ def create_graphiti(graph_driver: GraphDriver | None = None) -> Graphiti:
         embedder=embedder_client,
         cross_encoder=reranker_client,
         graph_driver=graph_driver,
+        max_coroutines=settings.semaphore_limit,  # 覆盖 graphiti-core 的 SEMAPHORE_LIMIT env
     )
 
 

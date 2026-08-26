@@ -28,8 +28,8 @@ NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "newsengine2026")
 
-BAILIAN_KEY = os.getenv("BAILIAN_API_KEY", "")
-BAILIAN_BASE = os.getenv("OPENAI_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+OPENAI_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_BASE = os.getenv("OPENAI_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
 LLM_MODEL = os.getenv("LLM_MODEL", "qwen-plus")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-v3")
 
@@ -60,8 +60,8 @@ async def graphiti_client():
     from graphiti_core.embedder import OpenAIEmbedder, OpenAIEmbedderConfig
 
     llm_config = LLMConfig(
-        api_key=BAILIAN_KEY,
-        base_url=BAILIAN_BASE,
+        api_key=OPENAI_KEY,
+        base_url=OPENAI_BASE,
         model=LLM_MODEL,
     )
     llm_client = OpenAIGenericClient(
@@ -70,8 +70,8 @@ async def graphiti_client():
     )
 
     embed_config = OpenAIEmbedderConfig(
-        api_key=BAILIAN_KEY,
-        base_url=BAILIAN_BASE,
+        api_key=OPENAI_KEY,
+        base_url=OPENAI_BASE,
         embedding_model=EMBEDDING_MODEL,
         embedding_dim=1024,
     )

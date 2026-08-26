@@ -161,7 +161,7 @@ class TestTierMap:
 
 class TestTierConfig:
     def test_default_intervals(self) -> None:
-        s = Settings(bailian_api_key="test-key", deepseek_api_key="test-key")
+        s = Settings(openai_api_key="test-key", deepseek_api_key="test-key")
         assert s.ingestion_interval_sec == 900
         assert s.ingestion_tier2_interval_sec == 14400
         assert s.ingestion_tier3_interval_sec == 43200
@@ -169,7 +169,7 @@ class TestTierConfig:
 
     def test_env_override_tier2(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("INGESTION_TIER2_INTERVAL_SEC", "21600")
-        s = Settings(bailian_api_key="test-key", deepseek_api_key="test-key")
+        s = Settings(openai_api_key="test-key", deepseek_api_key="test-key")
         assert s.ingestion_tier2_interval_sec == 21600
         # Other tiers unaffected.
         assert s.ingestion_tier3_interval_sec == 43200
@@ -177,7 +177,7 @@ class TestTierConfig:
 
     def test_backward_compat_interval_sec(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("INGESTION_INTERVAL_SEC", "600")
-        s = Settings(bailian_api_key="test-key", deepseek_api_key="test-key")
+        s = Settings(openai_api_key="test-key", deepseek_api_key="test-key")
         assert s.ingestion_interval_sec == 600
         # Tier 2-4 fall back to their own defaults.
         assert s.ingestion_tier2_interval_sec == 14400
@@ -197,7 +197,7 @@ class TestTierConfig:
     )
     def test_non_positive_interval_rejected(self, bad: dict[str, int]) -> None:
         with pytest.raises(ValidationError):
-            Settings(bailian_api_key="test-key", deepseek_api_key="test-key", **bad)
+            Settings(openai_api_key="test-key", deepseek_api_key="test-key", **bad)
 
 
 # ── 3.3: scheduling rhythm / tier independence / empty tiers ───────────

@@ -568,7 +568,7 @@ async def get_risk_summary(
             from openai import AsyncOpenAI
 
             llm_client = AsyncOpenAI(
-                api_key=settings.bailian_api_key,
+                api_key=settings.openai_api_key,
                 base_url=settings.openai_base_url,
             )
 

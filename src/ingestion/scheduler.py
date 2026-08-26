@@ -38,6 +38,89 @@ from .pipeline import PipelineResult, run_pipeline
 
 logger = get_logger(__name__)
 
+
+# ── Graphiti P0 基础设施辅助（G1 索引构建 / G10 SEMAPHORE_LIMIT / 健康检查） ──
+
+def _seed_semaphore_limit_env() -> None:
+    """将 .env 的 SEMAPHORE_LIMIT 播种到进程环境。
+
+    graphiti-core 原生从 ``os.getenv('SEMAPHORE_LIMIT')`` 读取并发上限
+    (helpers.py)，而 pydantic-settings 只读 .env、不会导出到进程环境。
+    create_graphiti(max_coroutines=...) 已显式传入同名配置（覆盖 env），
+    此处双保险：保证任何路径（含直接构造 Graphiti 的调用方）都能生效。
+    幂等：已设且非默认值时不覆盖。
+    """
+    if os.getenv("SEMAPHORE_LIMIT") is None:
+        try:
+            settings = get_settings()
+            os.environ["SEMAPHORE_LIMIT"] = str(settings.semaphore_limit)
+        except Exception as exc:
+            logger.warning("Failed to seed SEMAPHORE_LIMIT env: %s", exc)
+
+
+async def _ensure_graphiti_indices() -> None:
+    """确保 Graphiti 索引/约束已构建（P0-G1）。幂等：仅执行一次（进程级标志）。
+
+    放 start() 的 async 上下文执行（build_indices_and_constraints 是 async），
+    任何模式（常驻 / ingest-only / 注入外部 graphiti）都覆盖。失败仅记日志，
+    不阻塞启动 —— 写入时 graphiti 使用缺失索引仍可工作，只是性能差。
+    """
+    if _indices_built:
+        return
+    _indices_built = True  # 先置位，避免并发重复构建
+    if not _current_graphiti_ref:
+        return
+    g = _current_graphiti_ref()
+    if g is None:
+        return
+    try:
+        from graphiti_core.driver.driver import GraphDriver
+
+        if not isinstance(g.driver, GraphDriver):
+            logger.debug("Skipping index build: graphiti not owned (external driver)")
+            return
+        await g.build_indices_and_constraints(delete_existing=False)
+        logger.info("Graphiti indices and constraints ensured")
+    except Exception as exc:
+        logger.error("build_indices_and_constraints failed: %s", exc, exc_info=True)
+
+
+# 进程级标志 + graphiti 引用（供 _ensure_graphiti_indices 使用）
+_indices_built: bool = False
+_current_graphiti_ref: Any | None = None
+
+
+def _check_local_llm_health(base_url: str) -> None:
+    """检查本地 llama-server 健康状态，未就绪则拒绝启动写入循环。
+
+    用轻量 GET /health 验证（llama-server 原生端点）。响应体为
+    ``{"status": "ok", ...}`` 即就绪；否则抛 RuntimeError 携带清晰错误。
+    """
+    import httpx
+
+    health_url = base_url.replace("/v1", "/health")
+    try:
+        resp = httpx.get(health_url, timeout=5.0)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Local LLM not ready at {health_url}. "
+            f"Start llama-server before running ingest. Detail: {exc}"
+        ) from exc
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"Local LLM health check failed: {resp.status_code} {resp.text[:200]}"
+        )
+    try:
+        status = resp.json().get("status")
+    except Exception:
+        status = None
+    if status != "ok":
+        raise RuntimeError(
+            f"Local LLM health check failed at {health_url}: "
+            f"status={status!r} body={resp.text[:200]}"
+        )
+    logger.info("Local LLM health check passed: %s", health_url)
+
 # ── Default RSS feed URLs (financial news feeds) ───────────────────────
 # Path to RSS feed configuration JSON file
 _RSS_FEEDS_JSON_PATH: str = os.path.join(
@@ -309,7 +392,16 @@ class IngestionScheduler:
 
         self._running = True
         self._stop_event = asyncio.Event()
+        # G10: 将 .env 的 SEMAPHORE_LIMIT 播种到进程环境 — graphiti-core 原生
+        # 从 os.getenv('SEMAPHORE_LIMIT') 读取，而 pydantic-settings 不会导出到
+        # 进程环境。create_graphiti(max_coroutines=...) 已显式传入覆盖，这里双保险。
+        _seed_semaphore_limit_env()
         self._lazy_init_components()
+        # P0-G1: 启动时构建索引（幂等，仅一次；失败不阻塞启动，仅记日志）
+        try:
+            await self._ensure_graphiti_indices()
+        except Exception as exc:
+            logger.error("Startup index build failed: %s", exc, exc_info=True)
         if self._ingest_worker is not None:
             self._ingest_worker.stop_event = self._stop_event
 
@@ -394,6 +486,8 @@ class IngestionScheduler:
         stop() 末尾也会调用一次（重复调用安全）。
         """
         if self._landing_store is None:
+            # 无 landing 时也尝试关闭共享 graphiti driver（避免连接泄漏）
+            await self._close_graphiti_resources()
             return
         store, self._landing_store = self._landing_store, None
         try:
@@ -401,6 +495,22 @@ class IngestionScheduler:
             logger.info("LandingStore closed")
         except Exception as exc:
             logger.warning("LandingStore close failed: %s", exc)
+        await self._close_graphiti_resources()
+
+    async def _close_graphiti_resources(self) -> None:
+        """关闭共享 graphiti driver（若本 scheduler 创建过）。幂等。"""
+        global _current_graphiti_ref
+        if _current_graphiti_ref is None:
+            return
+        g = _current_graphiti_ref()
+        ref, _current_graphiti_ref = _current_graphiti_ref, None
+        if g is None:
+            return
+        try:
+            await g.close()  # Graphiti.close → driver.close()
+            logger.info("Graphiti closed (shared driver released)")
+        except Exception as exc:
+            logger.warning("Graphiti close failed: %s", exc)
 
     async def drain_ingest(self) -> None:
         """--ingest-only（非 watch）: drain 所有 pending 后返回。
@@ -536,7 +646,20 @@ class IngestionScheduler:
                 self._neo4j_driver = get_neo4j_driver()
 
             if self._graphiti is None:
-                self._graphiti = create_graphiti()
+                # P0-G2: 共享 graphiti driver（消除双驱动/双连接池）。graphiti-core
+                # 的 ops 依赖其 GraphDriver 接口（async），与应用层同步 driver 分开。
+                from src.core.neo4j_client import get_graphiti_driver
+                self._graphiti = create_graphiti(graph_driver=get_graphiti_driver())
+
+            # 供启动时 _ensure_graphiti_indices 使用的引用（scheduler 持有的实例）
+            global _current_graphiti_ref
+            _current_graphiti_ref = lambda: self._graphiti
+
+            # 健康检查: local provider 时校验 llama-server 就绪，未就绪拒绝启动
+            # 写入循环（报清晰错误后退出；capture/dry-run 不经过此分支）。
+            settings = get_settings()
+            if getattr(settings, "graphiti_llm_provider", "gemini") == "local":
+                _check_local_llm_health(getattr(settings, "openai_base_url", "http://127.0.0.1:8080/v1"))
 
             self._macro_writer = EpisodeWriter(
                 graphiti=self._graphiti,
@@ -569,8 +692,7 @@ class IngestionScheduler:
                 batch_cooldown=5.0,
             )
             logger.info("Dry-run: ContentFetcher enabled (V2.4 batch scheduling, network_idle=False)")
-        elif not self._dry_run:
-            # Normal mode: always enable ContentFetcher
+        elif not self._dry_run:            # Normal mode: always enable ContentFetcher
             from src.utils.content_fetcher import ContentFetcher
             content_fetcher = ContentFetcher(
                 timeout=30,

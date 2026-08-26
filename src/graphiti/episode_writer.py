@@ -59,15 +59,19 @@ except Exception:  # pragma: no cover - graphiti 不可用时退化为按类名�
     RateLimitError = None  # type: ignore[assignment,misc]
 
 # 全局并发信号量: 所有 EpisodeWriter 实例 / Tier 共享，限制同时进行的 LLM 调用数
-_LLM_SEMAPHORE = asyncio.Semaphore(3)
+# 并发参数配置化: 由 settings（.env）提供，避免硬编码
+from src.core.config import get_settings
+
+_settings = get_settings()
+_LLM_SEMAPHORE = asyncio.Semaphore(_settings.episode_semaphore)
 
 # 429 退避参数: 尊重 API retryDelay，但不得低于 _MIN_429_BACKOFF_SEC（配额恢复所需）
-_MIN_429_BACKOFF_SEC = 37.0
+_MIN_429_BACKOFF_SEC = _settings.min_429_backoff_sec
 _MAX_429_JITTER_SEC = 2.0
 
 # 熔断参数: 连续 _CIRCUIT_MAX_CONSECUTIVE_429 次 429 后，冷却整个队列
-_CIRCUIT_MAX_CONSECUTIVE_429 = 3
-_CIRCUIT_COOLDOWN_SEC = 60.0
+_CIRCUIT_MAX_CONSECUTIVE_429 = _settings.circuit_max_consecutive_429
+_CIRCUIT_COOLDOWN_SEC = _settings.circuit_cooldown_sec
 _CIRCUIT_CONSECUTIVE_429 = 0  # 全局连续 429 计数（单线程事件循环，读写原子）
 _CIRCUIT_OPEN_UNTIL = 0.0  # 熔断打开截止时刻（time.monotonic() 基准）
 
