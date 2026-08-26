@@ -498,7 +498,11 @@ class IngestionScheduler:
         await self._close_graphiti_resources()
 
     async def _close_graphiti_resources(self) -> None:
-        """关闭共享 graphiti driver（若本 scheduler 创建过）。幂等。"""
+        """关闭共享 graphiti driver（若本 scheduler 创建过）。幂等。
+        
+        同时调用 close_graphiti_driver() 清理 neo4j_client 模块级单例，
+        避免同一进程内二次创建 scheduler 时拿到已关闭的 driver。
+        """
         global _current_graphiti_ref
         if _current_graphiti_ref is None:
             return
@@ -511,6 +515,13 @@ class IngestionScheduler:
             logger.info("Graphiti closed (shared driver released)")
         except Exception as exc:
             logger.warning("Graphiti close failed: %s", exc)
+        # 清理 neo4j_client 模块级单例（P2-1）
+        try:
+            from ..core.neo4j_client import close_graphiti_driver
+            await close_graphiti_driver()
+            logger.debug("close_graphiti_driver() called (singleton cleared)")
+        except Exception as exc:
+            logger.warning("close_graphiti_driver failed: %s", exc)
 
     async def drain_ingest(self) -> None:
         """--ingest-only（非 watch）: drain 所有 pending 后返回。

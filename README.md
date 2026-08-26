@@ -134,7 +134,7 @@ Create `.env`:
 
 ```bash
 # Required
-BAILIAN_API_KEY=***
+OPENAI_API_KEY=***
 DEEPSEEK_API_KEY=***
 
 # Neo4j
@@ -180,7 +180,7 @@ python main.py --dry-run --source rss
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `BAILIAN_API_KEY` | *(required)* | 阿里百炼 API key |
+| `OPENAI_API_KEY` | *(required)* | OpenAI 兼容 API key（百炼 DashScope / 本地 llama-server） |
 | `DEEPSEEK_API_KEY` | *(required)* | DeepSeek API key |
 | `NEO4J_URI` | `bolt://localhost:7687` | Neo4j connection URI |
 | `NEO4J_USER` | `neo4j` | Neo4j username |
