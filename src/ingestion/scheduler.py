@@ -399,7 +399,7 @@ class IngestionScheduler:
         self._lazy_init_components()
         # P0-G1: 启动时构建索引（幂等，仅一次；失败不阻塞启动，仅记日志）
         try:
-            await self._ensure_graphiti_indices()
+            await _ensure_graphiti_indices()
         except Exception as exc:
             logger.error("Startup index build failed: %s", exc, exc_info=True)
         if self._ingest_worker is not None:
