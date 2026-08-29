@@ -85,10 +85,11 @@ def create_graphiti(graph_driver: GraphDriver | None = None) -> Graphiti:
             "Expected 'gemini', 'openai', or 'local'"
         )
 
-    # Embedder: 百炼 text-embedding-v4 (keep existing Bailian Embedder with 10-item batch limit)
+    # Embedder: 百炼 text-embedding-v4（独立配置，不复用 LLM 的 OPENAI_BASE_URL）
+    # LLM 切到 local（llama-server）时，embedding 仍走百炼（llama-server 不提供 embedding 端点）
     embedder_client = BailianEmbedder(
-        api_key=settings.openai_api_key,
-        base_url=settings.openai_base_url,
+        api_key=settings.embedding_api_key or settings.openai_api_key,  # fallback to openai_api_key
+        base_url=settings.embedding_base_url,
         model=settings.embedding_model,
         embedding_dim=1024,
     )

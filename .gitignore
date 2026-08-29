@@ -35,7 +35,7 @@ data/*.sqlite
 data/*.db
 
 # 日志
-logs/*.log
+logs/*.log*
 logs/*.json
 
 # 测试

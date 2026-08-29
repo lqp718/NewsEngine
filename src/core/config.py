@@ -50,6 +50,14 @@ class Settings(BaseSettings):
         "text-embedding-v4",
         description="Embedding 模型名（OpenAI 兼容接口）",
     )
+    embedding_base_url: str = Field(
+        "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        description="Embedding 服务 Base URL（百炼 DashScope，独立于 LLM 的 OPENAI_BASE_URL）",
+    )
+    embedding_api_key: str = Field(
+        "",
+        description="Embedding 服务 API Key（百炼 DashScope）。为空时 fallback 到 openai_api_key",
+    )
     llm_model: str = Field(
         "qwen3.7-plus",
         description="LLM 模型名（OpenAI 兼容接口）",
