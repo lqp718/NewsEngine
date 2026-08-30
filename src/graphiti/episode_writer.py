@@ -135,32 +135,54 @@ class HappenedInEdge(BaseModel):
     )
 
 
-def normalize_edge_type(edge_type: str) -> str:
+def normalize_edge_type(edge_type: str | None) -> str:
     """把任意边类型名称归一到核心关系类型集。
 
-    按前缀匹配（大小写不敏感），顺序即优先级。注意两点:
+    按前缀匹配（大小写不敏感），顺序即优先级。要点:
     - "INVOLVES" 必须在 "IN" 前缀规则之前匹配，否则会被误归为 HAPPENED_IN
-    - 补齐了任务给定规则的两个盲区: "CAUSED_BY"（startswith("CAUSES") 匹配
-      不到）→ TRIGGERS；MITIGATES（缓解本质是影响的一种）→ AFFECTS；
+    - "IN" 前缀规则已收窄为精确 "IN" / "IN_" 前缀 + "HAPPENED"：原规则
+      startswith("IN") 过于宽泛（"INVOLVES" 虽被前置的 INVOLV 规则拦住，
+      但 "INFLUENCES" 等其他 IN* 名称仍会被误归为 HAPPENED_IN）
+    - 补齐了任务给定规则的几个盲区: "CAUSED_BY" / "TRIGGERED_BY"
+      （startswith("CAUSES") / startswith("TRIGGERS") 匹配不到）→ 用前缀
+      "CAUSED" / "TRIGGER" 覆盖；MITIGATES（缓解本质是影响的一种）→ AFFECTS；
       LOCATED_IN（地区归属）→ PART_OF
+    - 新增归属/任职映射: SUBSIDIARY/OWNED_BY/PARENT_OF → PART_OF；
+      CEO_OF/EMPLOYED_BY/WORKS_FOR/CHAIR*/PRESIDENT* → INVOLVES
+      （"CHAIR" 前缀同时覆盖 CHAIRMAN_OF / CHAIRPERSON / CHAIR_OF，与写时/
+      迁移规则对称）
+    - TRACKS/REPORTS/REPORTED_BY/STATES 属通用关联，由默认兜底保持
+      RELATES_TO（不单设规则，显式注释以免后续误改）
     """
     if not edge_type:
         return "RELATES_TO"
     edge_upper = edge_type.upper().strip()
     if edge_upper.startswith("RELATES_TO"):
         return "RELATES_TO"
-    if edge_upper.startswith(("CAUSES", "CAUSED", "TRIGGERS")):
+    # "TRIGGER" 前缀同时覆盖 TRIGGERS / TRIGGERED_BY / TRIGGER（盲区修复）
+    if edge_upper.startswith(("CAUSES", "CAUSED", "TRIGGER")):
         return "TRIGGERS"
-    if edge_upper.startswith(("AFFECTS", "IMPACTS", "MITIGATES")):
+    if edge_upper.startswith(("AFFECTS", "IMPACTS", "INFLUENC", "MITIGATES")):
         return "AFFECTS"
-    if edge_upper.startswith(("INVOLV", "ACTOR")):
+    # 主体参与/任职: 除 INVOLV/ACTOR 外，CEO/受雇/任职/董事长/总裁等任职类
+    # 关系本质是主体参与，归入 INVOLVES（必须先于 HAPPENED_IN 规则匹配）。
+    # "CHAIR" 覆盖 CHAIRMAN_OF/CHAIRPERSON/CHAIR_OF；"PRESIDENT" 覆盖
+    # PRESIDENT_OF（盲区修复，消除写时/迁移不对称）
+    if edge_upper.startswith(
+        ("INVOLV", "ACTOR", "CEO", "EMPLOYED", "WORKS_FOR", "CHAIR", "PRESIDENT")
+    ):
         return "INVOLVES"
     if edge_upper.startswith("EXPOSED"):
         return "EXPOSED_TO"
-    if edge_upper.startswith(("IN", "HAPPENED")):
+    # 归属关系: 子公司/被持有/母子公司 → PART_OF
+    if edge_upper.startswith(("SUBSIDIARY", "OWNED_BY", "PARENT_OF")):
+        return "PART_OF"
+    # 地区关联: 仅精确 "IN" / "IN_*" / "HAPPENED*"（原 startswith("IN") 过宽）
+    if edge_upper == "IN" or edge_upper.startswith(("IN_", "HAPPENED")):
         return "HAPPENED_IN"
     if edge_upper.startswith(("PART", "BELONGS", "LOCATED")):
         return "PART_OF"
+    # TRACKS / REPORTS / REPORTED_BY / STATES 等通用关联 → 保持默认兜底
     return "RELATES_TO"  # 默认兜底
 
 
