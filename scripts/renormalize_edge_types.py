@@ -14,15 +14,39 @@
     2. 主体参与/任职 (→ CEO_OF → INVOLVES):
        CEO / chairman / chair / president / director / analyst / ...
        以及 fact 直接出现 involve(s)
-    3. 其余（含 tracks / reports / reported / states）保持 RELATES_TO
+    3. 影响/威胁/支持-反对 (→ AFFECTS，方案 C 新增):
+       threatens / boosts / pressures / impacts(动词) / undermines /
+       hurts / benefits / supports(动词) / opposes / withdrew support /
+       harms / damages / strengthens / weakens
+    4. 因果 (→ TRIGGERS，方案 C 新增):
+       caused(动词) / led to / triggered / sparked / resulted in /
+       precipitated
+    5. 地点 (→ HAPPENED_IN，方案 C 新增):
+       happened in / occurred in / took place in / is|was located in
+    6. 其余（含 tracks / reports / reported / states）保持 RELATES_TO
        —— 这些确实是通用关联，不做迁移。
+    优先级: PART_OF > INVOLVES > AFFECTS > TRIGGERS > HAPPENED_IN
+    （结构性归属 > 参与 > 影响 > 因果 > 地点）
 
-    注意两类已收紧的泛化模式（CR 修复）:
+    注意以下已收紧的泛化模式（CR 修复）:
     - "became" 必须带角色上下文（became the CEO/chairman/president/...），
       否则新闻高频状态变化句式 "X became the largest/top/first ..." 会被
       误归 INVOLVES（单向迁移不可自愈）
     - "partners" 限定名词语境（partnership / partner at|of|in），
-      动词用法 "X partners with Y" 不再命中
+      动词用法 "X partners with Y" 不再命中（CR #3）
+    - 方案 C 新增三类收紧（2026-08-31）:
+      * "impacts" 仅命中动词用法（X impacts Y）；名词 "impacts of ..."
+        不归一（负向前瞻排除后接 of）
+      * "supports" 仅命中动词用法；名词复数 "supports for/of ..."
+        不归一（负向前瞻排除后接介词）
+      * "caused" 仅命中动词过去式；名词 "the cause of" 不含 caused，
+        天然不命中
+    - "part of" 收紧（2026-08-31）: 裸 \\bpart\\s+of\\b 命中 "as part of ..."
+      习语（历史数据 42 条中 37 条误伤）。收紧为仅匹配带系动词/归属动词的
+      "X is/are/was/form(s)/constitute(s)/remain(s) (a/an/integral/key/...)
+      part of Y" 归属句式；另用负向前瞻排除 "part of" 后接抽象隐喻中心词
+      （race/effort/push/campaign/plan/strategy/...），如
+      "chips are part of the race to build AI" 非结构性归属，不归一。
 
 两个阶段:
     阶段 1（迁移）: 处理 name='RELATES_TO' 的边，按 fact 推断更具体核心类型。
@@ -78,7 +102,29 @@ _PART_OF_PATTERNS: list[tuple[str, str]] = [
     (r"\bowns\s+the\b", "OWNED_BY"),            # X owns the Y project/operation
     (r"\bwholly[- ]?owned\b", "OWNED_BY"),
     (r"\ba\s+unit\s+of\b", "SUBSIDIARY_OF"),
-    (r"\bpart\s+of\b", "PART_OF"),
+    # "part of" 收紧（2026-08-31）: 裸 \bpart\s+of\b 误伤 "as part of" 习语
+    # （历史 42 条命中中 37 条为习语）。收紧为仅命中归属句式 ——
+    # X is/are/was/were/form(s)/constitute(s)/remain(s) (a/an) (integral/key/
+    # major/core/vital/attractive) part of Y；"as part of" 前无系动词，天然不命中。
+    # 修饰词列表含 attractive —— 来自真实归属 fact "BMA coal business remains
+    # an attractive part of the portfolio"（业务归属投资组合）。
+    # 负向前瞻排除抽象隐喻中心词（race/effort/push/...），避免习语误伤，
+    # 如 "Nvidia's chips are part of the ongoing race to build AI"。
+    (
+        r"\b(?:is|are|was|were|forms?|constitutes?|remains?)\s+(?:an?\s+)?"
+        r"(?:integral\s+|key\s+|major\s+|core\s+|vital\s+|attractive\s+)?part\s+of\b"
+        r"(?!\s+(?:the\s+|an?\s+)?(?:[\w'-]+\s+){0,2}?"
+        r"(?:races?|efforts?|push|drive|campaigns?|battles?|fights?|contests?|"
+        r"debates?|journeys?|trends?|waves?|movements?|problems?|solutions?|"
+        r"plans?|deals?|strateg(?:y|ies)|initiatives?|process(?:es)?|"
+        r"agendas?|packages?|discussions?)\b)",
+        "PART_OF",
+    ),
+    # 方案 C 扩展: 收购/持股/所有权事实 → 结构性归属（PART_OF 系）
+    (r"\bacquired\b", "ACQUIRED_BY"),
+    (r"\bowns\b", "OWNED_BY"),
+    (r"\braised\s+its\s+stake\b", "OWNED_BY"),
+    (r"\bholds?\s+a\s+stake\b", "OWNED_BY"),
 ]
 
 # 角色词表: became 收紧模式与任职模式共用（CR #1 — "became" 必须带角色
@@ -130,6 +176,58 @@ _INVOLVES_PATTERNS: list[tuple[str, str]] = [
     (r"\banchors?\b", "CEO_OF"),
     (r"\bexperts?\b", "CEO_OF"),
     (r"\bleadership\s+roles?\b", "CEO_OF"),
+    # 方案 C 扩展: 政界职务（注: premier/governor/minister 已由上方
+    # \bpremiers?\b / \bgovernors?\b / \bministers?\b 覆盖，此处仅补
+    # prime minister 双词短语与 mayor / ambassador）
+    (r"\bprime\s+minister\b", "CEO_OF"),
+    (r"\bmayor\b", "CEO_OF"),
+    (r"\bambassadors?\b", "CEO_OF"),
+]
+
+# 影响类动词 → AFFECTS（方案 C 新增）。AFFECTS 已是核心类型，
+# 直接以核心名作遗留类型传入，经 normalize_edge_type 原样映射。
+_AFFECTS_PATTERNS: list[tuple[str, str]] = [
+    (r"\bthreatens?\b", "AFFECTS"),
+    (r"\bboosts?\b", "AFFECTS"),
+    (r"\bpressures?\b", "AFFECTS"),
+    # impacts: 仅动词用法（X impacts Y）；名词用法 "impacts of ..."、
+    # "have impacts on ..." 后接 of/on，用负向前瞻排除，避免归一（收紧策略）
+    (r"\bimpacts?\b(?!\s+(of|on)\b)", "AFFECTS"),
+    (r"\bundermines?\b", "AFFECTS"),
+    (r"\bhurts?\b", "AFFECTS"),
+    (r"\bbenefits?\b", "AFFECTS"),
+    # supports: 仅动词用法；名词用法 "supports for/of the project"、
+    # "support at $83"（技术分析）、"support during ..." 后接介词，
+    # 用负向前瞻排除（收紧策略）。
+    # 注意: "withdrew (its) support" 句式由下方专用模式兜住。
+    (r"\bsupports?\b(?!\s+(of|for|by|to|in|on|at|during|from)\b)", "AFFECTS"),
+    (r"\bopposes?\b", "AFFECTS"),
+    (r"\bwithdrew\s+(its\s+)?support\b", "AFFECTS"),
+    (r"\bharms?\b", "AFFECTS"),
+    (r"\bdamages?\b", "AFFECTS"),
+    (r"\bstrengthens?\b", "AFFECTS"),
+    (r"\bweakens?\b", "AFFECTS"),
+]
+
+# 因果类动词 → TRIGGERS（方案 C 新增）
+_TRIGGERS_PATTERNS: list[tuple[str, str]] = [
+    # caused: 仅动词过去式；名词 "the cause of" 不含 caused，天然不命中。
+    # （刻意不带 ?，裸名词 cause 不推断 —— 收紧策略）
+    (r"\bcaused\b", "TRIGGERS"),
+    (r"\bled\s+to\b", "TRIGGERS"),
+    (r"\btriggered?\b", "TRIGGERS"),
+    (r"\bsparked?\b", "TRIGGERS"),
+    (r"\bresulted\s+in\b", "TRIGGERS"),
+    (r"\bprecipitated?\b", "TRIGGERS"),
+]
+
+# 地点类短语 → HAPPENED_IN（方案 C 新增）
+_HAPPENED_IN_PATTERNS: list[tuple[str, str]] = [
+    (r"\bhappened\s+in\b", "HAPPENED_IN"),
+    (r"\boccurred\s+in\b", "HAPPENED_IN"),
+    (r"\btook\s+place\s+in\b", "HAPPENED_IN"),
+    (r"\bis\s+located\s+in\b", "HAPPENED_IN"),
+    (r"\bwas\s+located\s+in\b", "HAPPENED_IN"),
 ]
 
 # 上一轮迁移中的过宽模式（裸 became / partners）。阶段 2 据此圈定需要
@@ -140,8 +238,9 @@ _MISLABELED_FACT_RE = re.compile(r"\bbecame\b|\bpartners?\b", re.IGNORECASE)
 def infer_legacy_edge_type(fact: str | None) -> str | None:
     """从 fact 文本推断遗留类型名；无法推断时返回 None（保持 RELATES_TO）。
 
-    归属关系（PART_OF 系）优先于任职/参与关系（INVOLVES 系），
-    因结构性归属语义更具体；两者同时命中时取归属。
+    优先级 PART_OF > INVOLVES > AFFECTS > TRIGGERS > HAPPENED_IN:
+    结构性归属 > 主体参与 > 影响 > 因果 > 地点。语义越具体越优先；
+    同时命中时取更具体者（如 "The subsidiary supports ..." → PART_OF）。
     """
     if not fact:
         return None
@@ -150,6 +249,15 @@ def infer_legacy_edge_type(fact: str | None) -> str | None:
         if re.search(pattern, text):
             return legacy
     for pattern, legacy in _INVOLVES_PATTERNS:
+        if re.search(pattern, text):
+            return legacy
+    for pattern, legacy in _AFFECTS_PATTERNS:
+        if re.search(pattern, text):
+            return legacy
+    for pattern, legacy in _TRIGGERS_PATTERNS:
+        if re.search(pattern, text):
+            return legacy
+    for pattern, legacy in _HAPPENED_IN_PATTERNS:
         if re.search(pattern, text):
             return legacy
     return None

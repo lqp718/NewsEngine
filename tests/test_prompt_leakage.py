@@ -96,6 +96,62 @@ class TestBuildExtractionInstructions:
         assert "ENTITY RESOLUTION RULES" not in instructions
 
 
+class TestRelationTypeRules:
+    """方案A: RELATION TYPE RULES 关系类型引导规则注入断言。
+
+    背景: RELATES_TO 占比 58.7%，根因是 LLM 自行派生类型后被
+    normalize_edge_type() 兑底成 RELATES_TO。方案A 在
+    custom_extraction_instructions 追加引导规则，要求 LLM 在提取阶段就优先选用具体类型。
+    """
+
+    def test_instructions_contain_relation_type_rules(self):
+        ent = EntityItem(type="stock", name="Tencent Holdings", ticker="0700.HK")
+        episode = _make_episode(entities=[ent])
+        instructions = _build_extraction_instructions(episode)
+
+        assert "RELATION TYPE RULES" in instructions
+        assert "Prefer specific types over RELATES_TO" in instructions
+        # 五条引导映射均存在，且目标类型属于核心关系类型集（不含 EXPOSED_TO）
+        for target in ("INVOLVES", "PART_OF", "AFFECTS", "TRIGGERS", "HAPPENED_IN"):
+            assert f"-> {target}" in instructions
+
+    def test_relation_type_rules_present_without_entities(self):
+        # 无实体时仍需注入关系类型引导（与 canonical names 无关）
+        instructions = _build_extraction_instructions(_make_episode(entities=[]))
+
+        assert "RELATION TYPE RULES" in instructions
+        assert "Prefer specific types over RELATES_TO" in instructions
+        # canonical 段落仍不应出现（不回归）
+        assert "CANONICAL ENTITY NAMES" not in instructions
+
+    @pytest.mark.asyncio
+    async def test_relation_type_rules_carry_through_write_one(self):
+        """write_one 传给 add_episode 的 instructions 携带 RELATION TYPE RULES，
+        且 episode_body 不受影响（仍只含正文）。"""
+        body = "Apple Inc acquired a minority stake in a chip startup."
+        episode = _make_episode(body=body, entities=[])
+
+        fake_graphiti = SimpleNamespace(
+            add_episode=AsyncMock(
+                return_value=SimpleNamespace(
+                    episode=SimpleNamespace(uuid="ep-uuid-0002"),
+                    nodes=[],
+                    edges=[],
+                )
+            )
+        )
+        writer = EpisodeWriter(graphiti=fake_graphiti, neo4j_driver=None)
+
+        result = await writer.write_one(episode)
+
+        assert result.status == "ok"
+        kwargs = fake_graphiti.add_episode.call_args.kwargs
+        assert "RELATION TYPE RULES" in kwargs["custom_extraction_instructions"]
+        # episode_body 通道不被规则文本污染（验收标准 4）
+        assert kwargs["episode_body"] == body
+        assert "RELATION TYPE RULES" not in kwargs["episode_body"]
+
+
 class TestWriteOneNoLeakage:
     """write_one 传给 add_episode 的参数不得携带指令文本。"""
 
@@ -130,6 +186,10 @@ class TestWriteOneNoLeakage:
         assert "CANONICAL ENTITY NAMES" in instructions
         assert f"- {ent.name} ({ent.ticker})" in instructions
         assert "ENTITY RESOLUTION RULES" in instructions
+
+        # 3) 方案A: RELATION TYPE RULES 同样走 instructions 通道，不进 body
+        assert "RELATION TYPE RULES" in instructions
+        assert "RELATION TYPE RULES" not in kwargs["episode_body"]
 
 
 class TestCleanScriptTruncate:

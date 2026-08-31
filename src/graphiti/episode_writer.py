@@ -151,6 +151,8 @@ def normalize_edge_type(edge_type: str | None) -> str:
       CEO_OF/EMPLOYED_BY/WORKS_FOR/CHAIR*/PRESIDENT* → INVOLVES
       （"CHAIR" 前缀同时覆盖 CHAIRMAN_OF / CHAIRPERSON / CHAIR_OF，与写时/
       迁移规则对称）
+    - 重归一方案 C 新增: ACQUIRED_BY（收购 → 结构性归属）→ PART_OF；
+      LED_TO / SPARKED / RESULTED_IN（因果动词遗留名）→ TRIGGERS
     - TRACKS/REPORTS/REPORTED_BY/STATES 属通用关联，由默认兜底保持
       RELATES_TO（不单设规则，显式注释以免后续误改）
     """
@@ -160,7 +162,7 @@ def normalize_edge_type(edge_type: str | None) -> str:
     if edge_upper.startswith("RELATES_TO"):
         return "RELATES_TO"
     # "TRIGGER" 前缀同时覆盖 TRIGGERS / TRIGGERED_BY / TRIGGER（盲区修复）
-    if edge_upper.startswith(("CAUSES", "CAUSED", "TRIGGER")):
+    if edge_upper.startswith(("CAUSES", "CAUSED", "TRIGGER", "LED_TO", "SPARK", "RESULT")):
         return "TRIGGERS"
     if edge_upper.startswith(("AFFECTS", "IMPACTS", "INFLUENC", "MITIGATES")):
         return "AFFECTS"
@@ -174,8 +176,9 @@ def normalize_edge_type(edge_type: str | None) -> str:
         return "INVOLVES"
     if edge_upper.startswith("EXPOSED"):
         return "EXPOSED_TO"
-    # 归属关系: 子公司/被持有/母子公司 → PART_OF
-    if edge_upper.startswith(("SUBSIDIARY", "OWNED_BY", "PARENT_OF")):
+    # 归属关系: 子公司/被持有/母子公司/被收购 → PART_OF（重归一方案 C 新增
+    # ACQUIRED：收购关系与所有权同构，归入结构性归属）
+    if edge_upper.startswith(("SUBSIDIARY", "OWNED_BY", "PARENT_OF", "ACQUIRED")):
         return "PART_OF"
     # 地区关联: 仅精确 "IN" / "IN_*" / "HAPPENED*"（原 startswith("IN") 过宽）
     if edge_upper == "IN" or edge_upper.startswith(("IN_", "HAPPENED")):
@@ -709,12 +712,23 @@ def _build_extraction_instructions(episode: NormalizedEpisode) -> str:
 
     注入 ENTITY RESOLUTION RULES 约束，强制 LLM 使用规范化后的实体名称，
     避免因名称变体（如 "Tencent" vs "Tencent Holdings Ltd."）导致的重复实体。
+
+    另注入 RELATION TYPE RULES，引导 LLM 优先使用具体关系类型，
+    降低 RELATES_TO 占比（方案A，预期 58.7% → ~45%）。
     """
     base = (
         "ENTITY NAME LANGUAGE RULE:\n"
         "- Always extract entity names in English.\n"
         "- Translate non-English names to their standard English equivalents.\n"
-        "- If uncertain about translation, keep the original name."
+        "- If uncertain about translation, keep the original name.\n"
+        "\n"
+        "RELATION TYPE RULES:\n"
+        "- Prefer specific types over RELATES_TO. Use RELATES_TO only as a last resort.\n"
+        '- "X is the <role/title> of Y" or "X works for Y" -> INVOLVES\n'
+        '- "X owns / acquired / holds a stake in Y" -> PART_OF\n'
+        '- "X threatens / boosts / pressures / impacts Y" -> AFFECTS\n'
+        '- "X caused / led to / triggered Y" -> TRIGGERS\n'
+        '- "X happened / is located in <place>" -> HAPPENED_IN'
     )
     if not episode.entities:
         return base

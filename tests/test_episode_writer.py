@@ -11,7 +11,8 @@
 - None / 空输入 → RELATES_TO
 - 重归一脚本的 fact 关键词推断（scripts/renormalize_edge_types.py），
   含误伤反例（状态变化句式 became / 动词 partners）、
-  误标修正阶段（build_fix_plan）与 dry-run / 写库分支（fake driver）
+  误标修正阶段（build_fix_plan）与 dry-run / 写库分支（fake driver）、
+  方案 C 新增规则（AFFECTS / TRIGGERS / HAPPENED_IN 关键词 + 收紧策略 + 优先级）
 """
 
 from __future__ import annotations
@@ -287,6 +288,141 @@ class TestRenormalizeFactInference:
         fact = "MMG is a subsidiary of China Minmetals Corp."
         legacy = mod.infer_legacy_edge_type(fact)
         assert normalize_edge_type(legacy) == "PART_OF"
+
+    # ── "part of" 收紧（2026-08-31）: 归属句式命中，"as part of" 习语不命中 ──
+    # 背景: 裸 \bpart\s+of\b 把 42 条命中中 37 条 "as part of" 习语误归 PART_OF。
+
+    @pytest.mark.parametrize(
+        "fact",
+        [
+            # 正向: 归属句式（X is/are/form(s)/remain(s) (a/an) [修饰词] part of Y）
+            "The mine forms part of the Eagle project",
+            "Abu Dhabi is part of the UAE",
+            "The plant is an integral part of the investment",
+            "The business remains a key part of the portfolio",
+        ],
+    )
+    def test_attribution_part_of_infers_part_of(self, mod, fact):
+        legacy = mod.infer_legacy_edge_type(fact)
+        assert legacy is not None
+        assert normalize_edge_type(legacy) == "PART_OF"
+
+    @pytest.mark.parametrize(
+        "fact",
+        [
+            # 反向: "as part of ..." 习语 —— "part of" 前无系动词，不命中归属模式；
+            # 且不应被其他模式（INVOLVES/AFFECTS/...）误归 → 保持 RELATES_TO
+            "Lindor will oversee the mine as part of Codelco's northern operations",
+            "The U.S. imposed sanctions as part of 'Operation Economic Fury'",
+            "Applicants should consider master's programmes as part of the Chevening Scholarship",
+            # 反向: 隐喻参与习语 "are part of the (ongoing) race" —— 有系动词，
+            # 由负向前瞻（抽象隐喻中心词）排除，不归一为 PART_OF
+            "Nvidia's chips are part of the ongoing race to build AI",
+        ],
+    )
+    def test_idiomatic_part_of_stays_relates_to(self, mod, fact):
+        legacy = mod.infer_legacy_edge_type(fact)
+        if legacy is None:
+            return  # 保持 RELATES_TO
+        assert normalize_edge_type(legacy) == "RELATES_TO"
+
+    # ── 方案 C 新增规则: AFFECTS / TRIGGERS / HAPPENED_IN ────────────────
+
+    @pytest.mark.parametrize(
+        "fact",
+        [
+            "Rising copper prices threaten the profitability of smaller miners",
+            "The stimulus package boosts the gold sector",
+            "A stronger dollar pressures metal prices",
+            "The strike impacts production at the Las Bambas mine",
+            "The scandal undermines investor confidence",
+            "Lower ore grades hurt output at the copper mine",
+            "The tax break benefits domestic smelters",
+            "The government supports the mining ban",
+            "The opposition party opposes the new royalty tax",
+            "The fund withdrew its support for the takeover bid",
+            "The embargo harms Chilean copper exports",
+            "The spill damages the river ecosystem",
+            "Higher output strengthens the company's balance sheet",
+            "Rising costs weaken margins at the refinery",
+        ],
+    )
+    def test_affects_facts_infer_affects(self, mod, fact):
+        legacy = mod.infer_legacy_edge_type(fact)
+        assert legacy is not None
+        assert normalize_edge_type(legacy) == "AFFECTS"
+
+    @pytest.mark.parametrize(
+        "fact",
+        [
+            "The strike caused a halt in copper production",
+            "The rate cut led to a rally in gold prices",
+            "The power outage triggered a supply squeeze",
+            "The announcement sparked selling in mining stocks",
+            "The furnace fire resulted in the closure of the smelter",
+            "The sanctions precipitated a liquidity crisis",
+        ],
+    )
+    def test_triggers_facts_infer_triggers(self, mod, fact):
+        legacy = mod.infer_legacy_edge_type(fact)
+        assert legacy is not None
+        assert normalize_edge_type(legacy) == "TRIGGERS"
+
+    @pytest.mark.parametrize(
+        "fact",
+        [
+            "The accident happened in the Atacama region",
+            "The earthquake occurred in northern Chile",
+            "The summit took place in Geneva",
+            "The refinery is located in Texas",
+            "The smelter was located in Guangdong province",
+        ],
+    )
+    def test_happened_in_facts_infer_happened_in(self, mod, fact):
+        legacy = mod.infer_legacy_edge_type(fact)
+        assert legacy is not None
+        assert normalize_edge_type(legacy) == "HAPPENED_IN"
+
+    @pytest.mark.parametrize(
+        "fact",
+        [
+            # impacts 名词用法（后接 of）→ 不归一（收紧策略）
+            "the environmental impacts of mining",
+            # impacts 名词用法（have impacts on ...）→ 不归一（抽样发现）
+            "The project will have significant impacts on medicine",
+            # supports 名词复数用法（后接介词）→ 不归一（收紧策略）
+            "technical supports for the project",
+            # cause 名词用法（非 caused 动词）→ 不归一（收紧策略）
+            "the cause of the accident",
+            # support 技术分析名词用法（support at $X）→ 不归一（抽样发现）
+            "Crude Oil WTI is above the SuperTrend support at $83.32",
+            # support 名词用法（fiscal support during ...）→ 不归一（抽样发现）
+            "The ECB released research on fiscal support during the pandemic",
+        ],
+    )
+    def test_noun_usage_stays_relates_to(self, mod, fact):
+        legacy = mod.infer_legacy_edge_type(fact)
+        if legacy is None:
+            return  # 保持 RELATES_TO
+        assert normalize_edge_type(legacy) == "RELATES_TO"
+
+    def test_part_of_takes_priority_over_affects(self, mod):
+        # 优先级: 同时命中 PART_OF 与 AFFECTS 时取 PART_OF（结构性归属优先）
+        fact = "The subsidiary supports the group's overseas expansion"
+        legacy = mod.infer_legacy_edge_type(fact)
+        assert normalize_edge_type(legacy) == "PART_OF"
+
+    def test_involves_takes_priority_over_triggers(self, mod):
+        # 优先级: 同时命中 INVOLVES 与 TRIGGERS 时取 INVOLVES（参与 > 因果）
+        fact = "The chairman caused controversy with the restructuring plan"
+        legacy = mod.infer_legacy_edge_type(fact)
+        assert normalize_edge_type(legacy) == "INVOLVES"
+
+    def test_affects_takes_priority_over_happened_in(self, mod):
+        # 优先级: 同时命中 AFFECTS 与 HAPPENED_IN 时取 AFFECTS（影响 > 地点）
+        fact = "The storm that happened in Chile threatens copper output"
+        legacy = mod.infer_legacy_edge_type(fact)
+        assert normalize_edge_type(legacy) == "AFFECTS"
 
 
 class TestRenormalizeFixPlan:
