@@ -65,6 +65,7 @@ async def _ensure_graphiti_indices() -> None:
     任何模式（常驻 / ingest-only / 注入外部 graphiti）都覆盖。失败仅记日志，
     不阻塞启动 —— 写入时 graphiti 使用缺失索引仍可工作，只是性能差。
     """
+    global _indices_built
     if _indices_built:
         return
     _indices_built = True  # 先置位，避免并发重复构建
