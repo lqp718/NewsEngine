@@ -334,8 +334,10 @@ class EpisodeWriter:
                 duration_ms=(time.monotonic() - start) * 1000,
             )
 
-        # 1. 构造扩展 episode_body
-        extended_body = _build_extended_body(episode)
+        # 1. episode_body 只承载正文内容。
+        #    ⚠️ 提示词/规则约束禁止追加到 episode_body —— graphiti-core 的 LLM 会把
+        #    body 中的指令文本当作实体数据提取，写入节点属性（prompt leakage）。
+        #    实体解析规则统一通过 custom_extraction_instructions 传递（见步骤 3）。
 
         # 2. 提取 content_scope 用于写入后透传
         content_scope = episode.metadata.get("content_scope") if episode.metadata else None
@@ -358,19 +360,14 @@ class EpisodeWriter:
                 async with _LLM_SEMAPHORE:
                     result = await self._graphiti.add_episode(
                         name=episode.name,
-                        episode_body=extended_body,
+                        episode_body=episode.episode_body,
                         source_description=episode.source_description,
                         reference_time=episode.valid_at,
                         source=EpisodeType.text,
                         entity_types=self._entity_types,
                         edge_types=edge_types,
                         edge_type_map=edge_type_map,
-                        custom_extraction_instructions=(
-                            "ENTITY NAME LANGUAGE RULE:\n"
-                            "- Always extract entity names in English.\n"
-                            "- Translate non-English names to their standard English equivalents.\n"
-                            "- If uncertain about translation, keep the original name."
-                        ),
+                        custom_extraction_instructions=_build_extraction_instructions(episode),
                     )
                 _record_success()
 
@@ -702,18 +699,28 @@ class EpisodeWriter:
         return getattr(node, key, None)
 
 
-def _build_extended_body(episode: NormalizedEpisode) -> str:
-    """构建 episode body，附加实体解析约束。
+def _build_extraction_instructions(episode: NormalizedEpisode) -> str:
+    """构建 custom_extraction_instructions（含 canonical entity names 约束）。
 
-    这帮助 LLM 更准确地提取实体（已有提示），减少错误分类。
-    同时注入 ENTITY RESOLUTION RULES 约束，强制 LLM 使用规范化后的实体名称，
+    ⚠️ 提示词约束必须走 graphiti-core 的 custom_extraction_instructions 通道，
+    严禁追加到 episode_body —— 追加到 body 会让 LLM 把指令文本当作实体数据
+    提取并写入节点属性（prompt leakage，如 contact 字段混入 "ENTITY RESOLUTION
+    RULES..." / "Please wait..." 等文本）。
+
+    注入 ENTITY RESOLUTION RULES 约束，强制 LLM 使用规范化后的实体名称，
     避免因名称变体（如 "Tencent" vs "Tencent Holdings Ltd."）导致的重复实体。
     """
+    base = (
+        "ENTITY NAME LANGUAGE RULE:\n"
+        "- Always extract entity names in English.\n"
+        "- Translate non-English names to their standard English equivalents.\n"
+        "- If uncertain about translation, keep the original name."
+    )
     if not episode.entities:
-        return episode.episode_body
+        return base
 
     lines = [
-        "\n[END OF CONTENT]",
+        base,
         "",
         "ENTITY RESOLUTION RULES:",
         "1. Use the canonical names listed below as the preferred forms for entity resolution",
@@ -728,7 +735,7 @@ def _build_extended_body(episode: NormalizedEpisode) -> str:
         else:
             lines.append(f"- {ent.name}")
 
-    return episode.episode_body + "\n".join(lines)
+    return "\n".join(lines)
 
 
 # ── 429 识别 / retryDelay 提取 / 退避 / 熔断 ────────────────────────────
