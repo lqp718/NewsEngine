@@ -427,6 +427,13 @@ class RssAdapter(BaseAdapter):
         summary = record.get("summary", "") or None
         feed_url = record.get("feed_url", "unknown")
 
+        # BBC podcast page filter — /sounds/ and /play/ URLs are SPA pages;
+        # ContentFetcher extracts JavaScript instead of article body, which
+        # pollutes the knowledge graph. Skip them before any fetch/normalize.
+        if link and ('bbc.co.uk' in link) and ('/sounds/' in link or '/play/' in link):
+            logger.debug("Skipping BBC podcast URL: %s", link)
+            return None
+
         # Date window cutoff — drop entries older than news_max_age_days
         settings = get_settings()
         valid_at_candidate = _extract_published(record)
