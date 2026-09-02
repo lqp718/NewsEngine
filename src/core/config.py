@@ -63,6 +63,38 @@ class Settings(BaseSettings):
         description="LLM 模型名（OpenAI 兼容接口）",
     )
 
+    # === LLM Preprocessor (opt-in, default off) ===
+    # 在 adapter 写入 JSON 前增加一层 LLM 预处理：压缩长文 / 整合 codebook 模板。
+    # 详见 docs/design-llm-preprocessing-layer.md。默认关闭，行为与现有完全一致。
+    llm_preprocessor_enabled: bool = Field(
+        False,
+        description="LLM 预处理层开关（默认关闭）。开启后长文压缩 + GDELT 模板整合",
+    )
+    llm_preprocessor_endpoint: str = Field(
+        "http://192.168.0.27:8080/v1",
+        description="LLM 预处理 OpenAI 兼容 Base URL（复用现有 llama-server）",
+    )
+    llm_preprocessor_model: str = Field(
+        "gemma-4-12b",
+        description="LLM 预处理模型名",
+    )
+    llm_preprocessor_compress_threshold: int = Field(
+        5000,
+        description="压缩阈值（chars）：内容超过该长度才触发 LLM 压缩",
+    )
+    llm_preprocessor_compress_target: int = Field(
+        2500,
+        description="压缩目标长度（chars）",
+    )
+    llm_preprocessor_synthesize_target: int = Field(
+        1500,
+        description="整合目标长度（chars）",
+    )
+    llm_preprocessor_timeout: float = Field(
+        30.0,
+        description="LLM 预处理单次请求超时（秒）",
+    )
+
     # === Graphiti 并发控制 ===
     # Episode 级并发（_LLM_SEMAPHORE，同时处理的 episode 数）
     #   Gemini/百炼 API 推荐 3-5，Local 模型推荐 1（llama-server --parallel 1 串行）

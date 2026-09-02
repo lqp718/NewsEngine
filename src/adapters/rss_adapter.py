@@ -24,6 +24,7 @@ import feedparser
 _RSS_SOCKET_TIMEOUT: int = 15
 
 from src.adapters.base import BaseAdapter
+from src.adapters.llm_preprocessor import LLMPreprocessor
 from src.adapters.models import NormalizedEpisode
 from src.core.config import get_settings
 from src.ingestion.severity_enricher import rule_based_severity
@@ -246,6 +247,21 @@ class RssAdapter(BaseAdapter):
         super().__init__(dedup_cache=dedup_cache)
         self.feed_urls = feed_urls or []
         self._content_fetcher = content_fetcher
+
+        # LLM preprocessor (opt-in, default off). RSS only uses compress mode:
+        # the feed-summary fallback is already natural language, so no synthesis.
+        settings = get_settings()
+        if settings.llm_preprocessor_enabled:
+            self._llm_preprocessor: LLMPreprocessor | None = LLMPreprocessor(
+                endpoint=settings.llm_preprocessor_endpoint,
+                model=settings.llm_preprocessor_model,
+                compress_threshold=settings.llm_preprocessor_compress_threshold,
+                compress_target=settings.llm_preprocessor_compress_target,
+                synthesize_target=settings.llm_preprocessor_synthesize_target,
+                timeout=settings.llm_preprocessor_timeout,
+            )
+        else:
+            self._llm_preprocessor = None
 
     # ── feed fetching ────────────────────────────────────────────────
 
@@ -493,10 +509,32 @@ class RssAdapter(BaseAdapter):
         # Build episode body: prefer full_text over summary (never mix both)
         if full_text:
             pure_text, yaml_meta = strip_yaml_front_matter(full_text)
-            episode_body = _build_episode_body(title, pure_text)
+            if (
+                self._llm_preprocessor
+                and len(pure_text) > self._llm_preprocessor.compress_threshold
+            ):
+                # LLM compression for long content (context overflow guard)
+                preprocess_metadata: dict[str, Any] = {
+                    "title": title,
+                    "source_url": link,
+                }
+                body_text = await self._llm_preprocessor.preprocess(
+                    content=pure_text,
+                    metadata=preprocess_metadata,
+                    mode="compress",
+                )
+                # preprocess() enriches metadata with original_content_hash —
+                # fold it into the episode metadata so the source text stays
+                # traceable after it is not persisted.
+                metadata.update(preprocess_metadata)
+            else:
+                body_text = pure_text
+            episode_body = _build_episode_body(title, body_text)
             if yaml_meta:
                 metadata["extracted_metadata"] = yaml_meta
         else:
+            # Fetch failed: RSS feed summary is already publisher-written natural
+            # language — no LLM synthesis needed, keep as-is.
             episode_body = _build_episode_body(title, summary)
 
         content_hash = hashlib.sha256(episode_body.encode("utf-8")).hexdigest()

@@ -428,3 +428,145 @@ class TestEventsFirstPipeline:
         }
         episode = await adapter.normalize(gkg_record)
         assert episode.source_type == "gdelt_csv"
+
+
+# ── LLM preprocessing integration ───────────────────────────────────
+
+
+class TestLLMPreprocessing:
+    """LLM preprocessing opt-in behavior (compress + synthesize)."""
+
+    @staticmethod
+    def _settings(enabled: bool):
+        from types import SimpleNamespace
+
+        s = SimpleNamespace()
+        s.llm_preprocessor_enabled = enabled
+        s.llm_preprocessor_endpoint = "http://test/v1"
+        s.llm_preprocessor_model = "test-model"
+        s.llm_preprocessor_compress_threshold = 5000
+        s.llm_preprocessor_compress_target = 2500
+        s.llm_preprocessor_synthesize_target = 1500
+        s.llm_preprocessor_timeout = 30.0
+        return s
+
+    def test_init_creates_preprocessor_when_enabled(self):
+        with patch(
+            "src.adapters.gdelt_adapter.get_settings",
+            return_value=self._settings(True),
+        ):
+            adapter = GdeltAdapter()
+        assert adapter._llm_preprocessor is not None
+        assert adapter._llm_preprocessor.compress_threshold == 5000
+
+    def test_init_no_preprocessor_when_disabled(self):
+        with patch(
+            "src.adapters.gdelt_adapter.get_settings",
+            return_value=self._settings(False),
+        ):
+            adapter = GdeltAdapter()
+        assert adapter._llm_preprocessor is None
+
+    @pytest.mark.asyncio
+    async def test_event_compress_called_for_long_content(self):
+        adapter = GdeltAdapter()
+        mock_pp = MagicMock()
+        mock_pp.compress_threshold = 100
+        mock_pp.preprocess = AsyncMock(return_value="COMPRESSED BODY")
+        adapter._llm_preprocessor = mock_pp
+        adapter._content_fetcher = MagicMock()
+        adapter._content_fetcher.fetch.return_value = MagicMock(
+            success=True, text="long article text " * 20
+        )
+
+        ev = make_event()
+        record_dict = adapter._events_tuple_to_dict(
+            ev, [], ["https://reuters.com/a1"]
+        )
+        episode = await adapter._normalize_event_record(record_dict)
+
+        mock_pp.preprocess.assert_awaited_once()
+        _, kwargs = mock_pp.preprocess.await_args
+        assert kwargs["mode"] == "compress"
+        assert episode.episode_body == "COMPRESSED BODY"
+
+    @pytest.mark.asyncio
+    async def test_event_synthesize_called_when_fetch_fails(self):
+        adapter = GdeltAdapter()  # no content_fetcher → fetch fails
+        mock_pp = MagicMock()
+        mock_pp.preprocess = AsyncMock(return_value="SYNTHESIZED BODY")
+        adapter._llm_preprocessor = mock_pp
+
+        ev = make_event()
+        record_dict = adapter._events_tuple_to_dict(
+            ev, [], ["https://reuters.com/a1"]
+        )
+        episode = await adapter._normalize_event_record(record_dict)
+
+        mock_pp.preprocess.assert_awaited_once()
+        _, kwargs = mock_pp.preprocess.await_args
+        assert kwargs["mode"] == "synthesize"
+        assert kwargs["metadata"]["cameo_code"] == "163"
+        assert episode.episode_body == "SYNTHESIZED BODY"
+
+    @pytest.mark.asyncio
+    async def test_gkg_compress_called_for_long_content(self):
+        adapter = GdeltAdapter()
+        mock_pp = MagicMock()
+        mock_pp.compress_threshold = 100
+        mock_pp.preprocess = AsyncMock(return_value="GKG COMPRESSED")
+        adapter._llm_preprocessor = mock_pp
+        adapter._content_fetcher = MagicMock()
+        adapter._content_fetcher.fetch.return_value = MagicMock(
+            success=True, text="long gkg article " * 20
+        )
+
+        gkg_record = {
+            "global_event_id": "123",
+            "valid_at": _TEST_EVENT_DATE.replace("-", "") + "000000",
+            "domain": "reuters.com",
+            "source_url": "https://reuters.com/article",
+            "themes": "ECON_FINANCIAL_MARKET",
+            "tone": "0.0,0.0",
+        }
+        episode = await adapter.normalize(gkg_record)
+
+        mock_pp.preprocess.assert_awaited_once()
+        _, kwargs = mock_pp.preprocess.await_args
+        assert kwargs["mode"] == "compress"
+        assert episode.episode_body == "GKG COMPRESSED"
+
+    @pytest.mark.asyncio
+    async def test_gkg_synthesize_called_when_fetch_fails(self):
+        adapter = GdeltAdapter()  # no content_fetcher → fetch fails
+        mock_pp = MagicMock()
+        mock_pp.preprocess = AsyncMock(return_value="GKG SYNTHESIZED")
+        adapter._llm_preprocessor = mock_pp
+
+        gkg_record = {
+            "global_event_id": "123",
+            "valid_at": _TEST_EVENT_DATE.replace("-", "") + "000000",
+            "domain": "reuters.com",
+            "source_url": "https://reuters.com/article",
+            "themes": "ECON_FINANCIAL_MARKET",
+            "tone": "0.0,0.0",
+        }
+        episode = await adapter.normalize(gkg_record)
+
+        mock_pp.preprocess.assert_awaited_once()
+        _, kwargs = mock_pp.preprocess.await_args
+        assert kwargs["mode"] == "synthesize"
+        assert episode.episode_body == "GKG SYNTHESIZED"
+
+    @pytest.mark.asyncio
+    async def test_disabled_no_preprocessing_original_behavior(self):
+        """With preprocessor disabled (default), original CAMEO body is kept."""
+        adapter = GdeltAdapter()
+        assert adapter._llm_preprocessor is None
+        ev = make_event()
+        record_dict = adapter._events_tuple_to_dict(
+            ev, [], ["https://reuters.com/a1"]
+        )
+        episode = await adapter._normalize_event_record(record_dict)
+        assert "## GDELT Events Report" in episode.episode_body
+        assert "CAMEO 163" in episode.episode_body
