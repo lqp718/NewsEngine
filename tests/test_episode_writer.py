@@ -61,7 +61,12 @@ class TestNormalizeEdgeTypeExistingRules:
             ("IN", "HAPPENED_IN"),
             ("IN_REGION", "HAPPENED_IN"),
             ("PART_OF", "PART_OF"),
-            ("BELONGS_TO", "PART_OF"),
+            # P1-5.4: BELONGS_TO 独立于结构性 PART_OF（板块/行业/概念分类归属）
+            ("BELONGS_TO", "BELONGS_TO"),
+            ("TRADED_ON", "TRADED_ON"),
+            ("LISTED_ON", "TRADED_ON"),
+            ("INVESTS_IN", "INVESTS_IN"),
+            ("INVESTED_IN", "INVESTS_IN"),
             ("LOCATED_IN", "PART_OF"),
             ("RELATES_TO", "RELATES_TO"),
         ],

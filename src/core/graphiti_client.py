@@ -57,14 +57,21 @@ def create_graphiti(graph_driver: GraphDriver | None = None) -> Graphiti:
         )
     elif provider == "openai":
         # OpenAI 兼容接口（百炼 DashScope）
-        from .bailian_llm_client import BailianOpenAIClient
-        llm_client = BailianOpenAIClient(
+        # Qwen3.7-Flash 原生支持 json_schema（constrained decoding），
+        # 不再需要 BailianOpenAIClient 的 Schema Echo workaround。
+        #
+        # 重要：Qwen3 系列默认开启 thinking 模式，会生成大量 reasoning tokens
+        # （测试显示简单请求也会生成 1000+ reasoning tokens，耗时 10s+）。
+        # 使用 QwenNoThinkingClient 禁用 thinking 以提升性能。
+        from .qwen_no_thinking_client import QwenNoThinkingClient
+        llm_client = QwenNoThinkingClient(
             config=LLMConfig(
                 api_key=settings.openai_api_key,
                 model=settings.llm_model,
                 base_url=settings.openai_base_url,
             ),
-            structured_output_mode='json_object',  # 百炼不支持 json_schema
+            max_tokens=32768,
+            structured_output_mode='json_schema',
         )
     elif provider == "local":
         # 本地 llama-server（OpenAI 兼容）

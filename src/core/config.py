@@ -370,6 +370,13 @@ class Settings(BaseSettings):
         3000,
         description="pending 高水位告警阈值。",
     )
+    sweep_interval_sec: float = Field(
+        300.0,
+        description=(
+            "IngestWorker 批后 ticker grounding 扫除的最小间隔（秒）。"
+            "P0-5.1: --ingest-only 模式下无 Tier 循环，扫除靠此节流钩子维持。"
+        ),
+    )
 
     model_config = SettingsConfigDict(
         env_file=str(PROJECT_ROOT / ".env"),

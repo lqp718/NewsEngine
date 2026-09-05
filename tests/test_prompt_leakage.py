@@ -111,9 +111,14 @@ class TestRelationTypeRules:
 
         assert "RELATION TYPE RULES" in instructions
         assert "Prefer specific types over RELATES_TO" in instructions
-        # 五条引导映射均存在，且目标类型属于核心关系类型集（不含 EXPOSED_TO）
-        for target in ("INVOLVES", "PART_OF", "AFFECTS", "TRIGGERS", "HAPPENED_IN"):
+        # 四条引导映射均存在，且目标类型属于核心关系类型集（不含 EXPOSED_TO）
+        for target in ("INVOLVES", "AFFECTS", "TRIGGERS", "HAPPENED_IN"):
             assert f"-> {target}" in instructions
+        # P1-5.4: PART_OF 已从 "->" 引导映射移入 RELATION TYPE REFINEMENT 段，
+        # 与 BELONGS_TO / TRADED_ON / INVESTS_IN 一起给出精确语义。
+        assert "RELATION TYPE REFINEMENT" in instructions
+        for target in ("PART_OF", "BELONGS_TO", "TRADED_ON", "INVESTS_IN"):
+            assert f"{target}:" in instructions
 
     def test_relation_type_rules_present_without_entities(self):
         # 无实体时仍需注入关系类型引导（与 canonical names 无关）

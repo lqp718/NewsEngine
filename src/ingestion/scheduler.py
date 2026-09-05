@@ -312,6 +312,12 @@ class IngestionScheduler:
         self._ingest_task: asyncio.Task[None] | None = None
         self._last_retention_date: str | None = None
 
+        # ── P0-5.1: IngestWorker 批后 ticker 扫除节流状态 ─────
+        self._last_post_batch_sweep_ts: float = 0.0
+        self._post_batch_sweep_interval_sec: float = float(
+            getattr(settings, "sweep_interval_sec", 300.0)
+        )
+
         self._neo4j_driver = neo4j_driver
         self._graphiti = graphiti
         self._feed_urls = feed_urls or _DEFAULT_RSS_FEEDS
@@ -758,6 +764,8 @@ class IngestionScheduler:
                     lease_sec=getattr(lsettings, "ingest_lease_sec", 900),
                     max_attempts=getattr(lsettings, "ingest_max_attempts", 3),
                     pending_high_water=getattr(lsettings, "ingest_pending_high_water", 3000),
+                    # P0-5.1: 批后 ticker grounding 扫除钩子（--ingest-only 补漏）
+                    post_batch_callback=self._post_batch_ticker_sweep,
                 )
                 logger.info(
                     "Landing zone enabled: dir=%s store=%s worker=%s",
@@ -963,9 +971,11 @@ class IngestionScheduler:
             )
 
             try:
-                if tier == 1:
+                if tier == 1 and not self._capture_only:
                     # V2.2: TTL cleanup at start of each cycle (daily guard inside)
                     await self._ttl_cleanup()
+
+                if tier == 1:
                     # json-persistence-layer §5.1: landing 保留期清理（每日一次，
                     # 内部 date guard）。CR P2-3: 挂靠 Tier 1 而非 Tier 4 ——
                     # Tier 4 可能因无适配器/source_filter 而无循环，永远不执行。
@@ -1138,8 +1148,8 @@ class IngestionScheduler:
             else:
                 pipeline_results.append(result)
 
-        # ── Step 3 (Tier 1 only): severity enrichment + briefing ──
-        if tier == 1:
+        # ── Step 3 (Tier 1 only, non-capture): severity enrichment + briefing ──
+        if tier == 1 and not self._capture_only:
             try:
                 from .severity_enricher import enrich_severity_batch
 
@@ -1177,7 +1187,7 @@ class IngestionScheduler:
         # ── Step 4 (Tier 1 only): 存量节点 ticker 扫除（cycle 尾部）──────
         # 保证最终状态不变量：ticker ⟺ 白名单名称。写入时接地负责新写入，
         # cycle 尾部扫除负责清理 LLM 重新引入的错填（如合并节点的英文名变体）。
-        if tier == 1:
+        if tier == 1 and not self._capture_only:
             try:
                 self._sweep_ticker_grounding(tickers)
             except Exception as exc:
@@ -1242,6 +1252,7 @@ class IngestionScheduler:
                 adapter=adapter,
                 writer=writer,
                 tickers=tickers,
+                landing_store=self._landing_store,
             )
         except Exception as exc:
             source_type = getattr(adapter, "SOURCE_TYPE", type(adapter).__name__)
@@ -1388,6 +1399,35 @@ class IngestionScheduler:
                     )
         except Exception as exc:
             logger.warning("Ticker sweep failed (non-critical): %s", exc, exc_info=True)
+
+    async def _post_batch_ticker_sweep(self) -> None:
+        """IngestWorker 批后 ticker grounding 扫除钩子（P0-5.1）。
+
+        Stage A/B 分离后，_sweep_ticker_grounding 原只挂在 Tier 1 cycle 尾部，
+        而 --ingest-only 模式不启动 Tier 循环 → sweep 在两个进程都不跑，
+        存量节点 ticker 覆盖率跌倒 2%。
+
+        本钩子由 IngestWorker 每批写入后调用（post_batch_callback），
+        重用在 cycle 尾部的同一套确定性扫除逻辑。带节流（默认 300s），
+        避免 ingest 高频批量写入时反复扫全库。白名单为空时跳过。
+        """
+        now = time.monotonic()
+        if now - self._last_post_batch_sweep_ts < self._post_batch_sweep_interval_sec:
+            return
+        tickers = get_ticker_whitelist(self._whitelist_path)
+        if not tickers:
+            return
+        self._last_post_batch_sweep_ts = now
+        # _sweep_ticker_grounding 是同步 Cypher（SET/REMOVE pass），放进线程池
+        # 避免阻塞 IngestWorker 的 asyncio 事件循环。
+        try:
+            await asyncio.to_thread(self._sweep_ticker_grounding, tickers)
+        except Exception as exc:
+            logger.warning(
+                "Post-batch ticker sweep failed (non-critical): %s",
+                exc,
+                exc_info=True,
+            )
 
     # ── TTL Cleanup (V2.2 Layer 2) ─────────────────────────────────────
 

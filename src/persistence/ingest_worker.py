@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 from src.persistence.landing_store import ClaimedEpisode, LandingStore
 
@@ -57,6 +57,7 @@ class IngestWorker:
         max_attempts: int = 3,
         pending_high_water: int = 3000,
         stop_event: asyncio.Event | None = None,
+        post_batch_callback: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self._store = store
         self._writer_resolver = writer_resolver or (lambda source_type: None)
@@ -66,6 +67,12 @@ class IngestWorker:
         self._max_attempts = max(max_attempts, 1)
         self._pending_high_water = max(pending_high_water, 1)
         self._stop_event = stop_event if stop_event is not None else asyncio.Event()
+
+        # P0-5.1（data-quality-root-cause-2026-09-04 §5.1）: 每批写入后执行的
+        # ticker grounding 扫除钩子。由 scheduler 注入，确保 --ingest-only
+        # 模式下存量节点 ticker 覆盖率也能维持（原 sweep 只挂在 Tier 1 cycle
+        # 尾部，Stage A/B 分离后两个进程都不跑）。
+        self._post_batch_callback = post_batch_callback
 
         self._busy = False
         """当前是否正在处理一批（run_until_drained 空闲判断用）。"""
@@ -256,6 +263,17 @@ class IngestWorker:
             skipped,
             failed,
         )
+
+        # P0-5.1: 批后 ticker grounding 扫除（钩子失败不中断消费循环）
+        if self._post_batch_callback is not None:
+            try:
+                await self._post_batch_callback()
+            except Exception as exc:
+                logger.warning(
+                    "IngestWorker post_batch_callback failed: %s",
+                    exc,
+                    exc_info=True,
+                )
 
     # ── 状态机回写（P1-2: lease 归属校验 + P1-1: 异常不穿透）──────────
 

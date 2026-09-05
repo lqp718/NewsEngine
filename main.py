@@ -465,7 +465,11 @@ async def main_dry_run(args: argparse.Namespace) -> None:
 
 
 async def main_fetch_only(args: argparse.Namespace) -> None:
-    """Stage A only: fetch → normalize → dedup → write JSONL + register pending."""
+    """Stage A only: fetch → normalize → dedup → write JSONL + register pending.
+
+    --fetch-only          : one-shot capture cycle, then exit.
+    --fetch-only --watch  : resident tier-cycle loop (capture only, no Neo4j).
+    """
     try:
         settings = get_settings()
     except Exception as exc:
@@ -474,7 +478,6 @@ async def main_fetch_only(args: argparse.Namespace) -> None:
 
     setup_logging(level=settings.log_level, log_file=settings.log_file)
     logger = get_logger(__name__)
-    logger.info("=== NewsEngine fetch-only mode (Stage A capture) ===")
 
     scheduler = IngestionScheduler(
         dry_run=False,
@@ -483,31 +486,62 @@ async def main_fetch_only(args: argparse.Namespace) -> None:
         capture_only=True,
     )
 
-    try:
-        results = await scheduler.run_capture_cycle()
-    finally:
-        # CR P2-5: 通过 scheduler.close() 关闭 LandingStore，而非直取私有属性
-        await scheduler.close()
+    if args.watch:
+        # ── 常驻模式：启动 tier 循环（capture only，不连 Neo4j）──
+        logger.info("=== NewsEngine fetch-only watch mode (Stage A resident) ===")
+        await scheduler.start()
 
-    # Print summary
-    print()
-    print("=== FETCH-ONLY SUMMARY (Stage A capture) ===")
-    print(f"{'Source':<12} {'Fetched':<9} {'Landed':<9} {'Time':<6}")
-    total_landed = 0
-    total_time = 0.0
-    for r in results:
-        elapsed = r.elapsed_seconds
-        total_time += elapsed
-        landed = r.episode_count if r.success else 0
-        total_landed += landed
-        status = "OK" if r.success else "ERROR"
-        print(f"{r.source_type:<12} {r.fetch_count or r.episode_count:<9} {landed:<9} {elapsed:.1f}s [{status}]")
-    print(f"{'---':<12} {'---':<9} {'---':<9} {'---':<6}")
-    print(f"{'TOTAL':<12} {'':<9} {total_landed:<9} {total_time:.1f}s")
-    print()
+        # 注册信号处理（优雅退出）
+        loop = asyncio.get_running_loop()
+        stop_event = asyncio.Event()
 
-    logger.info("=== Fetch-only complete ===")
-    sys.exit(0)
+        def _on_signal(sig: int) -> None:
+            logger.warning(
+                "Received %s — stopping fetch watch",
+                signal.Signals(sig).name,
+            )
+            stop_event.set()
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, lambda s=sig: _on_signal(s))
+            except (NotImplementedError, ValueError):
+                pass
+
+        logger.info("Tier loops started. Press Ctrl+C to stop.")
+        await stop_event.wait()
+
+        logger.info("Shutting down...")
+        await scheduler.stop()  # stop() 末尾已调用 close()
+        await scheduler.close()  # 幂等，双保险
+    else:
+        # ── One-shot 模式（保持原有行为）──
+        logger.info("=== NewsEngine fetch-only mode (Stage A capture) ===")
+        try:
+            results = await scheduler.run_capture_cycle()
+        finally:
+            # CR P2-5: 通过 scheduler.close() 关闭 LandingStore，而非直取私有属性
+            await scheduler.close()
+
+        # Print summary
+        print()
+        print("=== FETCH-ONLY SUMMARY (Stage A capture) ===")
+        print(f"{'Source':<12} {'Fetched':<9} {'Landed':<9} {'Time':<6}")
+        total_landed = 0
+        total_time = 0.0
+        for r in results:
+            elapsed = r.elapsed_seconds
+            total_time += elapsed
+            landed = r.episode_count if r.success else 0
+            total_landed += landed
+            status = "OK" if r.success else "ERROR"
+            print(f"{r.source_type:<12} {r.fetch_count or r.episode_count:<9} {landed:<9} {elapsed:.1f}s [{status}]")
+        print(f"{'---':<12} {'---':<9} {'---':<9} {'---':<6}")
+        print(f"{'TOTAL':<12} {'':<9} {total_landed:<9} {total_time:.1f}s")
+        print()
+
+        logger.info("=== Fetch-only complete ===")
+        sys.exit(0)
 
 
 async def main_ingest_only(args: argparse.Namespace) -> None:
@@ -749,8 +783,8 @@ if __name__ == "__main__":
     # ── CLI 互斥/依赖校验（CR P2-4）──────────────────────────────────
     if parsed_args.fetch_only and parsed_args.ingest_only:
         parser.error("--fetch-only and --ingest-only are mutually exclusive")
-    if parsed_args.watch and not parsed_args.ingest_only:
-        parser.error("--watch requires --ingest-only")
+    if parsed_args.watch and not (parsed_args.ingest_only or parsed_args.fetch_only):
+        parser.error("--watch requires --ingest-only or --fetch-only")
     if parsed_args.replay and parsed_args.replay_all:
         parser.error("--replay and --replay-all are mutually exclusive")
 

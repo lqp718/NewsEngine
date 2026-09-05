@@ -45,6 +45,21 @@ def _clean_text(text: str) -> str:
     return _CONTROL_CHAR_RE.sub("", text)
 
 
+# ── 个股管线源类型集合（P1-5.6）──────────────────────────────────────
+# 与 scheduler._resolve_writer 的 _SYMBOL_WRITER_SOURCES 保持一致。用于
+# 在构建抽取指令时判断是否为个股管线（优先中文标准名），避免依赖
+# pre-extracted entities 是否带 ticker（ticker 匹配失败时会误判）。
+_SYMBOL_SOURCE_TYPES = frozenset(
+    {
+        "akshare",
+        "eastmoney",
+        "cls_telegraph",
+        "cninfo_announcement",
+        "eastmoney_research",
+    }
+)
+
+
 # ── 全局并发限制 / 429 退避 / 熔断（跨所有 EpisodeWriter 实例与 Tier 共享） ──
 #
 # 背景: 多个 Tier 共享同一 Gemini 4M tokens/min 配额。并发请求过多会触发
@@ -99,7 +114,10 @@ __all__ = [
 CORE_EDGE_TYPES = {
     "AFFECTS",      # 事件影响股票/行业
     "RELATES_TO",   # 通用关联
-    "PART_OF",      # 行业/地区归属
+    "PART_OF",      # 结构性归属（子公司/持股/组织包含）——P1-5.4 收窄后仅限结构所有权
+    "BELONGS_TO",   # 板块/行业/概念分类归属——P1-5.4 新增
+    "TRADED_ON",    # 交易所上市——P1-5.4 新增
+    "INVESTS_IN",   # 投资关系——P1-5.4 新增
     "EXPOSED_TO",   # 风险暴露
     "TRIGGERS",     # 因果触发
     "HAPPENED_IN",  # 地区关联
@@ -130,6 +148,43 @@ class HappenedInEdge(BaseModel):
     """HAPPENED_IN 关系: 地区关联 — 事件发生或关联于某地区。"""
 
     fact: str = Field(..., description="描述事件与地区关联的事实，使用中文")
+    valid_at: str | None = Field(
+        default=None, description="关系成立日期 (YYYY-MM-DD)"
+    )
+
+
+class BelongsToEdge(BaseModel):
+    """BELONGS_TO 关系: 板块/行业/概念分类归属（P1-5.4 新增）。
+
+    用于区分结构性 PART_OF：板块/指数/概念的分类关系，如
+    "Wuliangye belongs to Liquor II sector"。
+    """
+
+    fact: str = Field(..., description="描述板块/行业/概念分类归属的事实，使用中文")
+    valid_at: str | None = Field(
+        default=None, description="关系成立日期 (YYYY-MM-DD)"
+    )
+
+
+class TradedOnEdge(BaseModel):
+    """TRADED_ON 关系: 交易所上市（P1-5.4 新增）。
+
+    用于区分交易场所与结构性归属，如 "X trades on Y exchange"。
+    """
+
+    fact: str = Field(..., description="描述交易所上市关系的事实，使用中文")
+    valid_at: str | None = Field(
+        default=None, description="关系成立日期 (YYYY-MM-DD)"
+    )
+
+
+class InvestsInEdge(BaseModel):
+    """INVESTS_IN 关系: 投资关系（P1-5.4 新增）。
+
+    用于区分投资行为与结构性归属，如 "X invested $N in Y"。
+    """
+
+    fact: str = Field(..., description="描述投资关系的事实，使用中文")
     valid_at: str | None = Field(
         default=None, description="关系成立日期 (YYYY-MM-DD)"
     )
@@ -183,7 +238,16 @@ def normalize_edge_type(edge_type: str | None) -> str:
     # 地区关联: 仅精确 "IN" / "IN_*" / "HAPPENED*"（原 startswith("IN") 过宽）
     if edge_upper == "IN" or edge_upper.startswith(("IN_", "HAPPENED")):
         return "HAPPENED_IN"
-    if edge_upper.startswith(("PART", "BELONGS", "LOCATED")):
+    # P1-5.4: BELONGS_TO — 板块/行业/概念分类归属（独立于结构性 PART_OF）
+    if edge_upper.startswith("BELONGS"):
+        return "BELONGS_TO"
+    # P1-5.4: TRADED_ON — 交易所上市
+    if edge_upper.startswith(("TRADED", "LISTED")):
+        return "TRADED_ON"
+    # P1-5.4: INVESTS_IN — 投资关系
+    if edge_upper.startswith(("INVESTS", "INVESTED")):
+        return "INVESTS_IN"
+    if edge_upper.startswith(("PART", "LOCATED")):
         return "PART_OF"
     # TRACKS / REPORTS / REPORTED_BY / STATES 等通用关联 → 保持默认兜底
     return "RELATES_TO"  # 默认兜底
@@ -204,6 +268,10 @@ def _normalized_edge_types(
     normalized.setdefault("EXPOSED_TO", ExposedToEdge)
     normalized.setdefault("INVOLVES", InvolvesEdge)
     normalized.setdefault("HAPPENED_IN", HappenedInEdge)
+    # P1-5.4: 新增关系类型的兜底 schema
+    normalized.setdefault("BELONGS_TO", BelongsToEdge)
+    normalized.setdefault("TRADED_ON", TradedOnEdge)
+    normalized.setdefault("INVESTS_IN", InvestsInEdge)
     return normalized
 
 
@@ -300,12 +368,13 @@ class EpisodeWriter:
 
         SynapseEngine 可随时通过 POST /api/tickers/whitelist 推送新白名单，
         scheduler 每个 cycle 重新加载缓存并调用本方法同步到 writer。
+
+        P0-5.2（data-quality-root-cause-2026-09-04 §5.2）: 本方法不再清空
+        _seen_hashes / _seen_urls 去重缓存。此前每 cycle 调 clear() 导致去重
+        记忆归零，Episode 重复写入（31% 冗余）的根因之一。白名单更新与去重
+        缓存无耦合，二者解耦后去重记忆跨 cycle 存活。
         """
         self._whitelist = whitelist or []
-
-        # 实例级别去重缓存（不跨运行周期持久化）
-        self._seen_hashes: set[str] = set()
-        self._seen_urls: set[str] = set()
 
     # ── 公开接口 ────────────────────────────────────────────────────
 
@@ -336,6 +405,27 @@ class EpisodeWriter:
                 status="skipped_duplicate",
                 duration_ms=(time.monotonic() - start) * 1000,
             )
+
+        # 0b. 持久化去重（P1-5.5, data-quality-root-cause-2026-09-04 §5.5）:
+        #     实例级 _seen_hashes 仅存活于当前进程，进程重启/多进程并发时会
+        #     丢失去重记忆，导致 Episode 重复写入 31%。写入前查 Neo4j 是否
+        #     已存在同 content_hash 的 Episodic 节点。
+        if self._neo4j_driver is not None:
+            try:
+                if self._episode_exists_in_neo4j(episode.content_hash):
+                    return WriteResult(
+                        episode_name=episode.name,
+                        status="skipped_duplicate",
+                        duration_ms=(time.monotonic() - start) * 1000,
+                    )
+            except Exception as exc:
+                # 查询失败不阻断写入（去重是优化，非正确性依赖）
+                logger.warning(
+                    "Neo4j episode dedup check failed for '%s': %s",
+                    episode.name,
+                    exc,
+                    exc_info=True,
+                )
 
         # 1. episode_body 只承载正文内容。
         #    ⚠️ 提示词/规则约束禁止追加到 episode_body —— graphiti-core 的 LLM 会把
@@ -541,6 +631,23 @@ class EpisodeWriter:
         """当前实例已处理的唯一 Episode 数量。"""
         return len(self._seen_hashes)
 
+    def _episode_exists_in_neo4j(self, content_hash: str) -> bool:
+        """查 Neo4j 是否已有同 content_hash 的 Episode（持久化去重）。
+
+        P1-5.5（data-quality-root-cause-2026-09-04 §5.5）: Episode name 格式为
+        "{source_type}-{YYYYMMDD}-{group_id}-{hash[:12]}"，hash 前 12 位是 name
+        的唯一尾段。用 hash 前 12 位在 Episodic.name 上做后缀匹配，判断节点是否
+        已存在，弥补实例级 _seen_hashes 在进程重启后归零的去重漏洞。
+        """
+        hash12 = content_hash[:12]
+        result = self._neo4j_driver.execute_query(
+            "MATCH (e:Episodic) WHERE e.name ENDS WITH $hash12 "
+            "RETURN count(e) AS cnt",
+            hash12=hash12,
+        )
+        records = list(result.records)
+        return bool(records) and records[0]["cnt"] > 0
+
     def _set_episode_metadata(
         self,
         episode_uuid: str,
@@ -715,20 +822,60 @@ def _build_extraction_instructions(episode: NormalizedEpisode) -> str:
 
     另注入 RELATION TYPE RULES，引导 LLM 优先使用具体关系类型，
     降低 RELATES_TO 占比（方案A，预期 58.7% → ~45%）。
+
+    P0-5.3（§5.3）: EXCLUSION RULES 排除媒体/数据源误抽为实体。
+    P1-5.4（§5.4）: RELATION TYPE REFINEMENT 收窄 PART_OF，新增
+    BELONGS_TO / TRADED_ON / INVESTS_IN。
+    P1-5.6（§5.6）: 个股管线优先输出中文标准名（白名单为中文名）。
     """
+    # P1-5.6: 个股管线（source_type 属于个股源集）优先中文标准名；
+    # 宏观管线保持英文。以 source_type 为准（确定性信号），相比依赖
+    # pre-extracted entities 是否带 ticker 更稳健（后者在 ticker 匹配失败时
+    # 会误判为宏观管线，正是要修复的语言错配根因）。
+    is_stock_episode = episode.source_type in _SYMBOL_SOURCE_TYPES
+    if is_stock_episode:
+        language_rule = (
+            "ENTITY NAME LANGUAGE RULE (Stock-specific):\n"
+            "- For stocks/companies in the whitelist or canonical list, "
+            "use their Chinese standard name.\n"
+            "  Examples: 腾讯控股 (not Tencent Holdings), "
+            "贵州茅台 (not Kweichow Moutai)\n"
+            "- For other companies, use the name as it appears in the source text.\n"
+            "- Always prefer the official/standard name over translations or variants.\n"
+        )
+    else:
+        language_rule = (
+            "ENTITY NAME LANGUAGE RULE:\n"
+            "- Always extract entity names in English.\n"
+            "- Translate non-English names to their standard English equivalents.\n"
+            "- If uncertain about translation, keep the original name.\n"
+        )
+
     base = (
-        "ENTITY NAME LANGUAGE RULE:\n"
-        "- Always extract entity names in English.\n"
-        "- Translate non-English names to their standard English equivalents.\n"
-        "- If uncertain about translation, keep the original name.\n"
-        "\n"
-        "RELATION TYPE RULES:\n"
-        "- Prefer specific types over RELATES_TO. Use RELATES_TO only as a last resort.\n"
-        '- "X is the <role/title> of Y" or "X works for Y" -> INVOLVES\n'
-        '- "X owns / acquired / holds a stake in Y" -> PART_OF\n'
-        '- "X threatens / boosts / pressures / impacts Y" -> AFFECTS\n'
-        '- "X caused / led to / triggered Y" -> TRIGGERS\n'
-        '- "X happened / is located in <place>" -> HAPPENED_IN'
+        language_rule
+        + "\n"
+        + "EXCLUSION RULES:\n"
+        + "- Do NOT extract news agencies, media outlets, or data providers as entities.\n"
+        + "- Examples: CLS, Cailisi, CLS News, Reuters, Bloomberg, Xinhua, CCTV, Eastmoney, etc.\n"
+        + "- These are reporters/sources, not participants in the events.\n"
+        + "\n"
+        + "RELATION TYPE RULES:\n"
+        + "- Prefer specific types over RELATES_TO. Use RELATES_TO only as a last resort.\n"
+        + '- "X is the <role/title> of Y" or "X works for Y" -> INVOLVES\n'
+        + '- "X threatens / boosts / pressures / impacts Y" -> AFFECTS\n'
+        + '- "X caused / led to / triggered Y" -> TRIGGERS\n'
+        + '- "X happened / is located in <place>" -> HAPPENED_IN\n'
+        + "\n"
+        + "RELATION TYPE REFINEMENT:\n"
+        + '- PART_OF: ONLY for structural ownership (subsidiary, stake holding, '
+        + 'organizational containment). Examples: "Parent owns 51% of Subsidiary", '
+        + '"Holding company includes Division"\n'
+        + '- BELONGS_TO: for sector/industry/concept classification. '
+        + 'Examples: "X belongs to Y sector", "X is a member of Y index"\n'
+        + '- TRADED_ON: for stock exchange listing. '
+        + 'Examples: "X trades on Y exchange", "X is listed on Y"\n'
+        + '- INVESTS_IN: for investment relationships. '
+        + 'Examples: "X invested $N in Y", "X acquired stake in Y"\n'
     )
     if not episode.entities:
         return base
