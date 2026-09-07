@@ -86,10 +86,6 @@ class Settings(BaseSettings):
         2500,
         description="压缩目标长度（chars）",
     )
-    llm_preprocessor_synthesize_target: int = Field(
-        1500,
-        description="整合目标长度（chars）",
-    )
     llm_preprocessor_timeout: float = Field(
         30.0,
         description="LLM 预处理单次请求超时（秒）",

@@ -198,7 +198,6 @@ class TestRssLLMPreprocessing:
 
         mock_pp.preprocess.assert_awaited_once()
         _, kwargs = mock_pp.preprocess.await_args
-        assert kwargs["mode"] == "compress"
         assert "RSS COMPRESSED BODY" in episode.episode_body
 
     @pytest.mark.asyncio

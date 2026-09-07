@@ -1,4 +1,4 @@
-"""LLM Preprocessing Layer — compress/synthesize episode content before JSON write.
+"""LLM Preprocessing Layer — compress episode content before JSON write.
 
 Design: docs/design-llm-preprocessing-layer.md
 
@@ -12,10 +12,6 @@ content fetch and the JSON write:
 - **compress** mode: fetched article text longer than ``compress_threshold``
   chars is summarized down to ~``compress_target`` chars while preserving
   entities, numbers, dates, and causal claims. Used by both GDELT and RSS.
-- **synthesize** mode: the structured GDELT codebook template (CAMEO + actors
-  + Goldstein/tone) produced when source fetch fails is rewritten into a
-  ~``synthesize_target`` char natural-language summary. Used by GDELT only —
-  the RSS fallback is already publisher-written natural language.
 
 Graceful degradation: on any LLM failure (timeout, HTTP error, malformed
 response, empty output) ``preprocess()`` returns the original content
@@ -49,7 +45,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
-from typing import Any, Literal
+from typing import Any
 
 import httpx
 
@@ -77,22 +73,6 @@ COMPRESS_SCHEMA: dict[str, Any] = {
     "required": ["summary"],
 }
 
-SYNTHESIZE_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "summary": {"type": "string", "description": "Natural language summary"},
-        "who": {"type": "array", "items": {"type": "string"}, "description": "Entities involved"},
-        "what": {"type": "string", "description": "What happened"},
-        "when": {"type": "string", "description": "When it occurred"},
-        "where": {"type": "string", "description": "Where it occurred"},
-        "significance": {"type": "string", "description": "Potential impact"},
-    },
-    "required": ["summary"],
-}
-
-# Prompts are English by design: the serving model is Gemma 4 12B, which
-# follows English instructions significantly better. Length/format constraints
-# are now enforced by the JSON schema, so prompts focus on content quality.
 COMPRESS_PROMPT = """You are a news content compressor. Given the following article, \
 produce a concise summary that preserves:
 
@@ -109,23 +89,6 @@ ARTICLE:
 {content}
 ---"""
 
-SYNTHESIZE_PROMPT = """You are a news analyst. Given the following structured metadata \
-about a geopolitical/economic event, produce a natural language summary.
-
-Metadata:
-{metadata}
-
-Structured content:
-{content}
-
-Requirements:
-- Describe WHAT happened, WHO is involved, WHEN and WHERE it occurred
-- Explain the significance or potential impact if apparent
-- Use natural flowing prose, not bullet points
-- Do not invent facts not present in the metadata
-
-Natural language summary:"""
-
 
 class LLMPreprocessor:
     """LLM-based episode content preprocessor (opt-in preprocessing layer).
@@ -137,7 +100,6 @@ class LLMPreprocessor:
         compress_threshold: Content length (chars) above which compress mode
             is applied. Content at or below this length is passed through.
         compress_target: Target length (chars) for compressed summaries.
-        synthesize_target: Target length (chars) for synthesized summaries.
         timeout: Per-request timeout (seconds).
     """
 
@@ -148,7 +110,6 @@ class LLMPreprocessor:
         api_key: str = "local",
         compress_threshold: int = 5000,
         compress_target: int = 2500,
-        synthesize_target: int = 1500,
         timeout: float = 30.0,
     ) -> None:
         self._endpoint = endpoint.rstrip("/")
@@ -156,7 +117,6 @@ class LLMPreprocessor:
         self._api_key = api_key
         self._compress_threshold = compress_threshold
         self._compress_target = compress_target
-        self._synthesize_target = synthesize_target
         self._timeout = timeout
         # Circuit breaker state (design §2.4).
         self._consecutive_failures = 0
@@ -173,26 +133,19 @@ class LLMPreprocessor:
         self,
         content: str,
         metadata: dict[str, Any] | None = None,
-        mode: Literal["compress", "synthesize"] = "compress",
     ) -> str:
         """Preprocess episode content before it is written to JSON.
 
         Args:
-            content: Original content (full article text or codebook template).
-            metadata: Episode metadata (date, actors, CAMEO code, etc.).
-                Injected into the prompt in synthesize mode; informational
-                in compress mode. When not ``None``, a truncated SHA-256 of
+            content: Original content (full article text).
+            metadata: Episode metadata. When not ``None``, a truncated SHA-256 of
                 ``content`` is written back under ``original_content_hash``.
-            mode: ``"compress"`` — compress a long article; ``"synthesize"``
-                — rewrite a structured template into natural language.
 
         Returns:
             Preprocessed content, or the original ``content`` unchanged when:
-            - mode is unknown,
             - content is empty,
             - the circuit breaker is open (endpoint recently down),
-            - compress mode is requested but content is short
-              (< ``compress_threshold``, including the < 500 char floor),
+            - content is short (< ``compress_threshold``, including the < 500 char floor),
             - the LLM call fails or returns no usable summary
               (graceful degradation).
         """
@@ -205,28 +158,12 @@ class LLMPreprocessor:
             logger.debug("LLMPreprocessor: circuit breaker open, skipping LLM")
             return content
 
-        if mode == "compress":
-            # Below threshold (including the no-compress floor) → pass through.
-            if len(content) < max(self._compress_threshold, _MIN_COMPRESS_CHARS):
-                return content
-            prompt = COMPRESS_PROMPT.format(content=content)
-            schema = COMPRESS_SCHEMA
-            target = self._compress_target
-        elif mode == "synthesize":
-            prompt = SYNTHESIZE_PROMPT.format(
-                metadata=json.dumps(
-                    metadata or {}, ensure_ascii=False, indent=2, default=str
-                ),
-                content=content,
-            )
-            schema = SYNTHESIZE_SCHEMA
-            target = self._synthesize_target
-        else:
-            logger.warning(
-                "LLMPreprocessor: unknown mode %r — returning original content",
-                mode,
-            )
+        # Below threshold (including the no-compress floor) → pass through.
+        if len(content) < max(self._compress_threshold, _MIN_COMPRESS_CHARS):
             return content
+        prompt = COMPRESS_PROMPT.format(content=content)
+        schema = COMPRESS_SCHEMA
+        target = self._compress_target
 
         # Traceability: record a truncated hash of the original content so
         # the pre-compression source text can be identified downstream.
@@ -260,15 +197,6 @@ class LLMPreprocessor:
                 len(content),
             )
             return content
-        if mode == "synthesize" and len(summary) > target * 2:
-            logger.warning(
-                "LLMPreprocessor: synthesize output too long "
-                "(%d chars, target %d) — falling back to original content",
-                len(summary),
-                target,
-            )
-            return content
-
         return summary
 
     # ── LLM call ─────────────────────────────────────────────────────
@@ -340,7 +268,5 @@ class LLMPreprocessor:
 __all__ = [
     "LLMPreprocessor",
     "COMPRESS_PROMPT",
-    "SYNTHESIZE_PROMPT",
     "COMPRESS_SCHEMA",
-    "SYNTHESIZE_SCHEMA",
 ]

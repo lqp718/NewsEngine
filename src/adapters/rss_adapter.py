@@ -257,7 +257,6 @@ class RssAdapter(BaseAdapter):
                 model=settings.llm_preprocessor_model,
                 compress_threshold=settings.llm_preprocessor_compress_threshold,
                 compress_target=settings.llm_preprocessor_compress_target,
-                synthesize_target=settings.llm_preprocessor_synthesize_target,
                 timeout=settings.llm_preprocessor_timeout,
             )
         else:
@@ -521,7 +520,6 @@ class RssAdapter(BaseAdapter):
                 body_text = await self._llm_preprocessor.preprocess(
                     content=pure_text,
                     metadata=preprocess_metadata,
-                    mode="compress",
                 )
                 # preprocess() enriches metadata with original_content_hash —
                 # fold it into the episode metadata so the source text stays

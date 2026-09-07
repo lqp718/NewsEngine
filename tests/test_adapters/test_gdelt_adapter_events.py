@@ -511,7 +511,6 @@ class TestLLMPreprocessing:
 
         mock_pp.preprocess.assert_awaited_once()
         _, kwargs = mock_pp.preprocess.await_args
-        assert kwargs["mode"] == "compress"
         assert episode.episode_body == "COMPRESSED BODY"
 
     @pytest.mark.asyncio
@@ -553,7 +552,6 @@ class TestLLMPreprocessing:
 
         mock_pp.preprocess.assert_awaited_once()
         _, kwargs = mock_pp.preprocess.await_args
-        assert kwargs["mode"] == "compress"
         assert episode.episode_body == "GKG COMPRESSED"
 
     @pytest.mark.asyncio

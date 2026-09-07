@@ -551,8 +551,7 @@ class GdeltAdapter(BaseAdapter):
         )
 
         # LLM preprocessor (opt-in, default off). When enabled, long fetched
-        # article text is compressed and codebook templates are synthesized
-        # into natural language before the episode body is written to JSON.
+        # article text is compressed before the episode body is written to JSON.
         settings = get_settings()
         if settings.llm_preprocessor_enabled:
             self._llm_preprocessor: LLMPreprocessor | None = LLMPreprocessor(
@@ -560,7 +559,6 @@ class GdeltAdapter(BaseAdapter):
                 model=settings.llm_preprocessor_model,
                 compress_threshold=settings.llm_preprocessor_compress_threshold,
                 compress_target=settings.llm_preprocessor_compress_target,
-                synthesize_target=settings.llm_preprocessor_synthesize_target,
                 timeout=settings.llm_preprocessor_timeout,
             )
         else:
@@ -1194,7 +1192,6 @@ class GdeltAdapter(BaseAdapter):
                 body = await self._llm_preprocessor.preprocess(
                     content=pure_text,
                     metadata=preprocess_metadata,
-                    mode="compress",
                 )
                 # preprocess() enriches metadata with original_content_hash —
                 # fold it into the episode metadata so the source text stays
@@ -1204,28 +1201,6 @@ class GdeltAdapter(BaseAdapter):
                 body = _build_episode_body_with_full_text(record, pure_text)
             if yaml_meta:
                 metadata["extracted_metadata"] = yaml_meta
-        else:
-            # Unreachable since 2026-09-07: content_fetched=false returns None
-            # above. Kept as a rollback safety net; deletion tracked as tech debt.
-            template_body = _build_episode_body(record)
-            if self._llm_preprocessor:
-                preprocess_metadata = {
-                    "valid_at": raw_dt,
-                    "domain": record.get("domain", ""),
-                    "themes": record.get("themes", ""),
-                    "persons": record.get("persons", ""),
-                    "organizations": record.get("organizations", ""),
-                    "locations": record.get("locations", ""),
-                    "source_url": source_url,
-                }
-                body = await self._llm_preprocessor.preprocess(
-                    content=template_body,
-                    metadata=preprocess_metadata,
-                    mode="synthesize",
-                )
-                metadata.update(preprocess_metadata)
-            else:
-                body = template_body
 
         content_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
 
@@ -1357,7 +1332,6 @@ class GdeltAdapter(BaseAdapter):
                 body = await self._llm_preprocessor.preprocess(
                     content=pure_text,
                     metadata=preprocess_metadata,
-                    mode="compress",
                 )
                 # preprocess() enriches metadata with original_content_hash —
                 # fold it into the episode metadata so the source text stays
@@ -1367,30 +1341,6 @@ class GdeltAdapter(BaseAdapter):
                 body = pure_text
             if yaml_meta:
                 metadata["extracted_metadata"] = yaml_meta
-        else:
-            # Unreachable since 2026-09-07: content_fetched=false returns None
-            # above. Kept as a rollback safety net; deletion tracked as tech debt.
-            # No full text: fall back to CAMEO summary (~300 chars)
-            template_body = _build_event_episode_body(event_record, resolved_urls)
-            if self._llm_preprocessor:
-                # Synthesize the structured codebook template into natural language
-                preprocess_metadata = {
-                    "event_date": event_record.event_date,
-                    "cameo_code": event_record.cameo_code,
-                    "cameo_description": translate_cameo(event_record.cameo_code),
-                    "actor1": event_record.actor1_name or event_record.actor1_code,
-                    "actor2": event_record.actor2_name or event_record.actor2_code,
-                    "goldstein": event_record.goldstein_scale,
-                    "tone": event_record.avg_tone,
-                }
-                body = await self._llm_preprocessor.preprocess(
-                    content=template_body,
-                    metadata=preprocess_metadata,
-                    mode="synthesize",
-                )
-                metadata.update(preprocess_metadata)
-            else:
-                body = template_body
 
         content_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
 
