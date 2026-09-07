@@ -72,6 +72,10 @@ class CLSAdapter(BaseAdapter):
     - Uses CLS article ID for precise deduplication
     - Preserves level (A/B/C importance) in metadata for downstream reference
 
+    P0-1 (SYMBOL supply fix): content_scope is now dynamic —
+    "SYMBOL" when the API annotates a non-empty stock_list, "MACRO"
+    otherwise (previously hardcoded to "MACRO").
+
     Args:
         page_size: Number of articles to fetch per request (default: 50).
         dedup_cache: Shared dedup cache across adapters.
@@ -152,6 +156,9 @@ class CLSAdapter(BaseAdapter):
         - Extracts subjects (topic tags) into metadata
         - Uses CLS article ID for precise deduplication
         - Preserves level (A/B/C importance) in metadata
+
+        P0-1: content_scope derived from stock_list (SYMBOL if non-empty,
+        MACRO otherwise); cls_stock_count continues to record len(stock_list).
         """
         title = _strip_html(record.get("title", "") or record.get("brief", ""))
         content = _strip_html(record.get("content", "") or record.get("brief", ""))
@@ -159,7 +166,9 @@ class CLSAdapter(BaseAdapter):
         ts = record.get("ctime")
         article_id = record.get("id")  # V6.1.1: CLS article ID for dedup
         level = record.get("level", "")  # V6.1.1: A/B/C importance level
-        stock_list = record.get("stock_list", [])  # V6.1.1: API-returned stock entities
+        # V6.1.1: API-returned stock entities. `or []` guards against an
+        # explicit JSON null so downstream scope/entity logic stays safe.
+        stock_list = record.get("stock_list") or []
         subjects = record.get("subjects", [])  # V6.1.1: topic tags
 
         # Build episode body
@@ -184,6 +193,13 @@ class CLSAdapter(BaseAdapter):
 
         # V6.1.1: Extract entities from API-returned stock_list (precise)
         entities = self._extract_entities_from_stock_list(stock_list)
+
+        # P0-1 (SYMBOL supply fix): dynamic content_scope. CLS editor-annotated
+        # stock_list means the telegraph is stock-specific → SYMBOL pipeline;
+        # without annotated stocks it is market-wide news → MACRO pipeline.
+        # Replaces the previous hardcoded "MACRO" which misrouted all CLS
+        # episodes to the MACRO pipeline.
+        content_scope = "SYMBOL" if stock_list else "MACRO"
         
         # V6.1.1: Extract subject names for metadata
         subject_names = [s.get("subject_name", "") for s in (subjects or []) if s.get("subject_name")]
@@ -207,7 +223,7 @@ class CLSAdapter(BaseAdapter):
             keywords=keywords,
             entities=entities,
             metadata={
-                "content_scope": "MACRO",  # CLS is market-wide, not stock-specific
+                "content_scope": content_scope,  # P0-1: dynamic (see above)
                 "adapter": "cls",
                 "content_fetched": True,  # API returns full text
                 # V6.1.1: Enhanced metadata
@@ -263,7 +279,8 @@ class CLSAdapter(BaseAdapter):
             if exchange:
                 kwargs["exchange"] = exchange
             if is_stib:
-                kwargs["sector"] = "STAR Market"  # 科创板
+                # P1-2: 中文 canonical sector（原 "STAR Market" 导致英文 sector 泄漏）
+                kwargs["sector"] = "科创板"
 
             entities.append(EntityItem(**kwargs))
 

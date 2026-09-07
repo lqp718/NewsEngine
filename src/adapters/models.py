@@ -55,7 +55,8 @@ class EntityItem(BaseModel):
     sector: str | None = Field(
         default=None,
         description=(
-            "Stock sector (e.g. 'Tech', 'Financials'). "
+            "Stock sector in Chinese canonical form (e.g. '科技', '金融'). "
+            "Normalized via canonical_name on construction. "
             "Only present for stock entities."
         ),
     )
@@ -68,10 +69,14 @@ class EntityItem(BaseModel):
     )
 
     def __init__(self, **data):
-        """Initialize and normalize entity name to canonical form."""
+        """Initialize and normalize entity/sector names to canonical form."""
         super().__init__(**data)
         # Normalize entity name to canonical form to reduce duplicates
         self.name = canonical_name(self.name, self.type)
+        # P1-2: normalize sector to Chinese canonical form (e.g. Tech→科技,
+        # STAR Market→科创板) so macro/symbol pipelines share sector names.
+        if self.sector:
+            self.sector = canonical_name(self.sector, "sector")
 
 
 def build_entity_suffix(entities: list[EntityItem]) -> str:

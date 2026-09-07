@@ -115,10 +115,14 @@ class TestRelationTypeRules:
         for target in ("INVOLVES", "AFFECTS", "TRIGGERS", "HAPPENED_IN"):
             assert f"-> {target}" in instructions
         # P1-5.4: PART_OF 已从 "->" 引导映射移入 RELATION TYPE REFINEMENT 段，
-        # 与 BELONGS_TO / TRADED_ON / INVESTS_IN 一起给出精确语义。
+        # 与 BELONGS_TO / TRADED_ON 一起给出精确语义。
+        # P1-3: INVESTS_IN 已废弃移除，提示词显式禁止再创造废弃类型。
         assert "RELATION TYPE REFINEMENT" in instructions
-        for target in ("PART_OF", "BELONGS_TO", "TRADED_ON", "INVESTS_IN"):
+        for target in ("PART_OF", "BELONGS_TO", "TRADED_ON"):
             assert f"{target}:" in instructions
+        assert "INVESTS_IN:" not in instructions
+        assert "EXPOSED_TO:" not in instructions
+        assert "do NOT invent INVESTS_IN/EXPOSED_TO" in instructions
 
     def test_relation_type_rules_present_without_entities(self):
         # 无实体时仍需注入关系类型引导（与 canonical names 无关）

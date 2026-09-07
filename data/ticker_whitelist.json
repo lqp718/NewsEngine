@@ -1,0 +1,538 @@
+{
+  "tickers": [
+    {
+      "ticker": "0700.HK",
+      "sector": "互联网",
+      "biz_code": "00700",
+      "name": "腾讯控股",
+      "exchange": "HKEX"
+    },
+    {
+      "ticker": "9988.HK",
+      "sector": "电商",
+      "biz_code": "09988",
+      "name": "阿里巴巴-W",
+      "exchange": "HKEX"
+    },
+    {
+      "ticker": "3690.HK",
+      "sector": "互联网",
+      "biz_code": "03690",
+      "name": "美团-W",
+      "exchange": "HKEX"
+    },
+    {
+      "ticker": "1810.HK",
+      "sector": "消费电子",
+      "biz_code": "01810",
+      "name": "小米集团-W",
+      "exchange": "HKEX"
+    },
+    {
+      "ticker": "9618.HK",
+      "sector": "电商",
+      "biz_code": "09618",
+      "name": "京东集团-SW",
+      "exchange": "HKEX"
+    },
+    {
+      "ticker": "9999.HK",
+      "sector": "游戏",
+      "biz_code": "09999",
+      "name": "网易-S",
+      "exchange": "HKEX"
+    },
+    {
+      "ticker": "9888.HK",
+      "sector": "互联网",
+      "biz_code": "09888",
+      "name": "百度集团-SW",
+      "exchange": "HKEX"
+    },
+    {
+      "ticker": "1024.HK",
+      "sector": "传媒",
+      "biz_code": "01024",
+      "name": "快手-W",
+      "exchange": "HKEX"
+    },
+    {
+      "ticker": "0941.HK",
+      "sector": "通信",
+      "biz_code": "00941",
+      "name": "中国移动",
+      "exchange": "HKEX"
+    },
+    {
+      "ticker": "0388.HK",
+      "sector": "证券",
+      "biz_code": "00388",
+      "name": "香港交易所",
+      "exchange": "HKEX"
+    },
+    {
+      "ticker": "1211.HK",
+      "sector": "汽车",
+      "biz_code": "01211",
+      "name": "比亚迪股份",
+      "exchange": "HKEX"
+    },
+    {
+      "ticker": "0939.HK",
+      "sector": "银行",
+      "biz_code": "00939",
+      "name": "建设银行",
+      "exchange": "HKEX"
+    },
+    {
+      "ticker": "1299.HK",
+      "sector": "保险",
+      "biz_code": "01299",
+      "name": "友邦保险",
+      "exchange": "HKEX"
+    },
+    {
+      "ticker": "2020.HK",
+      "sector": "纺织服装",
+      "biz_code": "02020",
+      "name": "安踏体育",
+      "exchange": "HKEX"
+    },
+    {
+      "ticker": "9633.HK",
+      "sector": "食品饮料",
+      "biz_code": "09633",
+      "name": "农夫山泉",
+      "exchange": "HKEX"
+    },
+    {
+      "ticker": "2269.HK",
+      "sector": "医药",
+      "biz_code": "02269",
+      "name": "药明生物",
+      "exchange": "HKEX"
+    },
+    {
+      "ticker": "1929.HK",
+      "sector": "商贸零售",
+      "biz_code": "01929",
+      "name": "周大福",
+      "exchange": "HKEX"
+    },
+    {
+      "ticker": "600519.SH",
+      "sector": "白酒",
+      "biz_code": "600519",
+      "name": "贵州茅台",
+      "exchange": "SSE"
+    },
+    {
+      "ticker": "000858.SZ",
+      "sector": "白酒",
+      "biz_code": "000858",
+      "name": "五粮液",
+      "exchange": "SZSE"
+    },
+    {
+      "ticker": "000568.SZ",
+      "sector": "白酒",
+      "biz_code": "000568",
+      "name": "泸州老窖",
+      "exchange": "SZSE"
+    },
+    {
+      "ticker": "600809.SH",
+      "sector": "白酒",
+      "biz_code": "600809",
+      "name": "山西汾酒",
+      "exchange": "SSE"
+    },
+    {
+      "ticker": "000001.SZ",
+      "sector": "银行",
+      "biz_code": "000001",
+      "name": "平安银行",
+      "exchange": "SZSE"
+    },
+    {
+      "ticker": "600036.SH",
+      "sector": "银行",
+      "biz_code": "600036",
+      "name": "招商银行",
+      "exchange": "SSE"
+    },
+    {
+      "ticker": "601398.SH",
+      "sector": "银行",
+      "biz_code": "601398",
+      "name": "工商银行",
+      "exchange": "SSE"
+    },
+    {
+      "ticker": "601288.SH",
+      "sector": "银行",
+      "biz_code": "601288",
+      "name": "农业银行",
+      "exchange": "SSE"
+    },
+    {
+      "ticker": "601988.SH",
+      "sector": "银行",
+      "biz_code": "601988",
+      "name": "中国银行",
+      "exchange": "SSE"
+    },
+    {
+      "ticker": "601328.SH",
+      "sector": "银行",
+      "biz_code": "601328",
+      "name": "交通银行",
+      "exchange": "SSE"
+    },
+    {
+      "ticker": "600000.SH",
+      "sector": "银行",
+      "biz_code": "600000",
+      "name": "浦发银行",
+      "exchange": "SSE"
+    },
+    {
+      "ticker": "601166.SH",
+      "sector": "银行",
+      "biz_code": "601166",
+      "name": "兴业银行",
+      "exchange": "SSE"
+    },
+    {
+      "ticker": "601318.SH",
+      "sector": "保险",
+      "biz_code": "601318",
+      "name": "中国平安",
+      "exchange": "SSE"
+    },
+    {
+      "ticker": "601628.SH",
+      "sector": "保险",
+      "biz_code": "601628",
+      "name": "中国人寿",
+      "exchange": "SSE"
+    },
+    {
+      "ticker": "601601.SH",
+      "sector": "保险",
+      "biz_code": "601601",
+      "name": "中国太保",
+      "exchange": "SSE"
+    },
+    {
+      "ticker": "600030.SH",
+      "sector": "证券",
+      "biz_code": "600030",
+      "name": "中信证券",
+      "exchange": "SSE"
+    },
+    {
+      "ticker": "601688.SH",
+      "sector": "证券",
+      "biz_code": "601688",
+      "name": "华泰证券",
+      "exchange": "SSE"
+    },
+    {
+      "ticker": "601211.SH",
+      "sector": "证券",
+      "biz_code": "601211",
+      "name": "国泰海通",
+      "exchange": "SSE"
+    },
+    {
+      "ticker": "300059.SZ",
+      "sector": "互联网金融",
+      "biz_code": "300059",
+      "name": "东方财富",
+      "exchange": "SZSE"
+    },
+    {
+      "ticker": "300750.SZ",
+      "sector": "电池",
+      "biz_code": "300750",
+      "name": "宁德时代",
+      "exchange": "SZSE"
+    },
+    {
+      "ticker": "002594.SZ",
+      "sector": "汽车",
+      "biz_code": "002594",
+      "name": "比亚迪",
+      "exchange": "SZSE"
+    },
+    {
+      "ticker": "600104.SH",
+      "sector": "汽车",
+      "biz_code": "600104",
+      "name": "上汽集团",
+      "exchange": "SSE"
+    },
+    {
+      "ticker": "601012.SH",
+      "sector": "光伏",
+      "biz_code": "601012",
+      "name": "隆基绿能",
+      "exchange": "SSE"
+    },
+    {
+      "ticker": "600438.SH",
+      "sector": "光伏",
+      "biz_code": "600438",
+      "name": "通威股份",
+      "exchange": "SSE"
+    },
+    {
+      "ticker": "688599.SH",
+      "sector": "光伏",
+      "biz_code": "688599",
+      "name": "天合光能",
+      "exchange": "SSE"
+    },
+    {
+      "ticker": "002460.SZ",
+      "sector": "有色金属",
+      "biz_code": "002460",
+      "name": "赣锋锂业",
+      "exchange": "SZSE"
+    },
+    {
+      "ticker": "601899.SH",
+      "sector": "有色金属",
+      "biz_code": "601899",
+      "name": "紫金矿业",
+      "exchange": "SSE"
+    },
+    {
+      "ticker": "603993.SH",
+      "sector": "有色金属",
+      "biz_code": "603993",
+      "name": "洛阳钼业",
+      "exchange": "SSE"
+    },
+    {
+      "ticker": "601088.SH",
+      "sector": "煤炭",
+      "biz_code": "601088",
+      "name": "中国神华",
+      "exchange": "SSE"
+    },
+    {
+      "ticker": "600028.SH",
+      "sector": "石油石化",
+      "biz_code": "600028",
+      "name": "中国石化",
+      "exchange": "SSE"
+    },
+    {
+      "ticker": "601857.SH",
+      "sector": "石油石化",
+      "biz_code": "601857",
+      "name": "中国石油",
+      "exchange": "SSE"
+    },
+    {
+      "ticker": "600900.SH",
+      "sector": "电力",
+      "biz_code": "600900",
+      "name": "长江电力",
+      "exchange": "SSE"
+    },
+    {
+      "ticker": "688981.SH",
+      "sector": "半导体",
+      "biz_code": "688981",
+      "name": "中芯国际",
+      "exchange": "SSE"
+    },
+    {
+      "ticker": "002371.SZ",
+      "sector": "半导体",
+      "biz_code": "002371",
+      "name": "北方华创",
+      "exchange": "SZSE"
+    },
+    {
+      "ticker": "603501.SH",
+      "sector": "半导体",
+      "biz_code": "603501",
+      "name": "韦尔股份",
+      "exchange": "SSE"
+    },
+    {
+      "ticker": "603986.SH",
+      "sector": "半导体",
+      "biz_code": "603986",
+      "name": "兆易创新",
+      "exchange": "SSE"
+    },
+    {
+      "ticker": "002475.SZ",
+      "sector": "消费电子",
+      "biz_code": "002475",
+      "name": "立讯精密",
+      "exchange": "SZSE"
+    },
+    {
+      "ticker": "601138.SH",
+      "sector": "消费电子",
+      "biz_code": "601138",
+      "name": "工业富联",
+      "exchange": "SSE"
+    },
+    {
+      "ticker": "000725.SZ",
+      "sector": "电子",
+      "biz_code": "000725",
+      "name": "京东方A",
+      "exchange": "SZSE"
+    },
+    {
+      "ticker": "002415.SZ",
+      "sector": "安防",
+      "biz_code": "002415",
+      "name": "海康威视",
+      "exchange": "SZSE"
+    },
+    {
+      "ticker": "002236.SZ",
+      "sector": "安防",
+      "biz_code": "002236",
+      "name": "大华股份",
+      "exchange": "SZSE"
+    },
+    {
+      "ticker": "002230.SZ",
+      "sector": "人工智能",
+      "biz_code": "002230",
+      "name": "科大讯飞",
+      "exchange": "SZSE"
+    },
+    {
+      "ticker": "603259.SH",
+      "sector": "医药",
+      "biz_code": "603259",
+      "name": "药明康德",
+      "exchange": "SSE"
+    },
+    {
+      "ticker": "600276.SH",
+      "sector": "医药",
+      "biz_code": "600276",
+      "name": "恒瑞医药",
+      "exchange": "SSE"
+    },
+    {
+      "ticker": "000538.SZ",
+      "sector": "医药",
+      "biz_code": "000538",
+      "name": "云南白药",
+      "exchange": "SZSE"
+    },
+    {
+      "ticker": "300760.SZ",
+      "sector": "医疗器械",
+      "biz_code": "300760",
+      "name": "迈瑞医疗",
+      "exchange": "SZSE"
+    },
+    {
+      "ticker": "300015.SZ",
+      "sector": "医疗服务",
+      "biz_code": "300015",
+      "name": "爱尔眼科",
+      "exchange": "SZSE"
+    },
+    {
+      "ticker": "600887.SH",
+      "sector": "食品饮料",
+      "biz_code": "600887",
+      "name": "伊利股份",
+      "exchange": "SSE"
+    },
+    {
+      "ticker": "603288.SH",
+      "sector": "食品饮料",
+      "biz_code": "603288",
+      "name": "海天味业",
+      "exchange": "SSE"
+    },
+    {
+      "ticker": "002714.SZ",
+      "sector": "养殖",
+      "biz_code": "002714",
+      "name": "牧原股份",
+      "exchange": "SZSE"
+    },
+    {
+      "ticker": "000333.SZ",
+      "sector": "家电",
+      "biz_code": "000333",
+      "name": "美的集团",
+      "exchange": "SZSE"
+    },
+    {
+      "ticker": "000651.SZ",
+      "sector": "家电",
+      "biz_code": "000651",
+      "name": "格力电器",
+      "exchange": "SZSE"
+    },
+    {
+      "ticker": "600690.SH",
+      "sector": "家电",
+      "biz_code": "600690",
+      "name": "海尔智家",
+      "exchange": "SSE"
+    },
+    {
+      "ticker": "601668.SH",
+      "sector": "建筑",
+      "biz_code": "601668",
+      "name": "中国建筑",
+      "exchange": "SSE"
+    },
+    {
+      "ticker": "600585.SH",
+      "sector": "建材",
+      "biz_code": "600585",
+      "name": "海螺水泥",
+      "exchange": "SSE"
+    },
+    {
+      "ticker": "601919.SH",
+      "sector": "航运",
+      "biz_code": "601919",
+      "name": "中远海控",
+      "exchange": "SSE"
+    },
+    {
+      "ticker": "600029.SH",
+      "sector": "航空",
+      "biz_code": "600029",
+      "name": "南方航空",
+      "exchange": "SSE"
+    },
+    {
+      "ticker": "600009.SH",
+      "sector": "交通运输",
+      "biz_code": "600009",
+      "name": "上海机场",
+      "exchange": "SSE"
+    },
+    {
+      "ticker": "601888.SH",
+      "sector": "商贸零售",
+      "biz_code": "601888",
+      "name": "中国中免",
+      "exchange": "SSE"
+    }
+  ],
+  "updated_at": "2026-09-06T00:55:00+08:00",
+  "source": "manual_expansion_p0-2"
+}

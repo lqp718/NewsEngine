@@ -46,8 +46,33 @@ def get_neo4j_driver() -> Driver:
         except Exception as e:
             _logger.error(f"Failed to connect to Neo4j: {e}")
             raise
+
+        # Best-effort idempotent schema indexes (不阻断启动)
+        ensure_indexes(_driver)
     
     return _driver
+
+
+# P2-1（graph-api review）: Entity.ticker 是 /events/entity/{ticker} 事件查询与
+# P2-1 图查询的起点（MATCH (start:Entity) WHERE start.ticker=$ticker），无索引时
+# 为 label scan。CREATE INDEX ... IF NOT EXISTS 幂等，重复执行无副作用。
+_INDEX_DDL: tuple[str, ...] = (
+    "CREATE INDEX entity_ticker IF NOT EXISTS FOR (e:Entity) ON (e.ticker)",
+)
+
+
+def ensure_indexes(driver: Driver) -> None:
+    """Create idempotent schema indexes (best-effort).
+
+    失败仅记 WARNING，不阻断调用方（索引缺失只影响性能，不影响正确性）。
+    """
+    for ddl in _INDEX_DDL:
+        try:
+            with driver.session() as session:
+                session.run(ddl).consume()
+            _logger.info("Index ensured: %s", ddl)
+        except Exception as e:
+            _logger.warning("Index creation skipped (%s): %s", ddl, e)
 
 
 def close_neo4j_driver() -> None:

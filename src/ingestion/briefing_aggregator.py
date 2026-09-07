@@ -251,8 +251,34 @@ class SectorBriefingAggregator:
         return content[:2000]  # 截断超长内容
 
 
+# ---------------------------------------------------------------------------
+# Process-level shared singleton (L2 断路修复)
+# ---------------------------------------------------------------------------
+# 写入方 (ingestion/scheduler.py) 与读取方 (api/deps.py → routers/events.py)
+# 必须共享同一个实例，否则 scheduler 每 15 分钟写入的缓存在 API 侧永远
+# miss（此前两侧各自 SectorBriefingAggregator()，缓存不互通）。
+
+_shared_aggregator: SectorBriefingAggregator | None = None
+
+
+def get_shared_aggregator() -> SectorBriefingAggregator:
+    """Return the process-level shared SectorBriefingAggregator singleton.
+
+    Lazily initialized on first call. Both the ingestion scheduler
+    (writer, via aggregate_all) and the API layer (reader, via get_cached)
+    MUST obtain their instance through this function so they share one
+    in-memory cache within the same process (main.py runs scheduler +
+    uvicorn on a shared event loop).
+    """
+    global _shared_aggregator
+    if _shared_aggregator is None:
+        _shared_aggregator = SectorBriefingAggregator()
+    return _shared_aggregator
+
+
 __all__ = [
     "SectorBriefingAggregator",
     "BriefingCacheEntry",
+    "get_shared_aggregator",
     "SYSTEM_PROMPT",
 ]

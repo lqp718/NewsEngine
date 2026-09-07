@@ -31,6 +31,8 @@ data/landing/
 
 # 运行时缓存文件（TickerSync、数据摄取等生成）
 data/*.json
+# 例外：ticker 白名单需随 git 传播（作为 push 前的种子数据，CR P0-2）
+!data/ticker_whitelist.json
 data/*.sqlite
 data/*.db
 

@@ -33,7 +33,7 @@ from src.utils.entity_canonical import canonical_name
 from src.utils.logging_config import get_logger
 from src.utils.time_utils import now_hkt
 
-from .briefing_aggregator import SectorBriefingAggregator
+from .briefing_aggregator import get_shared_aggregator
 from .pipeline import PipelineResult, run_pipeline
 
 logger = get_logger(__name__)
@@ -205,6 +205,25 @@ def get_ticker_whitelist(cache_path: str) -> list[dict[str, str]]:
             )
             return []
 
+        # 同名多条目会让下游 name_to_ticker 字典后写覆盖（CR P0-2：中国平安双条目），
+        # 且白名单可被 SynapseEngine 随时重新推送，故在加载处显式告警而非静默容忍。
+        seen: dict[str, str] = {}
+        for entry in tickers:
+            name = (entry.get("name") or "").strip()
+            ticker = (entry.get("ticker") or "").strip()
+            if not name or not ticker:
+                continue
+            if name in seen:
+                logger.warning(
+                    "Duplicate whitelist name %r: %s vs %s — grounding will keep "
+                    "the last entry; fix the whitelist source",
+                    name,
+                    seen[name],
+                    ticker,
+                )
+            else:
+                seen[name] = ticker
+
         logger.info("Loaded %d tickers from whitelist cache: %s", len(tickers), cache_path)
         return tickers
 
@@ -359,7 +378,9 @@ class IngestionScheduler:
         self._china_macro_adapter: Any = None
 
         # ── Briefing Aggregator ───────────────────────────────────
-        self._aggregator = SectorBriefingAggregator() if not dry_run else None
+        # L2 断路修复: 使用进程级共享单例，与 API 层 (api/deps.py::get_aggregator)
+        # 读同一个内存缓存；此前自建实例导致缓存写入后 API 永远读不到。
+        self._aggregator = get_shared_aggregator() if not dry_run else None
 
         # ── TTL cleanup state (V2.2) ──────────────────────────────
         self._last_ttl_cleanup_date: str | None = None

@@ -23,11 +23,38 @@ def now_hkt() -> datetime:
     return now.replace(microsecond=0)
 
 
-def to_iso8601(dt: datetime) -> str:
+def coerce_datetime(value) -> datetime | None:
+    """Normalize a datetime-like value to a native datetime, else None.
+
+    Handles:
+        - datetime.datetime (returned as-is)
+        - neo4j.time temporal objects (DateTime/LocalDateTime/Date...) via
+          their ``to_native()`` method. NOTE: neo4j.time.DateTime is NOT a
+          datetime.datetime subclass, so isinstance() checks fail on it.
+
+    Returns:
+        A native datetime, or None if value cannot be coerced.
+    """
+    if isinstance(value, datetime):
+        return value
+    to_native = getattr(value, "to_native", None)
+    if callable(to_native):
+        try:
+            native = to_native()
+        except Exception:
+            return None
+        if isinstance(native, datetime):
+            return native
+    return None
+
+
+def to_iso8601(dt) -> str:
     """Convert a datetime object to ISO 8601 string format.
     
     Args:
-        dt: A datetime object (aware or naive)
+        dt: A datetime object (aware or naive), or a neo4j.time temporal
+            object (e.g. neo4j.time.DateTime) which is coerced via
+            ``to_native()``.
         
     Returns:
         ISO 8601 formatted string in UTC.
@@ -35,6 +62,10 @@ def to_iso8601(dt: datetime) -> str:
         - If dt has timezone, converts to UTC
         - Microseconds are removed
     """
+    coerced = coerce_datetime(dt)
+    if coerced is None:
+        raise TypeError(f"Cannot convert {type(dt).__name__} to ISO 8601 datetime")
+    dt = coerced
     # Remove microseconds to maintain consistent precision
     dt_no_micro = dt.replace(microsecond=0)
     
@@ -113,4 +144,4 @@ def from_iso8601(s: str) -> datetime:
 
 
 
-__all__ = ["now_hkt", "to_iso8601", "from_iso8601"]
+__all__ = ["now_hkt", "to_iso8601", "from_iso8601", "coerce_datetime"]

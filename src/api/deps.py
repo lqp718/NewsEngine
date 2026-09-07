@@ -34,9 +34,13 @@ if TYPE_CHECKING:
     from src.graphiti.episode_writer import EpisodeWriter
 
 # ---------------------------------------------------------------------------
-# Process-level singleton holder for SectorBriefingAggregator
+# SectorBriefingAggregator access
 # ---------------------------------------------------------------------------
-_aggregator: Any | None = None
+# The singleton lives in src/ingestion/briefing_aggregator.py
+# (get_shared_aggregator) so the ingestion scheduler (writer) and the API
+# layer (reader) share ONE in-memory cache within the same process.
+# Do NOT hold a separate instance here — that was the L2 break: scheduler
+# wrote briefings into its own cache while the API read an empty one.
 
 
 # ---------------------------------------------------------------------------
@@ -120,32 +124,15 @@ def get_episode_writer(
 
 
 def get_aggregator() -> Any:
-    """Provide the process-level singleton SectorBriefingAggregator.
+    """Provide the process-level shared SectorBriefingAggregator.
 
-    The aggregator is lazily initialized on first call using a lazy import.
-    It holds an in-memory cache shared across all API requests.
-
-    .. note::
-        ``SectorBriefingAggregator`` lives in ``src/ingestion/briefing_aggregator.py``,
-        which is created in a subsequent N4 task. If the module does not exist yet,
-        calling this function will raise a clear ``ImportError``.
+    Thin proxy — delegates to
+    ``ingestion/briefing_aggregator.py::get_shared_aggregator()``, the same
+    singleton the ingestion scheduler writes briefings into via
+    ``aggregate_all()``. API endpoints read through ``get_cached(sector)``
+    (O(1), no LLM call); a cache miss returns None and consumers fall back
+    to self-aggregation from raw events.
     """
-    global _aggregator
+    from src.ingestion.briefing_aggregator import get_shared_aggregator
 
-    if _aggregator is None:
-        try:
-            from src.ingestion.briefing_aggregator import (  # noqa: F811
-                SectorBriefingAggregator,
-            )
-        except ImportError:
-            raise ImportError(
-                "SectorBriefingAggregator not available. "
-                "Ensure src/ingestion/briefing_aggregator.py exists with "
-                "a SectorBriefingAggregator class. "
-                "This module is part of a subsequent N4 task (build order: "
-                "deps.py first, then briefing_aggregator.py)."
-            ) from None
-
-        _aggregator = SectorBriefingAggregator()
-
-    return _aggregator
+    return get_shared_aggregator()

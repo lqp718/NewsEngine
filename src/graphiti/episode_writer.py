@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import random
 import re
@@ -26,7 +27,7 @@ from graphiti_core.nodes import EpisodeType
 from src.adapters.models import NormalizedEpisode
 from src.graphiti.entity_types import SYMBOL_ENTITY_TYPES
 from src.graphiti.relation_types import EDGE_TYPES, DEFAULT_EDGE_TYPE_MAP
-from src.utils.entity_canonical import canonical_name
+from src.utils.entity_canonical import SECTORS, canonical_name, canonical_sector_names
 from src.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -39,10 +40,16 @@ _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
 
 
 def _clean_text(text: str) -> str:
-    """移除控制字符（保留 \n \r \t）。非字符串原样返回。"""
+    """解码 HTML 实体并移除控制字符（保留 \n \r \t）。非字符串原样返回。
+
+    P3-1: 先 html.unescape 再去控制字符 —— 防止 "China&rsquo;s" 等 HTML
+    实体泄漏进图谱；数字实体（如 &#x1;）解码后可能产生新控制字符，
+    先解码才能一并清除。html.unescape 单遍不递归（"&amp;rsquo;" →
+    "&rsquo;"），不会过度解码。
+    """
     if not isinstance(text, str):
         return text
-    return _CONTROL_CHAR_RE.sub("", text)
+    return _CONTROL_CHAR_RE.sub("", html.unescape(text))
 
 
 # ── 个股管线源类型集合（P1-5.6）──────────────────────────────────────
@@ -96,7 +103,6 @@ __all__ = [
     "EpisodeWriter",
     "CORE_EDGE_TYPES",
     "normalize_edge_type",
-    "ExposedToEdge",
     "InvolvesEdge",
     "HappenedInEdge",
 ]
@@ -117,22 +123,17 @@ CORE_EDGE_TYPES = {
     "PART_OF",      # 结构性归属（子公司/持股/组织包含）——P1-5.4 收窄后仅限结构所有权
     "BELONGS_TO",   # 板块/行业/概念分类归属——P1-5.4 新增
     "TRADED_ON",    # 交易所上市——P1-5.4 新增
-    "INVESTS_IN",   # 投资关系——P1-5.4 新增
-    "EXPOSED_TO",   # 风险暴露
     "TRIGGERS",     # 因果触发
     "HAPPENED_IN",  # 地区关联
     "INVOLVES",     # 主体参与
 }
-"""核心关系类型集 — 所有边语义类型收敛到该集合。"""
+"""核心关系类型集 — 所有边语义类型收敛到该集合。
 
-
-class ExposedToEdge(BaseModel):
-    """EXPOSED_TO 关系: 风险暴露 — 主体/事件暴露于某项风险。"""
-
-    fact: str = Field(..., description="描述风险暴露关系的事实，使用中文")
-    valid_at: str | None = Field(
-        default=None, description="关系成立日期 (YYYY-MM-DD)"
-    )
+P1-3（data-quality 诊断 2026-09-05）: 移除 INVESTS_IN / EXPOSED_TO ——
+抽样证实 INVESTS_IN 约 60% 错误率（捐赠、学历被误抽为投资关系），
+二者均零下游消费。存量边由 scripts/renormalize_edge_types.py 阶段 3
+降级迁移（按 fact 语义重推断，无法推断时回落 RELATES_TO）。
+"""
 
 
 class InvolvesEdge(BaseModel):
@@ -157,7 +158,7 @@ class BelongsToEdge(BaseModel):
     """BELONGS_TO 关系: 板块/行业/概念分类归属（P1-5.4 新增）。
 
     用于区分结构性 PART_OF：板块/指数/概念的分类关系，如
-    "Wuliangye belongs to Liquor II sector"。
+    "五粮液 belongs to 白酒 sector"。
     """
 
     fact: str = Field(..., description="描述板块/行业/概念分类归属的事实，使用中文")
@@ -173,18 +174,6 @@ class TradedOnEdge(BaseModel):
     """
 
     fact: str = Field(..., description="描述交易所上市关系的事实，使用中文")
-    valid_at: str | None = Field(
-        default=None, description="关系成立日期 (YYYY-MM-DD)"
-    )
-
-
-class InvestsInEdge(BaseModel):
-    """INVESTS_IN 关系: 投资关系（P1-5.4 新增）。
-
-    用于区分投资行为与结构性归属，如 "X invested $N in Y"。
-    """
-
-    fact: str = Field(..., description="描述投资关系的事实，使用中文")
     valid_at: str | None = Field(
         default=None, description="关系成立日期 (YYYY-MM-DD)"
     )
@@ -229,8 +218,6 @@ def normalize_edge_type(edge_type: str | None) -> str:
         ("INVOLV", "ACTOR", "CEO", "EMPLOYED", "WORKS_FOR", "CHAIR", "PRESIDENT")
     ):
         return "INVOLVES"
-    if edge_upper.startswith("EXPOSED"):
-        return "EXPOSED_TO"
     # 归属关系: 子公司/被持有/母子公司/被收购 → PART_OF（重归一方案 C 新增
     # ACQUIRED：收购关系与所有权同构，归入结构性归属）
     if edge_upper.startswith(("SUBSIDIARY", "OWNED_BY", "PARENT_OF", "ACQUIRED")):
@@ -244,12 +231,12 @@ def normalize_edge_type(edge_type: str | None) -> str:
     # P1-5.4: TRADED_ON — 交易所上市
     if edge_upper.startswith(("TRADED", "LISTED")):
         return "TRADED_ON"
-    # P1-5.4: INVESTS_IN — 投资关系
-    if edge_upper.startswith(("INVESTS", "INVESTED")):
-        return "INVESTS_IN"
     if edge_upper.startswith(("PART", "LOCATED")):
         return "PART_OF"
-    # TRACKS / REPORTS / REPORTED_BY / STATES 等通用关联 → 保持默认兜底
+    # P1-3 废弃类型: INVESTS_IN / EXPOSED_TO 不再单设规则，连同
+    # TRACKS / REPORTS / REPORTED_BY / STATES 等通用关联由默认兜底
+    # 收敛到 RELATES_TO（"INVESTS" 不中任何前置规则：INVOLV 前缀
+    # 匹配不到 INVESTS，IN_/HAPPENED 规则已收窄）
     return "RELATES_TO"  # 默认兜底
 
 
@@ -259,19 +246,17 @@ def _normalized_edge_types(
     """把 edge_types schema 的键收敛到核心集（边生成阶段的类型约束）。
 
     同一核心类型对应多个遗留类型时复用第一个 model（字段兼容）。
-    核心集中缺少 schema 的类型（EXPOSED_TO / INVOLVES / HAPPENED_IN）
-    由本模块定义的最小 model 补齐，保证 7 种核心类型都可被 LLM 产出。
+    核心集中缺少 schema 的类型（INVOLVES / HAPPENED_IN）
+    由本模块定义的最小 model 补齐，保证核心类型都可被 LLM 产出。
     """
     normalized: dict[str, type[BaseModel]] = {}
     for name, model in edge_types.items():
         normalized.setdefault(normalize_edge_type(name), model)
-    normalized.setdefault("EXPOSED_TO", ExposedToEdge)
     normalized.setdefault("INVOLVES", InvolvesEdge)
     normalized.setdefault("HAPPENED_IN", HappenedInEdge)
     # P1-5.4: 新增关系类型的兜底 schema
     normalized.setdefault("BELONGS_TO", BelongsToEdge)
     normalized.setdefault("TRADED_ON", TradedOnEdge)
-    normalized.setdefault("INVESTS_IN", InvestsInEdge)
     return normalized
 
 
@@ -809,6 +794,53 @@ class EpisodeWriter:
         return getattr(node, key, None)
 
 
+def _build_sector_names_block() -> str:
+    """构建 CANONICAL SECTOR NAMES 注入块（紧凑单行，控制 token）。
+
+    数据源：data/canonical_entities.yaml 的 sectors 区块（经
+    entity_canonical.py 加载）。每个 canonical 最多带 1 个 ASCII 别名，
+    帮助 LLM 把英文行业词映射到中文 canonical。
+    """
+    entries: list[str] = []
+    for canonical in canonical_sector_names():
+        aliases = [a for a in SECTORS.get(canonical, []) if a.isascii()][:1]
+        if aliases:
+            entries.append(f"{canonical} ({'/'.join(aliases)})")
+        else:
+            entries.append(canonical)
+    return ", ".join(entries)
+
+
+# 模块级常量：加载一次，所有 episode 共享（sector 表与 episode 无关）
+_SECTOR_NAMES_BLOCK = _build_sector_names_block()
+
+# P1-1: Sector 语义准入规则（宏观/个股管线共用）——阻止指数、政策概念、
+# 族群、哲学领域、媒体栏目、应急服务机构、HTML 碎片被标为 Sector。
+_SECTOR_ADMISSION_RULES = (
+    "SECTOR ADMISSION RULES:\n"
+    "- A Sector MUST be an industry/segment/theme tradable in the stock "
+    "market (e.g. 半导体, 白酒, 银行, 光伏).\n"
+    "- NEVER label as Sector: stock indices (恒生指数, S&P 500), policy "
+    "concepts/slogans (中国式现代化), ethnic groups (Dalit, Adivasis), "
+    "academic/philosophical fields (Critical Philosophy of Race), media "
+    "columns or programs, emergency/rescue services (FDNY firefighters), "
+    "HTML fragments (China&rsquo;s).\n"
+    "- If an entity is not a market-tradable industry, assign a more "
+    "appropriate type or omit it.\n"
+)
+
+# P1-2: Sector 语言统一规则（宏观/个股管线共用）——sector 一律用中文
+# canonical 名，配套 CANONICAL SECTOR NAMES 词表（来自 canonical_entities.yaml）。
+_SECTOR_LANGUAGE_RULES = (
+    "SECTOR LANGUAGE RULES:\n"
+    "- Sector names MUST use the Chinese canonical names listed under "
+    "CANONICAL SECTOR NAMES; translate English sector terms "
+    "(Textiles→纺织, Mining→有色金属, Tech→科技).\n"
+    "\n"
+    f"CANONICAL SECTOR NAMES:\n{_SECTOR_NAMES_BLOCK}\n"
+)
+
+
 def _build_extraction_instructions(episode: NormalizedEpisode) -> str:
     """构建 custom_extraction_instructions（含 canonical entity names 约束）。
 
@@ -825,8 +857,15 @@ def _build_extraction_instructions(episode: NormalizedEpisode) -> str:
 
     P0-5.3（§5.3）: EXCLUSION RULES 排除媒体/数据源误抽为实体。
     P1-5.4（§5.4）: RELATION TYPE REFINEMENT 收窄 PART_OF，新增
-    BELONGS_TO / TRADED_ON / INVESTS_IN。
+    BELONGS_TO / TRADED_ON。
+    P1-3: INVESTS_IN 已从 RELATION TYPE REFINEMENT 移除（废弃类型，
+    约 60% 错误率），投资/持股事实由 PART_OF / RELATES_TO 承接。
     P1-5.6（§5.6）: 个股管线优先输出中文标准名（白名单为中文名）。
+    P1-1: SECTOR ADMISSION RULES 阻止非行业实体（指数/政策概念/族群/
+    哲学/媒体栏目/应急机构/HTML碎片）被标为 Sector。
+    P1-2: SECTOR LANGUAGE RULES + CANONICAL SECTOR NAMES 统一宏观/个股
+    管线 sector 语言（中文 canonical，来自 canonical_entities.yaml）；
+    宏观管线英文名规则对 sector 开例外。
     """
     # P1-5.6: 个股管线（source_type 属于个股源集）优先中文标准名；
     # 宏观管线保持英文。以 source_type 为准（确定性信号），相比依赖
@@ -846,13 +885,19 @@ def _build_extraction_instructions(episode: NormalizedEpisode) -> str:
     else:
         language_rule = (
             "ENTITY NAME LANGUAGE RULE:\n"
-            "- Always extract entity names in English.\n"
+            "- Extract entity names in English, EXCEPT sector/industry "
+            "entities which MUST use Chinese canonical names "
+            "(see SECTOR LANGUAGE RULES).\n"
             "- Translate non-English names to their standard English equivalents.\n"
             "- If uncertain about translation, keep the original name.\n"
         )
 
     base = (
         language_rule
+        + "\n"
+        + _SECTOR_ADMISSION_RULES
+        + "\n"
+        + _SECTOR_LANGUAGE_RULES
         + "\n"
         + "EXCLUSION RULES:\n"
         + "- Do NOT extract news agencies, media outlets, or data providers as entities.\n"
@@ -874,8 +919,8 @@ def _build_extraction_instructions(episode: NormalizedEpisode) -> str:
         + 'Examples: "X belongs to Y sector", "X is a member of Y index"\n'
         + '- TRADED_ON: for stock exchange listing. '
         + 'Examples: "X trades on Y exchange", "X is listed on Y"\n'
-        + '- INVESTS_IN: for investment relationships. '
-        + 'Examples: "X invested $N in Y", "X acquired stake in Y"\n'
+        + '- For investment/stake-holding facts, use PART_OF (structural '
+        + 'ownership) or RELATES_TO; do NOT invent INVESTS_IN/EXPOSED_TO.\n'
     )
     if not episode.entities:
         return base

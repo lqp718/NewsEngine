@@ -38,19 +38,6 @@ class EventEntityItem(BaseModel):
     )
 
 
-class EventRelationItem(BaseModel):
-    """An inter-event relationship."""
-
-    type: str = Field(
-        ...,
-        description="Relation type: CAUSED_BY / MITIGATES / RELATED_TO",
-    )
-    target_event_id: str = Field(
-        ...,
-        description="Target event ID, format evt-YYYYMMDD-NNN",
-    )
-
-
 # ---------------------------------------------------------------------------
 # EventItem — core event model
 # ---------------------------------------------------------------------------
@@ -99,10 +86,6 @@ class EventItem(BaseModel):
         ...,
         description="Associated entities",
     )
-    relations: list[EventRelationItem] | None = Field(
-        default=None,
-        description="Inter-event relationships",
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +133,82 @@ class ActiveEventsResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Graph structure models — P2-1 (诊断报告 §3.8 方案 A)
+# ---------------------------------------------------------------------------
+
+
+class GraphNode(BaseModel):
+    """A node in the entity graph returned by GET /api/events/entity/:ticker.
+
+    ``id`` is the entity's canonical name (中文主名，与 SynapseEngine 接地
+    后的实体名一致)；``type`` 使用 translation.LABEL_TYPE_MAP 的小写业务
+    类型（stock / sector / country / policy / …），与 EventEntityItem.type
+    保持同一枚举。
+    """
+
+    id: str = Field(
+        ...,
+        description="Node id — canonical entity name (e.g. 五粮液 / 白酒 / 中国)",
+    )
+    type: str = Field(
+        ...,
+        description="Business entity type: stock / sector / country / policy / topic / organization / event / person / unknown",
+    )
+    ticker: str | None = Field(
+        default=None,
+        description="Stock ticker (only for stock type), e.g. 000858.SZ",
+    )
+
+
+class GraphEdge(BaseModel):
+    """A directed edge (RELATES_TO relationship) in the entity graph."""
+
+    source: str = Field(..., description="Source node id (entity name)")
+    target: str = Field(..., description="Target node id (entity name)")
+    type: str = Field(
+        ...,
+        description="Relation type from RELATES_TO.name, e.g. BELONGS_TO / AFFECTS / LOCATED_IN",
+    )
+    fact: str | None = Field(
+        default=None,
+        description="Natural-language fact extracted with the edge (Chinese)",
+    )
+
+
+class GraphStructure(BaseModel):
+    """Entity subgraph within N hops of the queried ticker (P2-1).
+
+    Nodes are deduplicated by name; edges are deduplicated by
+    (source, target, type). Lets downstream consumers (SynapseEngine)
+    reconstruct event context without querying Neo4j directly.
+    """
+
+    nodes: list[GraphNode] = Field(
+        default_factory=list,
+        description="Distinct entities within the hop range (including the queried stock)",
+    )
+    edges: list[GraphEdge] = Field(
+        default_factory=list,
+        description="Distinct RELATES_TO edges between the returned nodes",
+    )
+
+
+class EpisodeItem(BaseModel):
+    """A compact episodic-memory item (事件脉络节点, P2-1)."""
+
+    id: str = Field(..., description="Episodic node uuid")
+    title: str = Field(..., description="Episode title (first content line or node name)")
+    valid_at: str | None = Field(
+        default=None,
+        description="Event time (ISO 8601 +08:00)",
+    )
+    entities: list[str] = Field(
+        default_factory=list,
+        description="Names of entities linked to this episode",
+    )
+
+
+# ---------------------------------------------------------------------------
 # EntityEventSummary & EntityEventsResponse — GET /api/events/entity/:ticker
 # ---------------------------------------------------------------------------
 
@@ -176,7 +235,12 @@ class EntityEventSummary(BaseModel):
 
 
 class EntityEventsResponse(BaseModel):
-    """Response model for GET /api/events/entity/:ticker."""
+    """Response model for GET /api/events/entity/:ticker.
+
+    P2-1: ``graph`` / ``episodes`` 为新增可选字段（向后兼容 —— 既有
+    ``ticker`` / ``events`` / ``summary`` 契约不变）。include_graph=false
+    或图查询降级时为 None。
+    """
 
     ticker: str = Field(
         ...,
@@ -189,6 +253,22 @@ class EntityEventsResponse(BaseModel):
     summary: EntityEventSummary = Field(
         ...,
         description="Aggregated summary for this ticker",
+    )
+    graph: GraphStructure | None = Field(
+        default=None,
+        description=(
+            "Entity subgraph (nodes + edges) within graph_depth hops of the "
+            "ticker (P2-1). None when include_graph=false or the graph "
+            "query degrades; events/summary remain authoritative."
+        ),
+    )
+    episodes: list[EpisodeItem] | None = Field(
+        default=None,
+        description=(
+            "Compact episode timeline linked to entities in graph scope, "
+            "sorted by valid_at asc (事件脉络). None under the same "
+            "conditions as graph."
+        ),
     )
 
 

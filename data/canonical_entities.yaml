@@ -310,31 +310,161 @@ WTI原油:
   - Bank of Japan
 
 # ── Sectors / Themes ─────────────────────────────────────────────────────────
+#
+# Machine-readable sector block (P1-2 language unification).
+# The top-level `sectors` key is loaded by src/utils/entity_canonical.py:
+#   1. aliases merged into ALIAS_MAP → canonical_name() normalizes sector
+#      fields (e.g. "Tech" → "科技", "STAR Market" → "科创板")
+#   2. canonical names injected into extraction prompts as
+#      CANONICAL SECTOR NAMES (macro + symbol pipelines share Chinese names)
+#
+# Maintenance rules (P1-1 sector admission):
+#   - canonical 必须是股票市场可交易的行业/板块/概念中文名
+#   - 禁止收录：指数、政策概念、族群、学术/哲学领域、媒体栏目、
+#     应急服务机构等非行业实体
+#   - 新增前对照白名单 data/ticker_whitelist.json 的 sector 取值，
+#     保持两侧 canonical 一致
 
-半导体:
-  - Semiconductor
-  - Semiconductors
-  - Chip
-  - Chips
+sectors:
+  # ── 原有 Sectors/Themes 条目 ──
+  半导体:
+    - Semiconductor
+    - Semiconductors
+    - Chip
+    - Chips
+  人工智能:
+    - Artificial Intelligence
+    - AI
+  电动汽车:
+    - Electric Vehicle
+    - EV
+    - EVs
+  可再生能源:
+    - Renewable Energy
+    - Clean Energy
+  光伏:
+    - Solar
+    - Solar Energy
+    - Photovoltaic
+    - 太阳能
+  风电:
+    - Wind Power
+    - Wind Energy
 
-人工智能:
-  - Artificial Intelligence
-  - AI
+  # ── 白名单粗类（Tech/Consumer/Finance → 中文）──
+  科技:
+    - Tech
+    - Technology
+  消费:
+    - Consumer
+    - Consumer Goods
+    - Consumption
+  金融:
+    - Finance
+    - Financial
+    - Financials
+    - 非银金融
 
-电动汽车:
-  - Electric Vehicle
-  - EV
-  - EVs
-
-可再生能源:
-  - Renewable Energy
-  - Clean Energy
-
-太阳能:
-  - Solar
-  - Solar Energy
-  - Photovoltaic
-
-风电:
-  - Wind Power
-  - Wind Energy
+  # ── 高频宏观行业词 ──
+  纺织:
+    - Textiles
+    - Textile
+    - Apparel
+  有色金属:
+    - Mining
+    - Metals
+    - Nonferrous Metals
+  钢铁:
+    - Steel
+  煤炭:
+    - Coal
+  银行:
+    - Banking
+    - Banks
+  证券:
+    - Securities
+    - Brokerage
+  保险:
+    - Insurance
+    - 保险Ⅱ
+  医药:
+    - Pharmaceutical
+    - Pharmaceuticals
+    - Pharma
+    - Healthcare
+  医疗器械:
+    - Medical Devices
+  汽车:
+    - Automotive
+    - Autos
+  食品饮料:
+    - Food & Beverage
+    - Food and Beverage
+  白酒:
+    - Liquor
+    - Baijiu
+    - Liquor II
+  房地产:
+    - Real Estate
+    - Property
+  航空:
+    - Aviation
+    - Airlines
+  国防军工:
+    - Defense
+    - Defence
+    - Aerospace
+  农业:
+    - Agriculture
+    - Farming
+  养殖:
+    - Breeding
+    - Livestock
+    - Aquaculture
+  能源:
+    - Energy
+  石油石化:
+    - Oil & Gas
+    - Petrochemical
+  化工:
+    - Chemicals
+  互联网:
+    - Internet
+  电商:
+    - E-commerce
+    - ECommerce
+  游戏:
+    - Gaming
+  传媒:
+    - Media
+    - Entertainment
+  零售:
+    - Retail
+  物流:
+    - Logistics
+    - Shipping
+  电力:
+    - Power
+    - Utilities
+  建筑:
+    - Construction
+  机械:
+    - Machinery
+  通信:
+    - Telecom
+    - Telecommunications
+  消费电子:
+    - Consumer Electronics
+  电池:
+    - Battery
+    - Batteries
+  家电:
+    - Home Appliances
+  交通运输:
+    - Transportation
+  旅游:
+    - Tourism
+  教育:
+    - Education
+  科创板:
+    - STAR Market

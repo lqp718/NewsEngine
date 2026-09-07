@@ -35,16 +35,24 @@ CORPORATE_SUFFIXES = {
 }
 
 
-def _load_alias_map() -> dict[str, str]:
+def _load_alias_map() -> tuple[dict[str, str], dict[str, list[str]]]:
     """Load entity alias mapping from data/canonical_entities.yaml.
 
-    The YAML format is ``canonical_name: [alias1, alias2, ...]``.
-    This function builds a reverse mapping of ``alias → canonical_name``
-    (all lowercased) for fast lookup.  The canonical name itself is also
-    included as a key so that lookups are idempotent.
+    The YAML top level has two kinds of keys:
+
+    1. Flat entity entries ``canonical_name: [alias1, alias2, ...]``
+    2. A machine-readable ``sectors:`` block (P1-2) with the same
+       ``canonical: [aliases]`` shape, restricted to stock-market
+       tradable industry/segment/theme names.
+
+    Returns a tuple ``(alias_map, sectors)`` where ``alias_map`` maps
+    every alias and canonical name (all lowercased) to its canonical
+    name — sector aliases included — and ``sectors`` maps sector
+    canonical name to its alias list.
     """
     yaml_path = Path(__file__).resolve().parents[2] / "data" / "canonical_entities.yaml"
     alias_map: dict[str, str] = {}
+    sectors: dict[str, list[str]] = {}
     try:
         import yaml  # type: ignore[import-untyped]
     except ImportError:
@@ -53,7 +61,7 @@ def _load_alias_map() -> dict[str, str]:
             "Install with: pip install pyyaml",
             stacklevel=2,
         )
-        return alias_map
+        return alias_map, sectors
 
     try:
         with open(yaml_path, "r", encoding="utf-8") as fh:
@@ -63,22 +71,33 @@ def _load_alias_map() -> dict[str, str]:
             f"Entity mapping file not found: {yaml_path} – using empty mapping.",
             stacklevel=2,
         )
-        return alias_map
+        return alias_map, sectors
     except Exception as exc:
         warnings.warn(
             f"Failed to load entity mapping from {yaml_path}: {exc}",
             stacklevel=2,
         )
-        return alias_map
+        return alias_map, sectors
 
     if not isinstance(data, dict):
         warnings.warn(
             f"Entity mapping file {yaml_path} has unexpected format – using empty mapping.",
             stacklevel=2,
         )
-        return alias_map
+        return alias_map, sectors
 
-    for canonical, aliases in data.items():
+    # Sector block (dict of canonical -> aliases) is loaded separately so
+    # prompt injection can enumerate canonical sector names.
+    raw_sectors = data.pop("sectors", None)
+    if isinstance(raw_sectors, dict):
+        for canonical, aliases in raw_sectors.items():
+            if not isinstance(aliases, list):
+                continue
+            sectors[str(canonical)] = [str(a) for a in aliases]
+
+    for canonical, aliases in list(data.items()) + [
+        (c, a) for c, a in sectors.items()
+    ]:
         if not isinstance(aliases, list):
             continue
         # Map each alias (lowercased) → canonical name
@@ -87,11 +106,16 @@ def _load_alias_map() -> dict[str, str]:
         # Also map the canonical name itself (lowercased) → canonical name
         alias_map[str(canonical).strip().lower()] = str(canonical)
 
-    return alias_map
+    return alias_map, sectors
 
 
 # Module-level alias map (loaded once at import time)
-ALIAS_MAP: dict[str, str] = _load_alias_map()
+ALIAS_MAP, SECTORS = _load_alias_map()
+
+
+def canonical_sector_names() -> list[str]:
+    """Return canonical Chinese sector names sorted for stable prompt injection."""
+    return sorted(SECTORS)
 
 
 def canonical_name(name: str, entity_type: Optional[str] = None) -> str:
@@ -185,7 +209,9 @@ def is_canonical(name: str, entity_type: Optional[str] = None) -> bool:
 __all__ = [
     'canonical_name',
     'canonical_name_batch',
+    'canonical_sector_names',
     'is_canonical',
     'CORPORATE_SUFFIXES',
     'ALIAS_MAP',
+    'SECTORS',
 ]

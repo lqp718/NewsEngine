@@ -1,7 +1,10 @@
 """单元测试: episode_writer.normalize_edge_type — 边类型归一规则。
 
 覆盖:
-- 既有规则: TRIGGERS / AFFECTS / INVOLVES / EXPOSED_TO / HAPPENED_IN / PART_OF
+- 既有规则: TRIGGERS / AFFECTS / INVOLVES / HAPPENED_IN / PART_OF
+- P1-3: INVESTS_IN / EXPOSED_TO 已废弃 —— 归一回落 RELATES_TO，
+  含存量降级计划 build_retirement_plan 与 main() 阶段 3 分支
+- P3-1: _clean_text 增加 HTML 实体解码（html.unescape）
 - 新增规则: SUBSIDIARY/OWNED_BY/PARENT_OF → PART_OF；
   CEO_OF/EMPLOYED_BY/WORKS_FOR/CHAIRMAN_OF/CHAIR_OF/CHAIRPERSON/PRESIDENT_OF
   → INVOLVES；TRACKS/REPORTS/REPORTED_BY/STATES 保持 RELATES_TO
@@ -22,7 +25,12 @@ from pathlib import Path
 
 import pytest
 
-from src.graphiti.episode_writer import CORE_EDGE_TYPES, normalize_edge_type
+from src.graphiti.episode_writer import (
+    CORE_EDGE_TYPES,
+    _clean_text,
+    _normalized_edge_types,
+    normalize_edge_type,
+)
 
 
 def _load_renormalize_module():
@@ -55,8 +63,9 @@ class TestNormalizeEdgeTypeExistingRules:
             ("MITIGATES", "AFFECTS"),
             ("INVOLVES", "INVOLVES"),
             ("ACTOR", "INVOLVES"),
-            ("EXPOSED", "EXPOSED_TO"),
-            ("EXPOSED_TO", "EXPOSED_TO"),
+            # P1-3: EXPOSED_TO 已废弃 → 回落 RELATES_TO
+            ("EXPOSED", "RELATES_TO"),
+            ("EXPOSED_TO", "RELATES_TO"),
             ("HAPPENED_IN", "HAPPENED_IN"),
             ("IN", "HAPPENED_IN"),
             ("IN_REGION", "HAPPENED_IN"),
@@ -65,8 +74,9 @@ class TestNormalizeEdgeTypeExistingRules:
             ("BELONGS_TO", "BELONGS_TO"),
             ("TRADED_ON", "TRADED_ON"),
             ("LISTED_ON", "TRADED_ON"),
-            ("INVESTS_IN", "INVESTS_IN"),
-            ("INVESTED_IN", "INVESTS_IN"),
+            # P1-3: INVESTS_IN 已废弃 → 回落 RELATES_TO
+            ("INVESTS_IN", "RELATES_TO"),
+            ("INVESTED_IN", "RELATES_TO"),
             ("LOCATED_IN", "PART_OF"),
             ("RELATES_TO", "RELATES_TO"),
         ],
@@ -518,6 +528,23 @@ class TestRenormalizeMainCli:
                 q = query.upper()
                 if "UNWIND" in q:
                     batch = kw["batch"]
+                    if "ITEM.FROM_NAME" in q:
+                        # 阶段 3（P1-3）: 废弃类型降级，源 name 由 from_name 逐项给出
+                        updated = 0
+                        for item in batch:
+                            bucket = state["edges"].setdefault(
+                                item["from_name"], {}
+                            )
+                            if item["uuid"] in bucket:
+                                fact = bucket.pop(item["uuid"])
+                                state["edges"].setdefault(item["name"], {})[
+                                    item["uuid"]
+                                ] = fact
+                                updated += 1
+                                state["updates"].append(
+                                    (item["from_name"], item)
+                                )
+                        return _FakeResult([{"updated": updated}])
                     # 根据 WHERE 子句判断源 name
                     src = "INVOLVES" if "'INVOLVES'" in query else "RELATES_TO"
                     updated = 0
@@ -538,6 +565,17 @@ class TestRenormalizeMainCli:
                             for name, bucket in state["edges"].items()
                         ]
                     )
+                if "$RETIRED" in q:
+                    # 阶段 3 fetch（P1-3）: 按 retired 参数返回废弃类型边
+                    rows = []
+                    for name in kw.get("retired", []):
+                        rows.extend(
+                            {"uuid": uuid, "name": name, "fact": fact}
+                            for uuid, fact in state["edges"]
+                            .get(name, {})
+                            .items()
+                        )
+                    return _FakeResult(rows)
                 src = "INVOLVES" if "'INVOLVES'" in query else "RELATES_TO"
                 bucket = state["edges"].get(src, {})
                 return _FakeResult(
@@ -578,6 +616,14 @@ class TestRenormalizeMainCli:
             "u-inv-status": "Indonesia became the first country to ban nickel exports",
             "u-inv-verb": "Anglo American partners with Teck on the project",
             "u-inv-clean": "James Steel is the chief analyst at HSBC",
+        }
+        # P1-3: 废弃类型存量边 —— 持股事实 / 误抽事实 / 风险影响事实
+        state["edges"]["INVESTS_IN"] = {
+            "u-inv-stake": "X holds a stake in the Caserones mine",
+            "u-inv-bad": "Y donated $1M to the university",
+        }
+        state["edges"]["EXPOSED_TO"] = {
+            "u-exp-risk": "Rising copper prices threaten profitability",
         }
 
     def test_dry_run_writes_nothing(self, fake_env, monkeypatch, capsys):
@@ -621,6 +667,13 @@ class TestRenormalizeMainCli:
         assert "u-inv-verb" in state["edges"]["RELATES_TO"]
         assert "u-inv-role" in state["edges"]["INVOLVES"]
         assert "u-inv-clean" in state["edges"]["INVOLVES"]
+        # 阶段 3（P1-3）: 废弃类型降级 —— 持股事实 → PART_OF；
+        # 无关键词误抽事实 → RELATES_TO；风险影响事实 → AFFECTS
+        assert "u-inv-stake" in state["edges"]["PART_OF"]
+        assert "u-inv-bad" in state["edges"]["RELATES_TO"]
+        assert "u-exp-risk" in state["edges"]["AFFECTS"]
+        assert not state["edges"].get("INVESTS_IN")
+        assert not state["edges"].get("EXPOSED_TO")
         assert "完成" in out
 
     def test_idempotent_second_run_no_updates(self, fake_env, monkeypatch, capsys):
@@ -647,3 +700,143 @@ class TestRenormalizeMainCli:
         assert rc == 1
         assert "无法连接" in err
         assert "Connection refused" in err
+
+
+class TestP13RetiredTypes:
+    """P1-3: INVESTS_IN / EXPOSED_TO 从核心集移除（~60% 错误率，零下游消费）。"""
+
+    def test_retired_types_not_in_core_set(self):
+        assert "INVESTS_IN" not in CORE_EDGE_TYPES
+        assert "EXPOSED_TO" not in CORE_EDGE_TYPES
+
+    @pytest.mark.parametrize(
+        "raw",
+        ["INVESTS_IN", "INVESTED_IN", "INVESTS", "EXPOSED_TO", "EXPOSED"],
+    )
+    def test_retired_names_fall_back_to_relates_to(self, raw):
+        # 废弃类型名（含 LLM 偶发再产出）统一由默认兜底收敛到 RELATES_TO
+        assert normalize_edge_type(raw) == "RELATES_TO"
+
+    def test_normalized_edge_types_exclude_retired(self):
+        from src.graphiti.relation_types import EDGE_TYPES
+
+        normalized = _normalized_edge_types(EDGE_TYPES)
+        assert "INVESTS_IN" not in normalized
+        assert "EXPOSED_TO" not in normalized
+        # 补齐后的 schema 键仍全部落在核心集内
+        assert set(normalized) <= CORE_EDGE_TYPES
+
+    def test_extraction_instructions_no_longer_offer_retired_types(self):
+        from src.adapters.models import EntityItem, NormalizedEpisode
+        from src.graphiti.episode_writer import _build_extraction_instructions
+        from datetime import datetime, timezone
+
+        episode = NormalizedEpisode(
+            name="test",
+            episode_body="body",
+            source_description="src",
+            source_url="https://example.com",
+            valid_at=datetime.now(timezone.utc),
+            content_hash="h",
+            source_type="rss",
+            entities=[EntityItem(type="stock", name="X", ticker="0700.HK")],
+        )
+        instructions = _build_extraction_instructions(episode)
+        # 不再提供 INVESTS_IN 精确定义，且显式禁止再创造废弃类型
+        assert "INVESTS_IN:" not in instructions
+        assert "do NOT invent INVESTS_IN/EXPOSED_TO" in instructions
+
+
+class TestRenormalizeRetirementPlan:
+    """阶段 3（P1-3）: build_retirement_plan — 废弃类型存量边降级计划。"""
+
+    @pytest.fixture(scope="class")
+    def mod(self):
+        return _load_renormalize_module()
+
+    def test_stake_fact_demotes_to_part_of(self, mod):
+        updates, transitions = mod.build_retirement_plan(
+            [("u1", "INVESTS_IN", "X holds a stake in the Caserones mine")]
+        )
+        assert updates == [
+            {"uuid": "u1", "name": "PART_OF", "from_name": "INVESTS_IN"}
+        ]
+        assert transitions[("INVESTS_IN", "PART_OF")] == 1
+
+    def test_acquired_fact_demotes_to_part_of(self, mod):
+        updates, _ = mod.build_retirement_plan(
+            [("u1", "INVESTS_IN", "X acquired a 51% stake in Y")]
+        )
+        assert updates[0]["name"] == "PART_OF"
+
+    def test_risk_fact_demotes_to_affects(self, mod):
+        updates, _ = mod.build_retirement_plan(
+            [("u1", "EXPOSED_TO", "Rising copper prices threaten profitability")]
+        )
+        assert updates[0]["name"] == "AFFECTS"
+        assert updates[0]["from_name"] == "EXPOSED_TO"
+
+    def test_uninferable_fact_demotes_to_relates_to(self, mod):
+        # 误抽事实（捐赠/学历类，INVESTS_IN ~60% 错误率的主体）无关键词
+        # → 回落 RELATES_TO，而非扩散进 PART_OF/AFFECTS
+        updates, _ = mod.build_retirement_plan(
+            [
+                ("u1", "INVESTS_IN", "Y donated $1M to the university"),
+                ("u2", "INVESTS_IN", None),
+                ("u3", "EXPOSED_TO", "Z is exposed to currency risk"),
+            ]
+        )
+        assert [u["name"] for u in updates] == [
+            "RELATES_TO",
+            "RELATES_TO",
+            "RELATES_TO",
+        ]
+
+    def test_plan_targets_are_core_types_only(self, mod):
+        updates, _ = mod.build_retirement_plan(
+            [
+                ("u1", "INVESTS_IN", "X invested in Y"),
+                ("u2", "EXPOSED_TO", "The embargo harms copper exports"),
+            ]
+        )
+        for u in updates:
+            assert u["name"] in CORE_EDGE_TYPES
+            assert u["name"] not in ("INVESTS_IN", "EXPOSED_TO")
+
+    def test_plan_is_deterministic(self, mod):
+        edges = [("u1", "INVESTS_IN", "X holds a stake in Y")]
+        assert mod.build_retirement_plan(edges) == mod.build_retirement_plan(edges)
+
+
+class TestCleanTextP31:
+    """P3-1: _clean_text — HTML 实体解码 + 控制字符清除。"""
+
+    def test_named_entity_decoded(self):
+        # 诊断报告实例: "China&rsquo;s" 泄漏进 Sector 名
+        assert _clean_text("China&rsquo;s economy") == "China\u2019s economy"
+
+    def test_amp_and_numeric_entities(self):
+        assert _clean_text("A &amp; B") == "A & B"
+        assert _clean_text("it&#39;s") == "it's"
+        assert _clean_text("it&#x27;s") == "it's"
+        assert _clean_text("&lt;tag&gt;") == "<tag>"
+
+    def test_single_pass_no_double_unescape(self):
+        # html.unescape 单遍不递归: "&amp;rsquo;" 只解一层
+        assert _clean_text("&amp;rsquo;") == "&rsquo;"
+
+    def test_control_chars_still_removed(self):
+        assert _clean_text("a\x00b\x1fc") == "abc"
+        # \n \r \t 保留
+        assert _clean_text("line1\nline2\tend\r") == "line1\nline2\tend\r"
+
+    def test_entity_decoded_control_char_removed(self):
+        # 先解码后清控制字符: 数字实体解码产生的控制字符也被清除
+        assert _clean_text("a&#x1;b") == "ab"
+
+    def test_non_string_passthrough(self):
+        assert _clean_text(None) is None
+        assert _clean_text(42) == 42
+
+    def test_plain_text_unchanged(self):
+        assert _clean_text("贵州茅台发布年报") == "贵州茅台发布年报"

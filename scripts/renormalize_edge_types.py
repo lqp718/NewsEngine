@@ -48,17 +48,23 @@
       （race/effort/push/campaign/plan/strategy/...），如
       "chips are part of the race to build AI" 非结构性归属，不归一。
 
-两个阶段:
+三个阶段:
     阶段 1（迁移）: 处理 name='RELATES_TO' 的边，按 fact 推断更具体核心类型。
     阶段 2（修正）: 修正上一轮迁移中由过宽模式（裸 \\bbecame\\b /
       \\bpartners?\\b）误标为 INVOLVES 的边 —— 对这些 fact 用收紧后的规则
       重新推断；若不再是 INVOLVES 则改回正确类型（通常是 RELATES_TO）。
+    阶段 3（废弃类型降级，P1-3 2026-09-05）: INVESTS_IN / EXPOSED_TO 已从
+      核心集移除（INVESTS_IN 抽样约 60% 错误率，二者零下游消费）。对存量
+      name='INVESTS_IN'/'EXPOSED_TO' 的边按 fact 重推断核心类型（命中
+      acquired/stake 等归属模式 → PART_OF；threatens 等影响模式 → AFFECTS；
+      无法推断 → RELATES_TO），实现存量迁移。
 
 幂等性:
     阶段 1 只处理 name='RELATES_TO' 的边；迁移后 name 变为具体核心类型，
     重复运行不会再命中。阶段 2 只处理 name='INVOLVES' 且 fact 含
-    became/partners 的边；修正后 name 改变，重跑不再命中。两次运行后
-    两阶段 updated 均为 0。
+    became/partners 的边；修正后 name 改变，重跑不再命中。阶段 3 只处理
+    name='INVESTS_IN'/'EXPOSED_TO' 的边；降级后 name 改变，重跑不再命中。
+    两次运行后三阶段 updated 均为 0。
 
 用法:
     # 干跑（只统计，不写库）
@@ -316,6 +322,40 @@ def build_fix_plan(edges: list[tuple[str, str | None]]) -> list[dict]:
     return updates
 
 
+# ── 阶段 3: 废弃类型降级（P1-3） ─────────────────────────────────────────
+
+_RETIRED_EDGE_NAMES = ("INVESTS_IN", "EXPOSED_TO")
+"""P1-3 废弃的核心类型 —— 存量边需降级迁移。
+
+迁移策略: 对 fact 复用收紧后的关键词推断（core_type_for_fact）——
+投资/持股事实若命中归属模式（acquired / holds a stake / owns）→ PART_OF；
+风险暴露事实若命中影响模式（threatens / pressures）→ AFFECTS；
+无法推断（含误抽的捐赠/学历类 fact）→ RELATES_TO。
+不新增投资类关键词模式: INVESTS_IN 约 60% 错误率，把 "invested" 一律
+推断为 PART_OF 会把误抽事实扩散进结构归属类型，宁可回落 RELATES_TO。
+"""
+
+
+def build_retirement_plan(
+    edges: list[tuple[str, str, str | None]],
+) -> tuple[list[dict], Counter]:
+    """阶段 3: 对废弃类型边构建降级计划。纯函数，便于单测。
+
+    入参为 (uuid, name, fact) 三元组，name ∈ _RETIRED_EDGE_NAMES。
+    返回 (updates, transitions)；updates 每项含 uuid / name(目标) /
+    from_name(源)，供带源 name 约束的幂等回写查询使用。
+    """
+    updates: list[dict] = []
+    transitions: Counter = Counter()
+    for uuid, name, fact in edges:
+        core = core_type_for_fact(fact)
+        if core == name:  # 防御: 废弃类型已不在归一目标集，正常不可达
+            continue
+        transitions[(name, core)] += 1
+        updates.append({"uuid": uuid, "name": core, "from_name": name})
+    return updates, transitions
+
+
 # ── Neo4j 查询 ──────────────────────────────────────────────────────────
 
 _COUNT_BY_NAME_QUERY = """
@@ -331,6 +371,19 @@ RETURN r.uuid AS uuid, r.fact AS fact
 _FETCH_INVOLVES_QUERY = """
 MATCH ()-[r:RELATES_TO {name: 'INVOLVES'}]->()
 RETURN r.uuid AS uuid, r.fact AS fact
+"""
+
+_FETCH_RETIRED_QUERY = """
+MATCH ()-[r:RELATES_TO]->()
+WHERE r.name IN $retired
+RETURN r.uuid AS uuid, r.name AS name, r.fact AS fact
+"""
+
+_UPDATE_FROM_RETIRED_QUERY = """
+UNWIND $batch AS item
+MATCH ()-[r:RELATES_TO {uuid: item.uuid, name: item.from_name}]->()
+SET r.name = item.name
+RETURN count(r) AS updated
 """
 
 _UPDATE_FROM_RELATES_TO_QUERY = """
@@ -361,7 +414,8 @@ def _apply_updates(driver, query: str, updates: list[dict], batch_size: int = 20
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="把 name='RELATES_TO' 的历史边按 fact 重归一到更具体的核心类型，"
-        "并修正上一轮过宽模式误标为 INVOLVES 的边"
+        "修正上一轮过宽模式误标为 INVOLVES 的边，"
+        "并把废弃类型 INVESTS_IN/EXPOSED_TO 的存量边降级迁移（P1-3）"
     )
     parser.add_argument("--dry-run", action="store_true", help="只统计不写库")
     parser.add_argument(
@@ -438,7 +492,41 @@ def main() -> int:
                 )
                 print(f"    - {item['uuid'][:12]}: -> {item['name']} | {fact[:80]}")
 
-            if not updates and not fixes:
+            # ── 阶段 3: 废弃类型降级计划（P1-3） ──
+            result = driver.execute_query(
+                _FETCH_RETIRED_QUERY, retired=list(_RETIRED_EDGE_NAMES)
+            )
+            retired_edges = [
+                (rec["uuid"], rec["name"], rec["fact"])
+                for rec in result.records
+            ]
+            retirements, retired_transitions = build_retirement_plan(
+                retired_edges
+            )
+            print(
+                f"\n[阶段 3] 废弃类型边 {len(retired_edges)} 条"
+                f"（name ∈ {list(_RETIRED_EDGE_NAMES)}）"
+            )
+            for (src_name, core), cnt in sorted(
+                retired_transitions.items(), key=lambda kv: -kv[1]
+            ):
+                print(f"  {src_name} -> {core}: {cnt}")
+            print(f"  计划降级: {len(retirements)} 条")
+            for item in retirements[:10]:
+                fact = next(
+                    (
+                        f
+                        for u, _n, f in retired_edges
+                        if u == item["uuid"]
+                    ),
+                    "",
+                )
+                print(
+                    f"    - {item['uuid'][:12]}: {item['from_name']} ->"
+                    f" {item['name']} | {(fact or '')[:80]}"
+                )
+
+            if not updates and not fixes and not retirements:
                 print("\n无需更新（幂等，已是收敛状态）。")
                 return 0
 
@@ -448,7 +536,8 @@ def main() -> int:
 
             if not args.yes:
                 answer = input(
-                    f"即将写入 {len(updates) + len(fixes)} 条更新，确认执行？[y/N] "
+                    f"即将写入 {len(updates) + len(fixes) + len(retirements)}"
+                    " 条更新，确认执行？[y/N] "
                 ).strip().lower()
                 if answer not in ("y", "yes"):
                     print("已取消。")
@@ -476,6 +565,18 @@ def main() -> int:
                     file=sys.stderr,
                 )
 
+            # ── 回写阶段 3（幂等: WHERE 含 name=item.from_name） ──
+            retired_total = _apply_updates(
+                driver, _UPDATE_FROM_RETIRED_QUERY, retirements
+            )
+            if retired_total != len(retirements):
+                print(
+                    f"警告: 阶段 3 实际降级 {retired_total} 条 != 计划"
+                    f" {len(retirements)} 条（可能已被并发进程修改），"
+                    "请重跑 --dry-run 复核。",
+                    file=sys.stderr,
+                )
+
             # ── 归一后统计 ──
             after: Counter = Counter()
             result = driver.execute_query(_COUNT_BY_NAME_QUERY)
@@ -489,8 +590,8 @@ def main() -> int:
                 print(f"  {name}: {cnt} ({sign})")
 
             print(
-                f"\n完成: 阶段 1 更新 {updated_total} 条，阶段 2 修正 {fixed_total} 条"
-                "（幂等，可重复运行）。"
+                f"\n完成: 阶段 1 更新 {updated_total} 条，阶段 2 修正 {fixed_total} 条，"
+                f"阶段 3 降级 {retired_total} 条（幂等，可重复运行）。"
             )
             return 0
     except Exception as exc:  # noqa: BLE001

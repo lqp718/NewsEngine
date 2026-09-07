@@ -10,10 +10,9 @@ Zero dependency on `api/` or `ingestion/` modules — only depends on
 
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Any
 
-from src.utils.time_utils import now_hkt, to_iso8601
+from src.utils.time_utils import coerce_datetime, now_hkt, to_iso8601
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -142,17 +141,15 @@ def translate_episode_to_event(
         severity_raw = SEVERITY_DEFAULT
 
     # ---- timestamps ----
+    # P1 残留修复（CR 第二轮）: Neo4j 驱动返回 neo4j.time.DateTime，它不是
+    # datetime.datetime 子类，isinstance 检查会静默回退 now_hkt()，导致
+    # first_seen/last_updated 丢失真实时间。统一走 coerce_datetime()。
     ref_time = e.get("valid_at") or e.get("reference_time") or e.get("first_seen") or now_hkt()
     created = e.get("created_at") or ref_time
-    if isinstance(ref_time, datetime):
-        first_seen = to_iso8601(ref_time)
-        if isinstance(created, datetime):
-            last_updated = to_iso8601(created)
-        else:
-            last_updated = first_seen
-    else:
-        first_seen = to_iso8601(now_hkt())
-        last_updated = first_seen
+    ref_dt = coerce_datetime(ref_time)
+    first_seen = to_iso8601(ref_dt if ref_dt is not None else now_hkt())
+    created_dt = coerce_datetime(created)
+    last_updated = to_iso8601(created_dt) if created_dt is not None else first_seen
 
     # ---- source_count, source_urls ----
     source_count: int = int(e.get("source_count", 0))
@@ -286,12 +283,12 @@ def translate_episode_to_briefing_input(
         severity_raw = SEVERITY_DEFAULT
 
     # ---- timestamps ----
-    first_seen = e.get("valid_at") or e.get("reference_time") or e.get("first_seen")
-    last_updated = e.get("created_at") or first_seen
-    if not isinstance(first_seen, datetime):
-        first_seen = now_hkt()
-    if not isinstance(last_updated, datetime):
-        last_updated = first_seen
+    # P1 残留修复（CR 第二轮）: 同 translate_episode_to_event，neo4j.time.DateTime
+    # 需经 coerce_datetime() 归一化，isinstance 检查会静默回退 now_hkt()。
+    first_seen = coerce_datetime(
+        e.get("valid_at") or e.get("reference_time") or e.get("first_seen")
+    ) or now_hkt()
+    last_updated = coerce_datetime(e.get("created_at")) or first_seen
 
     # ---- source_count, summary, keywords ----
     source_count: int = int(e.get("source_count", 0))

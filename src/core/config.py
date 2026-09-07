@@ -263,6 +263,17 @@ class Settings(BaseSettings):
         description="TTL 清理间隔（小时），V2.2",
     )
 
+    # === Entity 事件查询窗口 (P0-3) ===
+    entity_events_window_days: int = Field(
+        7,
+        ge=1,
+        description=(
+            "GET /api/events/entity/{ticker} 事件查询时间窗口（天）。"
+            "P0-3: 原 Cypher 硬编码 duration({days: 3})，做事件脉络太短，"
+            "改为可配置，默认 7 天"
+        ),
+    )
+
     # === GDELT 宏观主题 (V2.2 新增) ===
     gdelt_macro_themes_file: str = Field(
         "src/adapters/macro_themes.py",
