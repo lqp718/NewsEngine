@@ -543,6 +543,9 @@ class GdeltAdapter(BaseAdapter):
         self._last_records: list[dict] = []
         self._lastupdate_url = LASTUPDATE_URL
         self._content_fetcher = content_fetcher
+        # Episodes skipped because content_fetched=false (2026-09-07, Boss decision).
+        # Incremented in normalize()/_normalize_event_record(); summarized in run().
+        self._skipped_content_not_fetched = 0
         self._events_filter = EventsPipelineFilter(
             config_path=events_filter_config_path
         )
@@ -1094,7 +1097,7 @@ class GdeltAdapter(BaseAdapter):
         self,
         record: dict,
         fetch_results: dict[str, ContentResult] | None = None,
-    ) -> NormalizedEpisode:
+    ) -> NormalizedEpisode | None:
         """Convert a single merged record to NormalizedEpisode.
 
         Routes to Events-specific normalization (``_normalize_event_record()``)
@@ -1110,7 +1113,9 @@ class GdeltAdapter(BaseAdapter):
                 keyed by URL (from batch fetch).
 
         Returns:
-            NormalizedEpisode with content_scope=MACRO in metadata.
+            NormalizedEpisode with content_scope=MACRO in metadata, or None
+            when the article content could not be fetched
+            (content_fetched=false → episode skipped, not ingested).
         """
         # Route to Events-specific normalization if applicable
         if record.get("_event_record") is not None:
@@ -1164,6 +1169,18 @@ class GdeltAdapter(BaseAdapter):
                         exc,
                     )
 
+        # Skip episodes without fetched article content (2026-09-07, Boss decision):
+        # template-only summaries (~400 chars) have poor entity-extraction quality
+        # and low LLM ROI → do not ingest. Returning None here also avoids the
+        # wasted LLM synthesize call on the template body below.
+        if not metadata["content_fetched"]:
+            self._skipped_content_not_fetched += 1
+            logger.debug(
+                "Skipping GDELT GKG episode (content_fetched=false): %s",
+                source_url or "(no source_url)",
+            )
+            return None
+
         if full_text:
             pure_text, yaml_meta = strip_yaml_front_matter(full_text)
             if (
@@ -1188,6 +1205,8 @@ class GdeltAdapter(BaseAdapter):
             if yaml_meta:
                 metadata["extracted_metadata"] = yaml_meta
         else:
+            # Unreachable since 2026-09-07: content_fetched=false returns None
+            # above. Kept as a rollback safety net; deletion tracked as tech debt.
             template_body = _build_episode_body(record)
             if self._llm_preprocessor:
                 preprocess_metadata = {
@@ -1251,7 +1270,7 @@ class GdeltAdapter(BaseAdapter):
         self,
         record: dict,
         fetch_results: dict[str, ContentResult] | None = None,
-    ) -> NormalizedEpisode:
+    ) -> NormalizedEpisode | None:
         """Convert an Events-derived record dict to a NormalizedEpisode.
 
         Uses the original ``EventRecord`` (stored in ``record["_event_record"]``)
@@ -1263,7 +1282,9 @@ class GdeltAdapter(BaseAdapter):
             fetch_results: Optional pre-fetched content results.
 
         Returns:
-            NormalizedEpisode with ``source_type="gdelt_events"``.
+            NormalizedEpisode with ``source_type="gdelt_events"``, or None when
+            the article content could not be fetched (content_fetched=false →
+            episode skipped, not ingested).
         """
         event_record: EventRecord = record["_event_record"]
         resolved_urls: list[str] = record.get("resolved_urls", [])
@@ -1310,6 +1331,16 @@ class GdeltAdapter(BaseAdapter):
                         exc,
                     )
 
+        # Skip episodes without fetched article content (2026-09-07, Boss decision):
+        # CAMEO template summaries (~300 chars) have low LLM ROI → do not ingest.
+        if not metadata["content_fetched"]:
+            self._skipped_content_not_fetched += 1
+            logger.debug(
+                "Skipping GDELT Events episode (content_fetched=false): %s",
+                source_url or event_record.event_id,
+            )
+            return None
+
         if full_text:
             # Full text available: use ONLY the article content (no CAMEO summary)
             # This avoids data pollution from prepending redundant metadata
@@ -1337,6 +1368,8 @@ class GdeltAdapter(BaseAdapter):
             if yaml_meta:
                 metadata["extracted_metadata"] = yaml_meta
         else:
+            # Unreachable since 2026-09-07: content_fetched=false returns None
+            # above. Kept as a rollback safety net; deletion tracked as tech debt.
             # No full text: fall back to CAMEO summary (~300 chars)
             template_body = _build_event_episode_body(event_record, resolved_urls)
             if self._llm_preprocessor:
@@ -1598,6 +1631,12 @@ class GdeltAdapter(BaseAdapter):
         """
         records = await self.fetch(**kwargs)
 
+        if self._content_fetcher is None:
+            logger.warning(
+                "GDELT: content_fetcher not configured — all episodes will have "
+                "content_fetched=false and be skipped (not ingested)"
+            )
+
         # Phase 1: batch fetch all article source URLs
         source_urls = [
             r.get("source_url") for r in records if r.get("source_url")
@@ -1629,6 +1668,19 @@ class GdeltAdapter(BaseAdapter):
                 for r in records
             ],
         )
+
+        # Phase 2.5: drop skipped episodes — normalize() returns None when
+        # content_fetched=false (2026-09-07 decision: template-only summaries
+        # are not ingested). Must filter BEFORE dedup() (it assumes non-None).
+        normalized_count = len(episodes)
+        episodes = [ep for ep in episodes if ep is not None]
+        skipped = normalized_count - len(episodes)
+        if skipped:
+            logger.info(
+                "GDELT: skipped %d/%d episodes (content_fetched=false, not ingested)",
+                skipped,
+                normalized_count,
+            )
 
         # Phase 3 (json-persistence-layer): 不再截断 episode。
         # 设计 §2.3: capture 阶段把所有 episode 落盘（LandingStore 写 JSONL +

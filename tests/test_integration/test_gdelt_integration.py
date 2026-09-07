@@ -64,8 +64,14 @@ class TestGdeltRealHttp:
             )
 
     async def test_full_pipeline(self):
-        """fetch → normalize → dedup pipeline produces valid episodes."""
-        adapter = GdeltAdapter()
+        """fetch → normalize → dedup pipeline produces valid episodes.
+
+        2026-09-07: normalize() skips content_fetched=false episodes, so the
+        pipeline must run with a real ContentFetcher to produce any episode.
+        """
+        from src.utils.content_fetcher import ContentFetcher
+
+        adapter = GdeltAdapter(content_fetcher=ContentFetcher())
         try:
             episodes = await adapter.run()
             assert len(episodes) > 0

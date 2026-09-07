@@ -28,6 +28,29 @@ from src.adapters.gdelt_adapter import (
 from src.adapters.gdelt_events_parser import EventRecord
 from src.adapters.gdelt_mentions_parser import MentionRecord
 from src.adapters.models import NormalizedEpisode
+from src.utils.content_fetcher import ContentResult
+
+
+# ── Content fetcher stub ────────────────────────────────────────────
+# Since 2026-09-07 normalize() skips episodes with content_fetched=false,
+# tests that expect an episode must inject a succeeding content fetcher.
+
+_STUB_ARTICLE_TEXT = "Full article body text for testing."
+
+
+class _StubFetcher:
+    """ContentFetcher stub: succeeds for any URL."""
+
+    def __init__(self, text: str = _STUB_ARTICLE_TEXT) -> None:
+        self._text = text
+
+    def fetch(self, url: str) -> ContentResult:
+        return ContentResult(url=url, text=self._text, success=True)
+
+    async def fetch_batch(
+        self, urls: list[str], batch_timeout: float | None = None
+    ) -> list[ContentResult]:
+        return [self.fetch(u) for u in urls]
 from src.ingestion.events_pipeline_filter import (
     DEFAULT_EVENTS_FILTER_CONFIG,
     EventsPipelineFilter,
@@ -202,7 +225,7 @@ class TestNormalizeEventRecord:
     @pytest.mark.asyncio
     async def test_normalize_event_output_fields(self):
         """Verify all NormalizedEpisode fields from event normalization."""
-        adapter = GdeltAdapter()
+        adapter = GdeltAdapter(content_fetcher=_StubFetcher())
         ev = make_event()
         resolved_urls = ["https://reuters.com/article1"]
         record_dict = adapter._events_tuple_to_dict(ev, [], resolved_urls)
@@ -229,9 +252,10 @@ class TestNormalizeEventRecord:
         assert episode.name.startswith("gdelt_events-")
         assert ev.event_id in episode.name
 
-        # Verify body has CAMEO content
-        assert "## GDELT Events Report" in episode.episode_body
-        assert "CAMEO 163" in episode.episode_body
+        # When content fetch succeeds, body is the fetched article text as-is
+        # (2026-09-07: CAMEO template fallback → episode skipped, not ingested)
+        assert episode.episode_body == _STUB_ARTICLE_TEXT
+        assert episode.metadata["content_fetched"] is True
 
         # Verify keywords
         assert len(episode.keywords) >= 1
@@ -239,7 +263,7 @@ class TestNormalizeEventRecord:
     @pytest.mark.asyncio
     async def test_normalize_event_without_mention_urls(self):
         """Event with no resolved URLs uses source_url."""
-        adapter = GdeltAdapter()
+        adapter = GdeltAdapter(content_fetcher=_StubFetcher())
         ev = make_event(source_url="https://wsj.com/fallback")
         record_dict = adapter._events_tuple_to_dict(ev, [], [])
         episode = await adapter._normalize_event_record(record_dict)
@@ -249,7 +273,7 @@ class TestNormalizeEventRecord:
     @pytest.mark.asyncio
     async def test_normalize_event_no_actor2(self):
         """Event with only actor1 produces single country entity."""
-        adapter = GdeltAdapter()
+        adapter = GdeltAdapter(content_fetcher=_StubFetcher())
         ev = make_event(actor1_name="United States", actor2_name="")
         record_dict = adapter._events_tuple_to_dict(ev, [], [])
         episode = await adapter._normalize_event_record(record_dict)
@@ -261,7 +285,7 @@ class TestNormalizeEventRecord:
     @pytest.mark.asyncio
     async def test_normalize_event_no_entities_for_untranslated_codes(self):
         """When actor names equal codes, no entities added."""
-        adapter = GdeltAdapter()
+        adapter = GdeltAdapter(content_fetcher=_StubFetcher())
         ev = make_event(actor1_name="USA", actor2_name="CHN")
         record_dict = adapter._events_tuple_to_dict(ev, [], [])
         episode = await adapter._normalize_event_record(record_dict)
@@ -273,7 +297,7 @@ class TestNormalizeEventRecord:
     @pytest.mark.asyncio
     async def test_normalize_event_low_severity(self):
         """Low Goldstein score produces low severity."""
-        adapter = GdeltAdapter()
+        adapter = GdeltAdapter(content_fetcher=_StubFetcher())
         ev = make_event(goldstein_scale=2.0)
         record_dict = adapter._events_tuple_to_dict(ev, [], [])
         episode = await adapter._normalize_event_record(record_dict)
@@ -282,7 +306,7 @@ class TestNormalizeEventRecord:
     @pytest.mark.asyncio
     async def test_normalize_event_critical_severity(self):
         """High Goldstein score produces critical severity."""
-        adapter = GdeltAdapter()
+        adapter = GdeltAdapter(content_fetcher=_StubFetcher())
         ev = make_event(goldstein_scale=-9.0)
         record_dict = adapter._events_tuple_to_dict(ev, [], [])
         episode = await adapter._normalize_event_record(record_dict)
@@ -328,7 +352,7 @@ class TestEventsFirstPipeline:
     @pytest.mark.asyncio
     async def test_events_first_full_pipeline(self):
         """Events-first pipeline: mock download → filter → normalize → episodes."""
-        adapter = GdeltAdapter()
+        adapter = GdeltAdapter(content_fetcher=_StubFetcher())
         events = [
             make_event(event_id="1", cameo_code="141", goldstein_scale=7.2),
             make_event(event_id="2", cameo_code="163", goldstein_scale=-8.5),
@@ -350,7 +374,7 @@ class TestEventsFirstPipeline:
         assert len(episodes) == 2
         for ep in episodes:
             assert ep.source_type == "gdelt_events"
-            assert "GDELT Events Report" in ep.episode_body
+            assert ep.episode_body == _STUB_ARTICLE_TEXT
 
     @pytest.mark.asyncio
     async def test_gkg_fallback_when_events_produce_zero(self):
@@ -386,7 +410,7 @@ class TestEventsFirstPipeline:
     @pytest.mark.asyncio
     async def test_events_tuple_to_dict_with_mention_flow(self):
         """End-to-end: EventRecord → resolve_urls → tuple_to_dict → normalize."""
-        adapter = GdeltAdapter()
+        adapter = GdeltAdapter(content_fetcher=_StubFetcher())
         ev = make_event()
         ment_list = [make_mention(confidence=90, document_identifier="https://top.com")]
 
@@ -402,7 +426,7 @@ class TestEventsFirstPipeline:
     @pytest.mark.asyncio
     async def test_normalize_routes_to_events_path(self):
         """GdeltAdapter.normalize() routes to _normalize_event_record() when _event_record present."""
-        adapter = GdeltAdapter()
+        adapter = GdeltAdapter(content_fetcher=_StubFetcher())
         ev = make_event()
         record_dict = adapter._events_tuple_to_dict(ev, [], ["https://reuters.com/a1"])
         episode = await adapter.normalize(record_dict)
@@ -411,7 +435,7 @@ class TestEventsFirstPipeline:
     @pytest.mark.asyncio
     async def test_normalize_routes_to_gkg_path(self):
         """GdeltAdapter.normalize() routes to GKG path when no _event_record."""
-        adapter = GdeltAdapter()
+        adapter = GdeltAdapter(content_fetcher=_StubFetcher())
         gkg_record = {
             "global_event_id": "123",
             "valid_at": _TEST_EVENT_DATE.replace("-", "") + "000000",
@@ -491,8 +515,9 @@ class TestLLMPreprocessing:
         assert episode.episode_body == "COMPRESSED BODY"
 
     @pytest.mark.asyncio
-    async def test_event_synthesize_called_when_fetch_fails(self):
-        adapter = GdeltAdapter()  # no content_fetcher → fetch fails
+    async def test_event_skipped_when_fetch_fails(self):
+        """2026-09-07: fetch fails → episode skipped BEFORE LLM synthesize."""
+        adapter = GdeltAdapter()  # no content_fetcher → content_fetched=false
         mock_pp = MagicMock()
         mock_pp.preprocess = AsyncMock(return_value="SYNTHESIZED BODY")
         adapter._llm_preprocessor = mock_pp
@@ -501,13 +526,8 @@ class TestLLMPreprocessing:
         record_dict = adapter._events_tuple_to_dict(
             ev, [], ["https://reuters.com/a1"]
         )
-        episode = await adapter._normalize_event_record(record_dict)
-
-        mock_pp.preprocess.assert_awaited_once()
-        _, kwargs = mock_pp.preprocess.await_args
-        assert kwargs["mode"] == "synthesize"
-        assert kwargs["metadata"]["cameo_code"] == "163"
-        assert episode.episode_body == "SYNTHESIZED BODY"
+        assert await adapter._normalize_event_record(record_dict) is None
+        mock_pp.preprocess.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_gkg_compress_called_for_long_content(self):
@@ -537,8 +557,9 @@ class TestLLMPreprocessing:
         assert episode.episode_body == "GKG COMPRESSED"
 
     @pytest.mark.asyncio
-    async def test_gkg_synthesize_called_when_fetch_fails(self):
-        adapter = GdeltAdapter()  # no content_fetcher → fetch fails
+    async def test_gkg_skipped_when_fetch_fails(self):
+        """2026-09-07: fetch fails → episode skipped BEFORE LLM synthesize."""
+        adapter = GdeltAdapter()  # no content_fetcher → content_fetched=false
         mock_pp = MagicMock()
         mock_pp.preprocess = AsyncMock(return_value="GKG SYNTHESIZED")
         adapter._llm_preprocessor = mock_pp
@@ -551,22 +572,24 @@ class TestLLMPreprocessing:
             "themes": "ECON_FINANCIAL_MARKET",
             "tone": "0.0,0.0",
         }
-        episode = await adapter.normalize(gkg_record)
-
-        mock_pp.preprocess.assert_awaited_once()
-        _, kwargs = mock_pp.preprocess.await_args
-        assert kwargs["mode"] == "synthesize"
-        assert episode.episode_body == "GKG SYNTHESIZED"
+        assert await adapter.normalize(gkg_record) is None
+        mock_pp.preprocess.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_disabled_no_preprocessing_original_behavior(self):
-        """With preprocessor disabled (default), original CAMEO body is kept."""
-        adapter = GdeltAdapter()
+    async def test_disabled_no_fetcher_skips_episode(self):
+        """Preprocessor disabled + no fetched content → episode skipped (2026-09-07).
+
+        The original CAMEO template body is no longer produced: such episodes
+        are not ingested at all.
+        """
+        with patch(
+            "src.adapters.gdelt_adapter.get_settings",
+            return_value=self._settings(False),
+        ):
+            adapter = GdeltAdapter()
         assert adapter._llm_preprocessor is None
         ev = make_event()
         record_dict = adapter._events_tuple_to_dict(
             ev, [], ["https://reuters.com/a1"]
         )
-        episode = await adapter._normalize_event_record(record_dict)
-        assert "## GDELT Events Report" in episode.episode_body
-        assert "CAMEO 163" in episode.episode_body
+        assert await adapter._normalize_event_record(record_dict) is None

@@ -6,6 +6,7 @@ All tests use synthetic data — no HTTP requests.
 from __future__ import annotations
 
 from datetime import datetime
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -16,6 +17,36 @@ from src.adapters.gdelt_adapter import (
     GdeltAdapter,
 )
 from src.adapters.models import NormalizedEpisode
+from src.utils.content_fetcher import ContentResult
+
+
+# ── Content fetcher stubs ───────────────────────────────────────────────
+# Since 2026-09-07 normalize() skips episodes with content_fetched=false,
+# tests that expect an episode must inject a succeeding content fetcher.
+
+_STUB_ARTICLE_TEXT = "Full article body text for testing."
+
+
+class _StubFetcher:
+    """ContentFetcher stub: succeeds for any URL (or only for succeed_urls)."""
+
+    def __init__(
+        self,
+        text: str = _STUB_ARTICLE_TEXT,
+        succeed_urls: set[str] | None = None,
+    ) -> None:
+        self._text = text
+        self._succeed_urls = succeed_urls
+
+    def fetch(self, url: str) -> ContentResult:
+        if self._succeed_urls is not None and url not in self._succeed_urls:
+            return ContentResult(url=url, success=False, error="stub: blocked")
+        return ContentResult(url=url, text=self._text, success=True)
+
+    async def fetch_batch(
+        self, urls: list[str], batch_timeout: float | None = None
+    ) -> list[ContentResult]:
+        return [self.fetch(u) for u in urls]
 
 
 class TestToneToSeverity:
@@ -144,7 +175,7 @@ class TestGdeltNormalize:
 
     @pytest.mark.asyncio
     async def test_normalize_output_fields(self, sample_gkg_record):
-        adapter = GdeltAdapter()
+        adapter = GdeltAdapter(content_fetcher=_StubFetcher())
         episode = await adapter.normalize(sample_gkg_record)
 
         assert isinstance(episode, NormalizedEpisode)
@@ -177,21 +208,16 @@ class TestGdeltNormalize:
         assert len(episode.keywords) > 0
         assert len(episode.keywords) == len(set(episode.keywords))  # no duplicates
 
-        # Verify episode_body has new format (themes-based summary)
-        assert "## GDELT News Report" in episode.episode_body
-        assert "**Domain**" in episode.episode_body
-        assert "**Summary**" in episode.episode_body
-        assert "**Key Topics**" in episode.episode_body
-        assert "**Key Persons**" in episode.episode_body
-        assert "**Key Organizations**" in episode.episode_body
-        assert "**Key Locations**" in episode.episode_body
-        assert "**Source**" in episode.episode_body
+        # When content fetch succeeds, body is the fetched full text as-is
+        # (2026-09-07: template-summary path is skipped, not ingested)
+        assert episode.episode_body == _STUB_ARTICLE_TEXT
+        assert episode.metadata["content_fetched"] is True
 
     @pytest.mark.asyncio
     async def test_normalize_empty_tone(self, sample_gkg_record):
         record = dict(sample_gkg_record)
         record["tone"] = ""
-        adapter = GdeltAdapter()
+        adapter = GdeltAdapter(content_fetcher=_StubFetcher())
         episode = await adapter.normalize(record)
         assert episode.severity == "medium"
 
@@ -210,18 +236,18 @@ class TestGdeltNormalize:
             "organizations": "",
             "tone": "0.0,0.0",
         }
-        adapter = GdeltAdapter()
+        adapter = GdeltAdapter(content_fetcher=_StubFetcher())
         episode = await adapter.normalize(record)
         assert len(episode.entities) == 0
         assert episode.severity == "medium"
 
     @pytest.mark.asyncio
-    async def test_normalize_episode_body_has_themes(self, sample_gkg_record):
-        adapter = GdeltAdapter()
+    async def test_normalize_body_is_fetched_text(self, sample_gkg_record):
+        """Body = fetched full text; themes still surface via keywords."""
+        adapter = GdeltAdapter(content_fetcher=_StubFetcher())
         episode = await adapter.normalize(sample_gkg_record)
-        assert "News coverage" in episode.episode_body
-        assert "Key Topics" in episode.episode_body
-        assert "ECON_FINANCIAL_MARKET" in episode.episode_body or "Financial Market" in episode.episode_body
+        assert episode.episode_body == _STUB_ARTICLE_TEXT
+        assert len(episode.keywords) > 0
 
     @pytest.mark.asyncio
     async def test_keywords_deduplicated(self):
@@ -239,7 +265,7 @@ class TestGdeltNormalize:
             "organizations": "",
             "tone": "0.0,0.0",
         }
-        adapter = GdeltAdapter()
+        adapter = GdeltAdapter(content_fetcher=_StubFetcher())
         episode = await adapter.normalize(record)
         # Should have 2 unique keywords (not 4)
         assert len(episode.keywords) == 2
@@ -263,9 +289,101 @@ class TestGdeltNormalize:
             "organizations": "",
             "tone": "0.0,0.0",
         }
-        adapter = GdeltAdapter()
+        adapter = GdeltAdapter(content_fetcher=_StubFetcher())
         episode = await adapter.normalize(record)
         assert len(episode.keywords) <= 20
+
+
+class TestSkipContentNotFetched:
+    """2026-09-07: content_fetched=false → normalize() returns None (not ingested)."""
+
+    @pytest.mark.asyncio
+    async def test_skip_when_no_content_fetcher(self, sample_gkg_record):
+        adapter = GdeltAdapter()
+        assert await adapter.normalize(sample_gkg_record) is None
+        assert adapter._skipped_content_not_fetched == 1
+
+    @pytest.mark.asyncio
+    async def test_skip_when_fetch_fails(self, sample_gkg_record):
+        fetcher = MagicMock()
+        fetcher.fetch.return_value = ContentResult(
+            url=sample_gkg_record["source_url"], success=False, error="HTTP 404"
+        )
+        adapter = GdeltAdapter(content_fetcher=fetcher)
+        assert await adapter.normalize(sample_gkg_record) is None
+        assert adapter._skipped_content_not_fetched == 1
+
+    @pytest.mark.asyncio
+    async def test_skip_when_fetch_raises(self, sample_gkg_record):
+        fetcher = MagicMock()
+        fetcher.fetch.side_effect = RuntimeError("boom")
+        adapter = GdeltAdapter(content_fetcher=fetcher)
+        assert await adapter.normalize(sample_gkg_record) is None
+
+    @pytest.mark.asyncio
+    async def test_skip_when_pre_fetched_result_failed(self, sample_gkg_record):
+        adapter = GdeltAdapter(content_fetcher=_StubFetcher())
+        url = sample_gkg_record["source_url"]
+        fetch_results = {url: ContentResult(url=url, success=False, error="timeout")}
+        assert await adapter.normalize(sample_gkg_record, fetch_results=fetch_results) is None
+
+    @pytest.mark.asyncio
+    async def test_skip_when_no_source_url(self):
+        record = {
+            "global_event_id": "1",
+            "valid_at": "20250609010101",
+            "source_collection": "1",
+            "domain": "reuters.com",
+            "source_url": "",
+            "language": "Eng",
+            "themes": "ECON_FINANCIAL_MARKET",
+            "locations": "",
+            "persons": "",
+            "organizations": "",
+            "tone": "0.0,0.0",
+        }
+        adapter = GdeltAdapter(content_fetcher=_StubFetcher())
+        assert await adapter.normalize(record) is None
+
+    @pytest.mark.asyncio
+    async def test_not_skipped_when_fetch_succeeds(self, sample_gkg_record):
+        adapter = GdeltAdapter(content_fetcher=_StubFetcher())
+        episode = await adapter.normalize(sample_gkg_record)
+        assert episode is not None
+        assert episode.metadata["content_fetched"] is True
+        assert adapter._skipped_content_not_fetched == 0
+
+    @pytest.mark.asyncio
+    async def test_no_llm_preprocess_call_on_skip(self, sample_gkg_record):
+        """Skip happens BEFORE body building → no wasted LLM synthesize call."""
+        adapter = GdeltAdapter()  # no fetcher → content_fetched=false
+        mock_pp = MagicMock()
+        mock_pp.preprocess = AsyncMock(return_value="SYNTHESIZED")
+        adapter._llm_preprocessor = mock_pp
+        assert await adapter.normalize(sample_gkg_record) is None
+        mock_pp.preprocess.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_run_filters_skipped_and_counts(
+        self, sample_gkg_record, monkeypatch
+    ):
+        """run() drops None episodes before dedup and counts skips."""
+        adapter = GdeltAdapter(
+            content_fetcher=_StubFetcher(
+                succeed_urls={"http://example.com/article1"}
+            )
+        )
+        record_ok = dict(sample_gkg_record)
+        record_bad = dict(sample_gkg_record)
+        record_bad["source_url"] = "http://blocked.com/article"
+        record_bad["global_event_id"] = "999"
+        monkeypatch.setattr(
+            adapter, "fetch", AsyncMock(return_value=[record_ok, record_bad])
+        )
+        episodes = await adapter.run()
+        assert len(episodes) == 1
+        assert episodes[0].source_url == "http://example.com/article1"
+        assert adapter._skipped_content_not_fetched == 1
 
 
 class TestGdeltPlanDFilter:
