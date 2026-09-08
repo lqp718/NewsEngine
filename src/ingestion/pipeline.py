@@ -73,11 +73,16 @@ async def run_pipeline(
     tickers: list[dict[str, str]] | None = None,
     dry_run: bool = False,
     landing_store: Any = None,
+    translator: Any = None,
 ) -> PipelineResult:
     """Run a full pipeline cycle for one adapter.
 
     Stages:
         1. adapter.run(tickers=tickers) → fetch → normalize → dedup (filter-only)
+        1.5. 翻译层（translator 非 None 时）：对 MACRO 源（英文为主）的
+           episode 做中文翻译，发生在持久化之前，因此 landing JSONL 与
+           graphiti 看到的都是翻译后内容。翻译失败降级保留原文，不阻断
+           ingestion（src/translation/translator.py）。
         2. Landing zone 开启时（landing_store 非 None）: Stage 2 改为
            ``landing_store.capture_batch``（Stage A: 写 JSONL + 登记 pending，
            设计文档 json-persistence-layer.md §2.3）；否则保持
@@ -92,6 +97,9 @@ async def run_pipeline(
         dry_run: When True, skip write_batch and health tracking, return episodes.
         landing_store: LandingStore instance（JSON 持久化层）；非 None 时
             Stage 2 走 capture_batch（Stage A），writer 被忽略。
+        translator: EpisodeTranslator instance（翻译层）；非 None 时在
+            Stage 1 之后、Stage 2 之前对 TRANSLATABLE_SOURCES 的 episode
+            做中文翻译。None 时行为与旧版完全一致。
 
     Returns:
         PipelineResult with outcome, health (None in dry-run), and episodes (dry-run).
@@ -113,6 +121,21 @@ async def run_pipeline(
         if tickers is not None:
             kwargs["tickers"] = tickers
         episodes = await adapter.run(**kwargs)
+
+        # Stage 1.5: 翻译层（MACRO 源 → 中文）。发生在持久化之前，
+        # 使 landing JSONL 和 graphiti 都写入翻译后内容。降级安全：
+        # translator 内部块级失败保留原文；此处再兜底一层，翻译层
+        # 任何未预期异常都不得阻断 ingestion。
+        if translator is not None and episodes:
+            try:
+                episodes = await translator.translate_batch(episodes)
+            except Exception as exc:
+                logger.warning(
+                    "pipeline [%s]: translation layer failed (%s) — "
+                    "continuing with original episodes",
+                    source_type,
+                    exc,
+                )
 
         # Stage 2: write to graphiti (skipped in dry-run mode)
         episode_count = len(episodes)

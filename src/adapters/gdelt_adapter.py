@@ -53,7 +53,7 @@ from src.adapters.models import (
 )
 from src.adapters.macro_themes import MACRO_THEME_KEYWORDS
 from src.adapters.cameo_event_codes_whitelist import CAMEO_EVENT_CODES_WHITELIST
-from src.adapters.llm_preprocessor import LLMPreprocessor
+# LLMPreprocessor removed: cloud API has sufficient context
 from src.ingestion.events_pipeline_filter import EventsPipelineFilter
 from src.core.config import get_settings
 from src.utils.content_fetcher import ContentResult
@@ -550,19 +550,8 @@ class GdeltAdapter(BaseAdapter):
             config_path=events_filter_config_path
         )
 
-        # LLM preprocessor (opt-in, default off). When enabled, long fetched
-        # article text is compressed before the episode body is written to JSON.
-        settings = get_settings()
-        if settings.llm_preprocessor_enabled:
-            self._llm_preprocessor: LLMPreprocessor | None = LLMPreprocessor(
-                endpoint=settings.llm_preprocessor_endpoint,
-                model=settings.llm_preprocessor_model,
-                compress_threshold=settings.llm_preprocessor_compress_threshold,
-                compress_target=settings.llm_preprocessor_compress_target,
-                timeout=settings.llm_preprocessor_timeout,
-            )
-        else:
-            self._llm_preprocessor = None
+        # LLMPreprocessor removed: cloud API has sufficient context (32K).
+        # Long fetched article text is written to the episode body as-is.
 
     # ── fetch helpers ────────────────────────────────────────────────
 
@@ -1181,24 +1170,9 @@ class GdeltAdapter(BaseAdapter):
 
         if full_text:
             pure_text, yaml_meta = strip_yaml_front_matter(full_text)
-            if (
-                self._llm_preprocessor
-                and len(pure_text) > self._llm_preprocessor.compress_threshold
-            ):
-                preprocess_metadata: dict[str, Any] = {
-                    "source_url": source_url,
-                    "valid_at": raw_dt,
-                }
-                body = await self._llm_preprocessor.preprocess(
-                    content=pure_text,
-                    metadata=preprocess_metadata,
-                )
-                # preprocess() enriches metadata with original_content_hash —
-                # fold it into the episode metadata so the source text stays
-                # traceable after it is not persisted.
-                metadata.update(preprocess_metadata)
-            else:
-                body = _build_episode_body_with_full_text(record, pure_text)
+            # LLMPreprocessor removed: cloud API has sufficient context —
+            # long article text is used as-is (no compress step).
+            body = _build_episode_body_with_full_text(record, pure_text)
             if yaml_meta:
                 metadata["extracted_metadata"] = yaml_meta
 
@@ -1320,25 +1294,9 @@ class GdeltAdapter(BaseAdapter):
             # Full text available: use ONLY the article content (no CAMEO summary)
             # This avoids data pollution from prepending redundant metadata
             pure_text, yaml_meta = strip_yaml_front_matter(full_text)
-            if (
-                self._llm_preprocessor
-                and len(pure_text) > self._llm_preprocessor.compress_threshold
-            ):
-                # LLM compression for long content (context overflow guard)
-                preprocess_metadata: dict[str, Any] = {
-                    "source_url": source_url,
-                    "event_date": event_record.event_date,
-                }
-                body = await self._llm_preprocessor.preprocess(
-                    content=pure_text,
-                    metadata=preprocess_metadata,
-                )
-                # preprocess() enriches metadata with original_content_hash —
-                # fold it into the episode metadata so the source text stays
-                # traceable after it is not persisted.
-                metadata.update(preprocess_metadata)
-            else:
-                body = pure_text
+            # LLMPreprocessor removed: cloud API has sufficient context —
+            # long article text is used as-is (no compress step).
+            body = pure_text
             if yaml_meta:
                 metadata["extracted_metadata"] = yaml_meta
 
@@ -1664,3 +1622,5 @@ def _parse_gkg_datetime(raw: str) -> datetime:
             pass
     logger.warning("Could not parse GKG datetime '%s', using current HKT time", raw)
     return now_hkt()
+
+# PREPROCESS_REMOVED

@@ -35,10 +35,14 @@ def test_local_provider_config():
 
 
 def test_episode_semaphore_from_settings():
-    """Verify _LLM_SEMAPHORE uses settings value."""
+    """Verify _LLM_SEMAPHORE uses settings value.
+
+    Assert against the live settings instead of a hardcoded number:
+    .env sets EPISODE_SEMAPHORE=20 for the cloud API (32K context),
+    while the code default remains 3.
+    """
     from src.graphiti.episode_writer import _LLM_SEMAPHORE
-    # Default should be 3
-    assert _LLM_SEMAPHORE._value == 3
+    assert _LLM_SEMAPHORE._value == get_settings().episode_semaphore
 
 
 def test_circuit_params_from_settings():
@@ -74,4 +78,7 @@ def test_semaphore_limit_env_seeding():
     with patch.dict('os.environ', {}, clear=False):
         os.environ.pop("SEMAPHORE_LIMIT", None)
         _seed_semaphore_limit_env()
-        assert os.environ.get("SEMAPHORE_LIMIT") == "3"
+        # Seeded from settings.semaphore_limit (.env: SEMAPHORE_LIMIT=20)
+        assert os.environ.get("SEMAPHORE_LIMIT") == str(get_settings().semaphore_limit)
+
+# PREPROCESS_REMOVED

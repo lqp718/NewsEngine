@@ -72,25 +72,43 @@ class StockEntity(BaseModel):
 
 
 class SectorEntity(BaseModel):
-    """行业/板块实体 — 新闻报道中涉及的行业概念。
+    """行业/板块实体 — 新闻报道中涉及的行业分类概念。
 
-    示例: "互联网平台", "半导体", "新能源", "房地产"
+    业务意义: Sector 是连接宏观新闻与个股表现的核心桥梁 —
+    宏观事件（政策、地缘、产业周期）先作用于板块，再通过板块传导到
+    板块内个股。查询 "某政策影响哪些股票" 时，Sector → Stock 的
+    BELONGS_TO 归属关系是关键路径。
+
+    典型示例: "互联网平台", "半导体", "新能源", "房地产", "医药", "军工"。
+    新闻中提到的行业分类概念（含受政策监管、补贴、产业周期影响的
+    行业层面对象）都应归类为 Sector。
     Neo4j 节点标签: Entity:Sector
     """
 
 
 class CountryEntity(BaseModel):
-    """国家/地区实体 — 新闻中涉及的国家或地区。
+    """国家/地区实体 — 新闻中涉及的主权国家或地区。
 
-    示例: "中国", "美国", "日本", "欧盟"
+    业务意义: Country 是宏观分析中的地缘政治参与者 — 贸易战、制裁、
+    关税、外交冲突均以国家为行为主体或受体。国家层面的事件通过
+    "Country → Sector → Stock" 路径传导影响，是地缘风险分析的起点。
+
+    典型示例: "中国", "美国", "日本", "欧盟", "俄罗斯"。
+    新闻中作为行为主体或受影响方出现的主权国家、经济体联盟、
+    独立关税区都应归类为 Country。
     Neo4j 节点标签: Entity:Country
     """
 
 
 class PolicyEntity(BaseModel):
-    """政策/监管实体 — 新闻报道中涉及的政策事件、监管行动。
+    """政策/监管实体 — 新闻报道中涉及的政策事件、监管行动、官方举措。
 
-    示例:
+    业务意义: Policy 是金融市场最常见的外生冲击来源 — 货币政策
+    （加息/降息）、财政政策（刺激计划）、监管行动（反垄断调查）、
+    贸易政策（关税/出口管制）直接改变板块估值逻辑与企业盈利预期。
+    Policy 实体把 "政府行为" 与 "市场反应" 连接起来，是政策驱动分析的起点。
+
+    典型示例:
     - 反垄断调查 (type="regulatory", status="rumor")
     - 降息 (type="monetary", status="confirmed")
     - 财政刺激 (type="fiscal", status="announced")
@@ -115,17 +133,32 @@ class PolicyEntity(BaseModel):
 
 
 class OrganizationEntity(BaseModel):
-    """组织/机构/公司实体 — 新闻中涉及的企业、机构、政府部门。
+    """组织/机构实体 — 新闻中涉及的未上市企业、政府机构、国际组织。
 
-    示例: "腾讯控股", "美联储", "证监会", "世界卫生组织"
+    业务意义: Organization 覆盖参与市场事件但本身不是可交易标的的机构 —
+    监管方（发布政策、发起调查）、央行（制定货币政策）、国际组织
+    （协调地缘事务）。这些机构的行为常是股票/板块影响的上游原因，
+    也是 INVOLVES 参与关系（Person → Organization）的对象侧。
+
+    与 Stock 的区别: 上市公司（股票可交易、有 ticker）提取为 Stock；
+    未上市企业、政府机构、监管部门、国际组织提取为 Organization。
+
+    典型示例: "美联储", "证监会", "世界卫生组织", "财政部", "OpenAI"（未上市）。
     Neo4j 节点标签: Entity:Organization
     """
 
 
 class TopicEntity(BaseModel):
-    """主题/话题实体 — 宏观新闻中涉及的主题概念。
+    """主题/话题实体 — 宏观新闻中反复出现的主题概念。
 
-    示例: "加息", "贸易战", "芯片出口管制", "新冠"
+    业务意义: Topic 把跨事件、跨时间的宏观叙事（如 "贸易战"、
+    "芯片出口管制"）凝聚为可追踪对象，是比单个 Event 更高层的抽象。
+    多个相关事件可关联到同一 Topic，用于主题级情绪追踪与历史回顾 —
+    回答 "某主题如何演变" 时，Topic 是聚合锚点。
+
+    典型示例: "加息", "贸易战", "芯片出口管制", "新冠"。
+    跨多条新闻反复出现的宏观叙事概念归类为 Topic；
+    单次发生的具体事件归类为 Event。
     Neo4j 节点标签: Entity:Topic
     """
     category: str | None = Field(
@@ -213,7 +246,14 @@ class SymbolEventEntity(BaseModel):
 class PersonEntity(BaseModel):
     """自然人实体 — 新闻中涉及的个人。
 
-    示例: "鲍威尔", "易纲", "马斯克"
+    业务意义: 关键人物的言行具有显著市场影响力 — 央行行长的表态
+    影响货币政策预期，公司高管的动向影响公司基本面，政治人物的决策
+    影响地缘风险。Person 实体把 "个人言行" 与 "市场/机构反应" 连接起来，
+    是 INVOLVES 参与关系（Person → Organization, Event → Person）的主体来源。
+
+    典型示例: "鲍威尔", "易纲", "马斯克"。
+    新闻中作为行为主体出现（发表言论、担任职务、被调查等）的
+    自然人都应归类为 Person。
     Neo4j 节点标签: Entity:Person
     """
     title: str | None = Field(
@@ -257,3 +297,5 @@ SYMBOL_ENTITY_TYPES: dict[str, type[BaseModel]] = {
 
 包含: Stock, Sector, Organization, Country, Policy, Event, Person
 """
+
+# G8_FIX_COMPLETE

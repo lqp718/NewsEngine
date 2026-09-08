@@ -13,7 +13,6 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -454,113 +453,28 @@ class TestEventsFirstPipeline:
         assert episode.source_type == "gdelt_csv"
 
 
-# ── LLM preprocessing integration ───────────────────────────────────
+# ── LLM preprocessing removed (2026-09-08) ─────────────────────────
+# LLMPreprocessor removed: cloud API has sufficient context (32K).
+# The 2026-09-07 skip behavior (content_fetched=false → episode skipped)
+# is preserved and still covered below.
 
 
-class TestLLMPreprocessing:
-    """LLM preprocessing opt-in behavior (compress + synthesize)."""
-
-    @staticmethod
-    def _settings(enabled: bool):
-        from types import SimpleNamespace
-
-        s = SimpleNamespace()
-        s.llm_preprocessor_enabled = enabled
-        s.llm_preprocessor_endpoint = "http://test/v1"
-        s.llm_preprocessor_model = "test-model"
-        s.llm_preprocessor_compress_threshold = 5000
-        s.llm_preprocessor_compress_target = 2500
-        s.llm_preprocessor_synthesize_target = 1500
-        s.llm_preprocessor_timeout = 30.0
-        return s
-
-    def test_init_creates_preprocessor_when_enabled(self):
-        with patch(
-            "src.adapters.gdelt_adapter.get_settings",
-            return_value=self._settings(True),
-        ):
-            adapter = GdeltAdapter()
-        assert adapter._llm_preprocessor is not None
-        assert adapter._llm_preprocessor.compress_threshold == 5000
-
-    def test_init_no_preprocessor_when_disabled(self):
-        with patch(
-            "src.adapters.gdelt_adapter.get_settings",
-            return_value=self._settings(False),
-        ):
-            adapter = GdeltAdapter()
-        assert adapter._llm_preprocessor is None
-
-    @pytest.mark.asyncio
-    async def test_event_compress_called_for_long_content(self):
-        adapter = GdeltAdapter()
-        mock_pp = MagicMock()
-        mock_pp.compress_threshold = 100
-        mock_pp.preprocess = AsyncMock(return_value="COMPRESSED BODY")
-        adapter._llm_preprocessor = mock_pp
-        adapter._content_fetcher = MagicMock()
-        adapter._content_fetcher.fetch.return_value = MagicMock(
-            success=True, text="long article text " * 20
-        )
-
-        ev = make_event()
-        record_dict = adapter._events_tuple_to_dict(
-            ev, [], ["https://reuters.com/a1"]
-        )
-        episode = await adapter._normalize_event_record(record_dict)
-
-        mock_pp.preprocess.assert_awaited_once()
-        _, kwargs = mock_pp.preprocess.await_args
-        assert episode.episode_body == "COMPRESSED BODY"
+class TestFetchFailSkip:
+    """No fetched content → episode skipped, not ingested (2026-09-07)."""
 
     @pytest.mark.asyncio
     async def test_event_skipped_when_fetch_fails(self):
-        """2026-09-07: fetch fails → episode skipped BEFORE LLM synthesize."""
         adapter = GdeltAdapter()  # no content_fetcher → content_fetched=false
-        mock_pp = MagicMock()
-        mock_pp.preprocess = AsyncMock(return_value="SYNTHESIZED BODY")
-        adapter._llm_preprocessor = mock_pp
 
         ev = make_event()
         record_dict = adapter._events_tuple_to_dict(
             ev, [], ["https://reuters.com/a1"]
         )
         assert await adapter._normalize_event_record(record_dict) is None
-        mock_pp.preprocess.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_gkg_compress_called_for_long_content(self):
-        adapter = GdeltAdapter()
-        mock_pp = MagicMock()
-        mock_pp.compress_threshold = 100
-        mock_pp.preprocess = AsyncMock(return_value="GKG COMPRESSED")
-        adapter._llm_preprocessor = mock_pp
-        adapter._content_fetcher = MagicMock()
-        adapter._content_fetcher.fetch.return_value = MagicMock(
-            success=True, text="long gkg article " * 20
-        )
-
-        gkg_record = {
-            "global_event_id": "123",
-            "valid_at": _TEST_EVENT_DATE.replace("-", "") + "000000",
-            "domain": "reuters.com",
-            "source_url": "https://reuters.com/article",
-            "themes": "ECON_FINANCIAL_MARKET",
-            "tone": "0.0,0.0",
-        }
-        episode = await adapter.normalize(gkg_record)
-
-        mock_pp.preprocess.assert_awaited_once()
-        _, kwargs = mock_pp.preprocess.await_args
-        assert episode.episode_body == "GKG COMPRESSED"
 
     @pytest.mark.asyncio
     async def test_gkg_skipped_when_fetch_fails(self):
-        """2026-09-07: fetch fails → episode skipped BEFORE LLM synthesize."""
         adapter = GdeltAdapter()  # no content_fetcher → content_fetched=false
-        mock_pp = MagicMock()
-        mock_pp.preprocess = AsyncMock(return_value="GKG SYNTHESIZED")
-        adapter._llm_preprocessor = mock_pp
 
         gkg_record = {
             "global_event_id": "123",
@@ -571,23 +485,5 @@ class TestLLMPreprocessing:
             "tone": "0.0,0.0",
         }
         assert await adapter.normalize(gkg_record) is None
-        mock_pp.preprocess.assert_not_awaited()
 
-    @pytest.mark.asyncio
-    async def test_disabled_no_fetcher_skips_episode(self):
-        """Preprocessor disabled + no fetched content → episode skipped (2026-09-07).
-
-        The original CAMEO template body is no longer produced: such episodes
-        are not ingested at all.
-        """
-        with patch(
-            "src.adapters.gdelt_adapter.get_settings",
-            return_value=self._settings(False),
-        ):
-            adapter = GdeltAdapter()
-        assert adapter._llm_preprocessor is None
-        ev = make_event()
-        record_dict = adapter._events_tuple_to_dict(
-            ev, [], ["https://reuters.com/a1"]
-        )
-        assert await adapter._normalize_event_record(record_dict) is None
+# PREPROCESS_REMOVED

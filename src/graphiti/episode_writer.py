@@ -866,6 +866,9 @@ def _build_extraction_instructions(episode: NormalizedEpisode) -> str:
     P1-2: SECTOR LANGUAGE RULES + CANONICAL SECTOR NAMES 统一宏观/个股
     管线 sector 语言（中文 canonical，来自 canonical_entities.yaml）；
     宏观管线英文名规则对 sector 开例外。
+    G8（2026-09-08）: RELATION TYPE CONSTRAINTS 硬约束 — 只允许
+    BELONGS_TO / INVOLVES / AFFECTS / RELATED_TO 四种关系类型，
+    无法匹配时兜底 RELATED_TO，禁止 LLM 自创类型。
     """
     # P1-5.6: 个股管线（source_type 属于个股源集）优先中文标准名；
     # 宏观管线保持英文。以 source_type 为准（确定性信号），相比依赖
@@ -921,6 +924,11 @@ def _build_extraction_instructions(episode: NormalizedEpisode) -> str:
         + 'Examples: "X trades on Y exchange", "X is listed on Y"\n'
         + '- For investment/stake-holding facts, use PART_OF (structural '
         + 'ownership) or RELATES_TO; do NOT invent INVESTS_IN/EXPOSED_TO.\n'
+        + "\n"
+        + "RELATION TYPE CONSTRAINTS:\n"
+        + "- 只能使用以下关系类型：BELONGS_TO, INVOLVES, AFFECTS, RELATED_TO。\n"
+        + "- 如果无法匹配上述类型，使用 RELATED_TO。\n"
+        + "- 不要自创新的关系类型。\n"
     )
     if not episode.entities:
         return base
@@ -1135,3 +1143,6 @@ def _record_success() -> None:
     if _CIRCUIT_CONSECUTIVE_429:
         _CIRCUIT_CONSECUTIVE_429 = 0
         logger.info("Circuit breaker: consecutive 429 counter reset")
+
+
+# G8_FIX_COMPLETE

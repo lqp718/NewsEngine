@@ -12,17 +12,23 @@
 > ⚠️ **重要背景**：当前库内全部 595 个 episode 产自 **2026-09-05**，
 > 而数据质量修复 commits（`3a85b62` 09-06、`cf8e2bc` 09-07）在其之后。
 > 即：**代码修复已合入，但图谱数据是修复前的存量，修复效果一律未经真实数据验证。**
-> 所有"待验证"项都需要一次全量 replay（`--replay-all`）或重新运行后再审计。
+> 所有“待验证”项都需要一次全量 replay（`--replay-all`）或重新运行后再审计。
+>
+> ⚠️ **Replay 验证结果（2026-09-08）**：Replay 进行中（352/2665），发现 prompt 约束
+> 效果有限——英文 Sector 仍有 20 个，跨 scope 桥接仍为 0，ticker 覆盖 4.8%。
+> 根因：LLM 在抽取时同时做翻译，认知负荷大，遵循度低。
+> 新增方案：统一语言翻译（在 adapter 写入 JSONL 前调用 LLM 翻译，统一翻译成中文）。
 
 | # | Gap | 状态 | 影响场景 | 优先级 |
 |---|-----|------|---------|--------|
-| G1 | 宏观-个股桥接断裂 | 🟡 代码已修，数据 0 桥接，待重跑验证 | L1 L2 L3 | **P0** |
-| G2 | Ticker 覆盖率低 + **格式碎片化** | 🔴 数据未改善；新发现三种格式并存 | L2 | **P0** |
-| G3 | SYMBOL 管线供给不足 | 🟡 CLS 动态 scope 已修，供给结构仍偏 | L1 L2 | **P0→P1** |
-| G4 | Sector 类型污染 | 🟡 prompt 准入已加，无写后强制、存量 147 节点未清 | L1 | **P1** |
+| G1 | 宏观-个股桥接断裂 | 🔴 Replay 验证：prompt 约束效果有限，桥接仍为 0；新增统一语言翻译方案 | L1 L2 L3 | **P0** |
+| G2 | Ticker 覆盖率低 + **格式碎片化** | 🔴 Replay 验证：覆盖率 4.8%，未改善 | L2 | **P0** |
+| G3 | SYMBOL 管线供给不足 | 🟡 Replay 验证：6.25%，目标 15-20% | L1 L2 | **P0→P1** |
+| G4 | Sector 类型污染 | 🟡 Replay 验证：英文 Sector 20 个，准入规则未完全生效 | L1 | **P1** |
 | G5 | API 图结构未被 SynapseEngine 消费 | 🔴 服务端已提供，消费端 0 使用 | L2 L3 | **P2**（依赖 G1/G2） |
 | G6 | 跨仓库 ticker/sector 契约 | 🟢 查询侧已修；**存储侧格式收敛缺失**、无契约测试 | L2 | **P1** |
 | G7 | 补充发现（Stock 侧准入缺失 / sector=Unknown / 实体碎片化 / MACRO 供给结构） | 🔴 | L1 L2 | P1-P2 |
+| G8 | 基础设施审查：Entity/Edge Type 定义缺陷 + 双向边 | 🔴 Entity Type 缺语言约束；Edge Type 定义与实际脱节；双向边是 Graphiti 架构问题 | G1 G4 L1-L3 | **P0** |
 
 ---
 
@@ -60,12 +66,82 @@ L1/L2/L3 全部依赖宏观 episode 与个股 episode 通过共享实体（核�
    LLM 实际遵从率未知。
 
 **建议修复方向**
+
+### Replay 验证结果（2026-09-08，已停止）
+
+进程启动时间：Sep 7 23:15（晚于代码修改时间 Sep 6 11:42，用的是新代码）
+进程停止时间：Sep 8 00:37（Boss 确认后停止）
+
+**最终数据**（394 episodes done / 2265 pending）：
+- 跨 scope 桥接：**0**（仍为 0，未改善）
+- Sector 节点：100 个（英文 Sector 仍存在）
+- Ticker 覆盖：4/84（4.8%，未改善）
+- SYMBOL 占比：22/394（5.6%，目标 15-20%）
+
+**结论**：Prompt 约束效果有限，LLM 没有完全遵守 SECTOR LANGUAGE RULES。
+英文新闻中的行业词被直接抽取为英文 Sector，导致跨 scope 桥接仍为 0。
+
+**根因**：LLM 在抽取时同时做翻译，认知负荷大，遵循度低。
+需要把翻译从抽取阶段剥离出来，交给确定性任务。
+
+---
+
+### 方案 A：Prompt 约束（已实施，效果有限）
 - 立即执行一次全量 replay（landing JSONL 还在）或新跑一轮 ingestion，
   用附录 A1 的桥接查询复测：目标 = 跨 scope 共享 Sector > 0 且持续增长。
 - 建立**词表运营闭环**：定期（如每周）跑 sector 审计脚本，把高频新行业词
   补进 canonical_entities.yaml，而不是等桥接失败才发现。
 - 中期评估：Sector 归一是否需要写后强制层（对 LLM 输出做 canonical 匹配 +
   近似匹配兜底），不能永远只靠 prompt。
+
+### 方案 B：统一语言翻译（推荐，2026-09-08 新增）
+
+**背景**：Replay 验证发现 prompt 约束效果有限。RSS 源（英文）抽取的 Sector
+仍有 20 个英文节点（如 "Energy"、"Mining"、"Artificial intelligence"），
+跨 scope 桥接仍为 0。LLM 在抽取时同时做翻译，认知负荷大，遵循度低。
+
+**方案**：在 adapter 写入 JSONL 之前调用 LLM 进行翻译，统一翻译成中文。
+
+```
+Adapter → NormalizedEpisode → [翻译层] → JSONL → IngestWorker → Graphiti
+```
+
+**实现要点**：
+1. **翻译层位置**：`NormalizedEpisode` 创建后、写入 JSONL 前
+2. **翻译策略**：
+   - 宏观源（RSS/GDELT/CLS macro）→ 翻译成中文
+   - 个股源（CLS stock/Eastmoney）→ 保持中文
+   - 专有名词（公司名、人名）→ 保留原文或加括号注释
+   - 关键数据（数字、日期、ticker）→ 不翻译
+3. **参考词表**：复用 `canonical_entities.yaml` 作为翻译参考
+4. **基础设施**：复用 `QwenNoThinkingClient`（已有 `enable_thinking: False`）
+
+**优势**：
+1. **源头统一**：后续所有环节（抽取、去重、桥接）都处理同一种语言
+2. **白名单直接匹配**：canonical_entities.yaml 是中文，翻译后直接命中
+3. **解耦翻译和抽取**：翻译是确定性任务（有参考词表），抽取是开放性任务
+4. **成本可控**：翻译 prompt 比抽取简单（~2K tokens vs ~8K tokens），成本约 ¥0.5/天
+
+**解决的 Gap**：
+- **G1**：跨 scope 桥接断裂 → 都用中文 → canonical 词表直接匹配 → 自动桥接
+- **G4**：Sector 垃圾率高 → 翻译成 canonical 中文名（"有色金属"）
+- **G2**（间接）：公司名统一中文 → 白名单直接匹配 → ticker 覆盖提升
+
+**需要修改的地方**：
+1. 新增翻译模块：`src/translation/translator.py`
+2. 修改 adapter 输出：在 `to_normalized_episode()` 后调用翻译
+3. 配置项：`translate_enabled: bool`、`translate_target_language: str`
+
+**为什么翻译成中文而非英文**：
+- 现有基础设施全部是中文（canonical_entities.yaml、ticker_whitelist.json、SECTOR ADMISSION RULES）
+- 下游 API 查询是中文（`sector_name='白酒'`）
+- 最终用户是中文
+- 翻译成中文 = 零改动现有基础设施；翻译成英文 = 全部推翻重写
+
+**风险**：
+- 翻译层增加延迟（约 1-2 秒/episode）
+- 翻译层增加成本（约 ¥0.5/天）
+- 翻译可能丢失部分语义（但行业/sector 有 canonical 词表兜底，准确率接近 100%）
 
 ---
 
@@ -261,12 +337,232 @@ GDELT/Sanctions 收紧主题过滤），而非全量入库后指望 LLM 抽取�
 
 ---
 
+## G8. 基础设施审查：Entity/Edge Type 定义缺陷 + 双向边（P0，2026-09-08 新增）
+
+**问题描述**
+Graphiti 的抽取质量取决于 Entity Type 和 Edge Type 的定义质量。审查发现：
+1. **Entity Type doc 没有让 LLM 理解 type 代表什么**：doc 描述过于简单，LLM 不知道这个 type 的业务意义
+2. **Edge Type 定义与实际严重脱节**：定义了 6 种，其中 3 种是死类型；LLM 自创了 5 种
+3. **共同 Entity Type 存在但语言不统一**：Sector/Country/Organization 等 6 个类型在 MACRO 和 SYMBOL 管线都有定义，但抽取结果语言不一致导致无法匹配（翻译层解决）
+
+**影响场景**: G1（桥接断裂的根因之一）、G4（Sector 污染）、所有依赖图谱质量的场景
+
+**Graphiti 社区最佳实践**：
+> "Custom entity types are Pydantic models with a docstring describing the entity category. **The LLM uses both the class name and docstring to classify extracted entities.**"
+> 
+> — DeepWiki: Graphiti Podcast Processing Example
+
+即：`__doc__` 是 LLM 分类实体的核心依据，应该描述"这个 type 代表什么、业务意义是什么"。
+
+**当前状态（证据）**
+
+### Entity Type 审查
+
+| Entity Type | Doc 完备度 | 问题 |
+|-------------|-----------|------|
+| StockEntity | ⚠️ 中等 | doc 说"可交易标的"，但没说业务意义（个股端的核心实体） |
+| SectorEntity | ❌ 不足 | doc 只说"行业概念"，没说业务意义（桥接核心） |
+| CountryEntity | ❌ 不足 | doc 只说"国家/地区"，没说业务意义（地缘政治参与者） |
+| OrganizationEntity | ❌ 不足 | doc 只说"组织/机构"，没说与 Stock 的区别 |
+| PolicyEntity | ⚠️ 中等 | 有 type/status 枚举，但 doc 没说业务意义 |
+| EventEntity | ✅ 较好 | doc 说"CAMEO 事件"，有字段说明 |
+
+**核心问题**：大部分 entity type 的 doc **没有让 LLM 理解这个 type 代表什么、业务意义是什么**。LLM 不知道 Sector 是桥接核心，不知道 Country 是地缘政治参与者，导致抽取质量低。
+
+### Edge Type 审查
+
+当前 `relation_types.py` 定义了 6 种：
+
+| Edge Type | Doc 完备度 | 实际使用 | 问题 |
+|-----------|-----------|---------|------|
+| AFFECTS | ⚠️ 中等 | 92 条 | 方向描述模糊，说"任意→Stock"但实际是任意→任意 |
+| CAUSED_BY | ⚠️ 中等 | 0 条 | 死类型，LLM 不用 |
+| MITIGATES | ⚠️ 中等 | 0 条 | 死类型，LLM 不用 |
+| BELONGS_TO | ✅ 较好 | 92 条 | 方向明确 Stock→Sector |
+| LOCATED_IN | ⚠️ 中等 | 0 条 | 死类型，被 HAPPENED_IN 替代 |
+| RELATED_TO | ⚠️ 中等 | 169 条 | 兜底，但描述说"事件→政策"太窄 |
+
+**LLM 自创的类型**（不在定义中，但实际使用）：
+
+| Edge Type | 数量 | 说明 |
+|-----------|------|------|
+| HAPPENED_IN | 273 | 最多！LLM 用来表示"发生在某地" |
+| INVOLVES | 272 | 第二多！LLM 用来表示"参与关系" |
+| PART_OF | 53 | 与 BELONGS_TO 语义重叠 |
+| TRIGGERS | 25 | 因果链 |
+| TRADED_ON | 6 | 股票→交易所 |
+
+### 共同 Entity Type 分析
+
+| Entity Type | MACRO | SYMBOL | 桥接作用 | 实际数据 |
+|-------------|:-----:|:------:|---------|----------|
+| **Sector** | ✅ | ✅ | **核心桥接**：宏观事件→行业←个股 | 中文 78 / 英文 22 |
+| **Organization** | ✅ | ✅ | 机构关联（如"美联储"影响"银行"） | 中文 ~400 / 英文 ~128 |
+| **Country** | ✅ | ✅ | 地域关联（如"中国"→"白酒"） | 中文 ~150 / 英文 ~53 |
+| **Policy** | ✅ | ✅ | 政策关联（如"降息"→"房地产"） | - |
+| **Event** | ✅ | ✅ | 事件关联 | - |
+| **Person** | ✅ | ✅ | 人物关联 | - |
+| Topic | ✅ | ❌ | MACRO 独有 | - |
+| Stock | ❌ | ✅ | SYMBOL 独有 | - |
+
+**结论**：共同 entity types 定义是有的（6 个），但语言不统一导致无法匹配。
+**语言不统一问题由翻译层解决**（见 G1 方案 B），本 Gap 聚焦于 doc 质量问题。
+
+**建议修复方向**
+
+### 1. Entity Type Doc 改进
+
+根据 Graphiti 社区最佳实践，Entity Type 的 `__doc__` 作用是：
+> **描述这个 entity category 代表什么**，让 LLM 知道"这个实体应该归类为哪个 type"
+
+LLM 使用 **class name + docstring** 来分类抽取的实体。
+
+**Doc 应该包含**：
+- **语义定义**：这个 entity type 代表什么概念
+- **业务意义**：为什么需要这个 type，在业务场景中扮演什么角色
+- **典型示例**：什么样的实体应该被归类为这个 type
+
+**Doc 不应该包含**：
+- ~~语言约束~~：翻译层会处理，不需要在 doc 中约束
+- ~~canonical 参考~~：LLM 不知道 `canonical_entities.yaml` 的存在
+- ~~负面示例~~：entry type 是 LLM 应该提取的东西，没有"不让提取"的概念
+
+**示例（SectorEntity 改进后）**：
+```python
+class SectorEntity(BaseModel):
+    """行业/板块实体 — 代表一个可交易或可投资的行业分类。
+
+    业务意义：Sector 是宏观事件与个股之间的桥接实体。
+    宏观事件影响某个行业，个股属于某个行业，通过 Sector 建立关联。
+
+    典型示例：
+    - 传统行业：白酒、房地产、有色金属、煤炭
+    - 新兴行业：人工智能、新能源、半导体、生物医药
+    - 概念板块：国企改革、一带一路、碳中和
+
+    注意：Sector 应该是行业级别的概念，不是具体公司或产品。
+    """
+```
+
+**示例（CountryEntity 改进后）**：
+```python
+class CountryEntity(BaseModel):
+    """国家/地区实体 — 代表一个主权国家或重要经济体。
+
+    业务意义：Country 是地缘政治、贸易政策、宏观经济事件的核心参与者。
+    通过 Country 可以追踪"美国对中国加征关税"等跨国事件链。
+
+    典型示例：
+    - 主权国家：中国、美国、日本、德国
+    - 经济体：欧盟、东盟
+    - 地区：中东、东南亚（仅当作为整体参与事件时）
+
+    注意：城市、省份不是 Country，除非它们作为独立参与者出现。
+    """
+```
+
+### 2. Edge Type 精简方案
+
+根据 GAP 文档和实际数据，精简到 4 种：
+
+| Edge Type | 用途 | 实体对约束 | doc 改进 |
+|-----------|------|-----------|----------|
+| **BELONGS_TO** | 归属 | Stock→Sector, Subsidiary→Parent | 明确"结构性归属" |
+| **INVOLVES** | 参与 | Person→Org, Event→Person | **新增**！LLM 已在用（272 条） |
+| **AFFECTS** | 影响 | Event→Stock/Sector/Country | 放宽方向约束 |
+| **RELATES_TO** | 兜底 | 任意→任意 | 明确"无法归类时使用" |
+
+**删除**：
+- CAUSED_BY（0 条，死类型）
+- MITIGATES（0 条，死类型）
+- LOCATED_IN（0 条，被 HAPPENED_IN 替代）
+- PART_OF（与 BELONGS_TO 重叠）
+- TRIGGERS（25 条，可合并到 AFFECTS）
+- TRADED_ON（6 条，可合并到 BELONGS_TO）
+
+**新增**：
+- INVOLVES（LLM 已在用，272 条，是核心类型）
+
+### 3. Edge Type Doc 改进
+
+根据 Graphiti 社区最佳实践，Edge Type 的 `__doc__` 作用是：
+> **描述这个 relationship 代表什么**，让 LLM 知道"这两个实体之间是什么关系"
+
+**Doc 应该包含**：
+- **语义定义**：这个 edge type 代表什么关系
+- **方向约定**：A→B 还是 B→A（如 Stock→Sector 表示"股票属于行业"）
+- **实体对约束**：哪些类型的实体之间可以用这个关系
+- **典型示例**：什么样的关系应该被归类为这个 type
+
+**Doc 不应该包含**：
+- ~~语言约束~~：翻译层会处理，不需要在 doc 中约束
+
+示例（BELONGS_TO 改进后）：
+```python
+class BelongsToEdge(BaseModel):
+    """BELONGS_TO 关系: 结构性归属。
+
+    语义定义：表示一个实体是另一个实体的组成部分或分类归属。
+    方向约定：子 → 父（如 Stock → Sector 表示"股票属于行业"）
+
+    实体对约束：
+    - Stock → Sector: 股票属于某个行业
+    - Subsidiary → Parent: 子公司属于母公司
+    - Product → Category: 产品属于某个品类
+
+    典型示例：
+    - "0700.HK 属于 互联网平台 行业"
+    - "Tencent 是一家 科技 公司"
+    - "贵州茅台 属于 白酒 行业"
+
+    不要用于：
+    - 地理位置（用 HAPPENED_IN 或 LOCATED_IN）
+    - 时间关系（用 valid_at 属性）
+    - 因果关系（用 AFFECTS 或 TRIGGERS）
+    """
+
+    fact: str = Field(..., description="描述归属关系的事实陈述")
+```
+
+### 4. 双向边问题（Graphiti 架构缺陷）
+
+Graphiti 的 `get_between_nodes` 只查单向 `(a)-[r]->(b)`。如果 LLM 对同一对实体抽了 A→B 和 B→A，系统不会去重。随着数据量增长，双向边会累积。
+
+**影响场景**: L1/L2/L3（图查询时双向边导致重复遍历或矛盾信息）
+
+**修复方向**：
+- 短期：在 prompt 中明确边的方向约定（如"政策→行业"而非"行业→政策"）
+- 中期：评估是否需要在 EpisodeWriter 层加写前去重（查询两个方向是否已存在）
+- 长期：等 Graphiti 官方修复（Issue #1303）
+
+### 5. 实施顺序
+
+1. **先改 Entity Type doc**：让 LLM 知道每个 type 代表什么、业务意义是什么
+2. **再精简 Edge Type**：删除死类型，新增 INVOLVES（4 种核心类型）
+3. **最后改 Edge Type doc**：明确语义、方向、实体对约束
+
+**注意**：
+- Doc 改进解决的是"LLM 理解"问题：让 LLM 知道 type 代表什么
+- 翻译层解决的是"语言统一"问题：让抽取结果语言一致
+- 两者独立，可以并行实施
+
+**社区最佳实践参考**：
+- Graphiti 官方文档："Clear Descriptions: Always include detailed descriptions in docstrings and Field descriptions"
+- DeepWiki："The LLM uses both the class name and docstring to classify extracted entities"
+- 关键：docstring 是 LLM 分类实体的依据，应该描述"这个 type 代表什么"，而不是"怎么抽取"
+
+---
+
 ## 优先级路线图（建议）
 
 ```
-第一步（本周）：重跑验证 —— replay-all 或新一轮 ingestion
-  └─ 复测：G1 桥接数、G3 scope 分布、G4 新增 Sector 垃圾率
-     （修复代码全部已合入，这一步不做，后面全是盲修）
+第一步（本周）：基础设施修复 + 统一语言翻译（G1/G4/G8 根源修复）
+  ├─ 1a. Entity Type doc 改进：添加语言约束（配合翻译层）
+  ├─ 1b. Edge Type 精简：删除死类型，新增 INVOLVES（4 种核心类型）
+  ├─ 1c. 实现翻译层：src/translation/translator.py
+  ├─ 1d. 修改 adapter 输出：NormalizedEpisode → 翻译 → JSONL
+  └─ 复测：G1 桥接数、G4 新增 Sector 垃圾率、Edge Type 分布
+  （翻译层是确定性任务，有 canonical 词表兜底，效果可预期）
 
 第二步（P0）：ticker 格式收敛（G2/G6 残余）
   └─ canonical 格式定义 → 适配器写入层归一 → 存量迁移 → API 端防御性归一

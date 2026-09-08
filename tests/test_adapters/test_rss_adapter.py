@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -148,86 +147,9 @@ class TestRssFetchSingle:
         assert dt.day == 8
 
 
-class TestRssLLMPreprocessing:
-    """RSS LLM preprocessing opt-in behavior (compress only, no synthesize)."""
+# LLMPreprocessor removed: cloud API has sufficient context (32K).
+# The former TestRssLLMPreprocessing class was deleted with the module.
+# Fetch-fail → feed-summary-as-is behavior remains covered by
+# TestRssNormalize.test_normalize_rss_entry (no content_fetcher injected).
 
-    @staticmethod
-    def _settings(enabled: bool):
-        from types import SimpleNamespace
-
-        s = SimpleNamespace()
-        s.llm_preprocessor_enabled = enabled
-        s.llm_preprocessor_endpoint = "http://test/v1"
-        s.llm_preprocessor_model = "test-model"
-        s.llm_preprocessor_compress_threshold = 5000
-        s.llm_preprocessor_compress_target = 2500
-        s.llm_preprocessor_synthesize_target = 1500
-        s.llm_preprocessor_timeout = 30.0
-        return s
-
-    def test_init_creates_preprocessor_when_enabled(self):
-        with patch(
-            "src.adapters.rss_adapter.get_settings",
-            return_value=self._settings(True),
-        ):
-            adapter = RssAdapter()
-        assert adapter._llm_preprocessor is not None
-        assert adapter._llm_preprocessor.compress_threshold == 5000
-
-    def test_init_no_preprocessor_when_disabled(self):
-        with patch(
-            "src.adapters.rss_adapter.get_settings",
-            return_value=self._settings(False),
-        ):
-            adapter = RssAdapter()
-        assert adapter._llm_preprocessor is None
-
-    @pytest.mark.asyncio
-    async def test_compress_called_for_long_content(self, sample_rss_entry):
-        adapter = RssAdapter()
-        mock_pp = MagicMock()
-        mock_pp.compress_threshold = 100
-        mock_pp.preprocess = AsyncMock(return_value="RSS COMPRESSED BODY")
-        adapter._llm_preprocessor = mock_pp
-        adapter._content_fetcher = MagicMock()
-        adapter._content_fetcher.fetch_async = AsyncMock(return_value=MagicMock(
-            success=True, text="long rss article text " * 20
-        ))
-
-        episode = await adapter.normalize(sample_rss_entry)
-
-        mock_pp.preprocess.assert_awaited_once()
-        _, kwargs = mock_pp.preprocess.await_args
-        assert "RSS COMPRESSED BODY" in episode.episode_body
-
-    @pytest.mark.asyncio
-    async def test_fetch_fail_no_synthesis(self, sample_rss_entry):
-        """Fetch fails → feed summary used as-is; NO LLM synthesis for RSS."""
-        adapter = RssAdapter()  # no content_fetcher → fetch fails
-        mock_pp = MagicMock()
-        mock_pp.preprocess = AsyncMock()
-        adapter._llm_preprocessor = mock_pp
-
-        episode = await adapter.normalize(sample_rss_entry)
-
-        mock_pp.preprocess.assert_not_awaited()
-        # Feed summary (natural language) is preserved as-is
-        assert "Tencent Holdings reported strong quarterly earnings" in episode.episode_body
-
-    @pytest.mark.asyncio
-    async def test_short_content_not_compressed(self, sample_rss_entry):
-        """Content below threshold → no compress, original preserved."""
-        adapter = RssAdapter()
-        mock_pp = MagicMock()
-        mock_pp.compress_threshold = 5000
-        mock_pp.preprocess = AsyncMock()
-        adapter._llm_preprocessor = mock_pp
-        adapter._content_fetcher = MagicMock()
-        adapter._content_fetcher.fetch_async = AsyncMock(return_value=MagicMock(
-            success=True, text="short article"
-        ))
-
-        episode = await adapter.normalize(sample_rss_entry)
-
-        mock_pp.preprocess.assert_not_awaited()
-        assert "short article" in episode.episode_body
+# PREPROCESS_REMOVED

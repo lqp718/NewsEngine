@@ -354,16 +354,6 @@ class TestSkipContentNotFetched:
         assert adapter._skipped_content_not_fetched == 0
 
     @pytest.mark.asyncio
-    async def test_no_llm_preprocess_call_on_skip(self, sample_gkg_record):
-        """Skip happens BEFORE body building → no wasted LLM synthesize call."""
-        adapter = GdeltAdapter()  # no fetcher → content_fetched=false
-        mock_pp = MagicMock()
-        mock_pp.preprocess = AsyncMock(return_value="SYNTHESIZED")
-        adapter._llm_preprocessor = mock_pp
-        assert await adapter.normalize(sample_gkg_record) is None
-        mock_pp.preprocess.assert_not_awaited()
-
-    @pytest.mark.asyncio
     async def test_run_filters_skipped_and_counts(
         self, sample_gkg_record, monkeypatch
     ):
@@ -489,3 +479,5 @@ class TestGdeltPlanDFilter:
             record = self._make_record(domain, themes="WEATHER")
             filtered = adapter.filter_relevant([record])
             assert len(filtered) == 1, f"Domain {domain} should pass unconditionally"
+
+# PREPROCESS_REMOVED
